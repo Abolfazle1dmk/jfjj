@@ -8538,6 +8538,7 @@ async def connect_and_run(eng, creds):
         all_groups = [raw_groups] if isinstance(raw_groups, str) else list(raw_groups)
         groups_to_scan = group_failover_scan_groups(x, all_groups, int(scan_now))
         scan_error = False
+        scan_errors = []
 
         # ── دروازه‌ی ضد-انباشت (فقط اسکن خودکار؛ اسکن دستی همیشه رد است) ──
         # وقتی صفِ عملکرد به‌خاطر FloodWait بسته است یا هنوز انباری از
@@ -8602,14 +8603,20 @@ async def connect_and_run(eng, creds):
                              if l.lstrip("@").lower() not in mine]
                     if not links:
                         continue
-                    candidates.append((msg, sender, links[0]))
+                    # لینک‌هایی که تبادل فعال یا ردشده دارند قابل انتخاب
+                    # نیستند. قبلاً تازه‌ترین لینک تکراری کل اسکن را متوقف
+                    # می‌کرد و لینک تازه‌ی بعدی هم با جلو رفتن نشانگر گم می‌شد.
+                    link = links[0]
+                    existing = eng.db.ex_by_link(link)
+                    if existing and existing.get("status") not in ("failed", "left"):
+                        continue
+                    candidates.append((msg, sender, link, existing))
                     if len(candidates) >= pick:
                         break
 
                 if candidates:
                     selected_index = min(pick, len(candidates))
-                    msg, sender, link = candidates[selected_index - 1]
-                    existing = eng.db.ex_by_link(link)
+                    msg, sender, link, existing = candidates[selected_index - 1]
                     sender_name = (f"@{sender.username}"
                                    if getattr(sender, "username", None)
                                    else (getattr(sender, "first_name", "")
@@ -8627,7 +8634,11 @@ async def connect_and_run(eng, creds):
                             found += 1
                     elif existing.get("status") in ("failed", "left"):
                         # پیام جدیدی از همان کانال آمده؛ دوباره در صف Join قرار بده.
+                        # این یک نوبت تازه است؛ کارگر سن صف را از created_at
+                        # می‌سنجد. نگه‌داشتن زمانِ رکورد قبلی باعث می‌شد حتی
+                        # پیام تازه فوراً به‌عنوان لینک قدیمی رد شود.
                         eng.db.ex_set(existing["id"], status="approved",
+                                      created_at=int(scan_now),
                                       peer_id=sender.id, peer_name=sender_name,
                                       direction="out", src_chat=msg.chat_id,
                                       src_msg=msg.id, replied=0, claim_joined=0,
@@ -8642,6 +8653,7 @@ async def connect_and_run(eng, creds):
                 return found, f"FloodWait {w}s"
             except Exception as e:
                 scan_error = True
+                scan_errors.append(f"{g}: {type(e).__name__}: {str(e)[:120]}")
                 eng.log("warn", "scan", f"{g}: {type(e).__name__}: {e}")
                 continue
 
@@ -8675,6 +8687,8 @@ async def connect_and_run(eng, creds):
         eng.st.save()
         if found:
             eng.log("info", "scan", f"{found} آخرین پیام دارای لینک ثبت شد")
+        if scan_errors:
+            return found, "خطای اسکن: " + "؛ ".join(scan_errors[:3])
         return found, ""
 
     # ---------- اسکن مستقل پیش‌قدم ----------
@@ -8717,7 +8731,8 @@ async def connect_and_run(eng, creds):
                     n, err = await scan_groups(manual)
                     if manual:
                         if err:
-                            await note(f"🔍 اسکن انجام نشد — {err}")
+                            await note(f"🔍 اسکن کامل نشد — {err}\n"
+                                       f"{fa(n)} کانال تازه در گروه‌های دیگر پیدا شد.")
                         else:
                             wait = eng.join_thr.wait_time()
                             left = joins_left_today()

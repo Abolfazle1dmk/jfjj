@@ -4423,6 +4423,9 @@ class Supervisor:
         self._resume_fail = {}
         # تا این زمان هیچ سلفی وصل نمی‌شود (مهلتِ بوت؛ بخشِ resume_grace_plan).
         self._grace_until = 0.0
+        # از پیش از شروع watchdog تا پایان بوت اولیه، بازیابی خودکار نباید
+        # قبل از محاسبه و اعمال مهلت سشن‌ها شروع شود.
+        self._startup_boot_pending = threading.Event()
         # قفلِ «بالا آوردنِ همه» — بوتِ خودکار و بازیابیِ دستی نباید هم‌زمان
         # یک سرویس را دو بار ری‌استارت کنند.
         self.boot_lock = threading.Lock()
@@ -5642,7 +5645,8 @@ class Supervisor:
                 # افتاده‌ها را بلند کن — فقط اگر اعتبار دارند.
                 # اگر همین حالا «بالا آوردنِ همه» در جریان است صبر می‌کنیم؛
                 # وگرنه یک سرویس دو بار اجرا می‌شد.
-                if self.cfg["auto_restart"] and self.boot_lock.acquire(blocking=False):
+                if (self.cfg["auto_restart"] and not self._startup_boot_pending.is_set()
+                        and self.boot_lock.acquire(blocking=False)):
                     try:
                         self.resume_wanted(log_kind="autorestart")
                     finally:
@@ -6232,7 +6236,8 @@ class Manager:
             pass
 
     # ---------- بالا آوردنِ سرویس‌ها بعد از آپدیت/بازیابی ----------
-    def _spawn_boot(self, notify_admins=False, why="", force_restart=False):
+    def _spawn_boot(self, notify_admins=False, why="", force_restart=False,
+                    startup=False):
         """همه‌ی سرویس‌هایی که «باید روشن باشند» را در پس‌زمینه بالا می‌آورد.
 
         چرا thread؟ هر سرویس ~۱.۵ ثانیه وقت می‌برد؛ اگر همین‌جا و همگام اجرا
@@ -6242,6 +6247,8 @@ class Manager:
         def _worker():
             got = self.sup.boot_lock.acquire(timeout=600)
             if not got:
+                if startup:
+                    self.sup._startup_boot_pending.clear()
                 print("  ⚠️ بالا آوردنِ سرویس‌ها: قفل نگرفت — watchdog جبران می‌کند",
                       flush=True)
                 return
@@ -6287,8 +6294,15 @@ class Manager:
             except Exception as e:
                 print(f"  ⚠️ بالا آوردنِ سرویس‌ها: {type(e).__name__}: {e}", flush=True)
             finally:
+                if startup:
+                    self.sup._startup_boot_pending.clear()
                 self.sup.boot_lock.release()
-        threading.Thread(target=_worker, daemon=True).start()
+        try:
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception:
+            if startup:
+                self.sup._startup_boot_pending.clear()
+            raise
 
     def _resume_after_restore(self, why="بازیابی"):
         """بعد از هر بازیابی: سرویس‌های «قبلاً روشن» را خودکار برگردان.
@@ -16475,8 +16489,9 @@ class Manager:
         self.boot_at = now()
         # بالا آوردنِ سرویس‌ها در پس‌زمینه: هر سرویس ~۱.۵ ثانیه وقت می‌برد و
         # اگر همگام اجرا شود، ربات بعد از آپدیت دقیقاً وقتی مدیر «روشن کن»
-        # می‌زند چند دقیقه جواب نمی‌دهد. watchdog هم از همان اول فعال است تا
-        # اگر یکی جا افتاد، خودش جبران کند.
+        # می‌زند چند دقیقه جواب نمی‌دهد. قبل از شروع watchdog پرچم را
+        # می‌گذاریم تا حتی اگر thread بوت هنوز اجرا نشده، محافظ دور زده نشود.
+        self.sup._startup_boot_pending.set()
         threading.Thread(target=self.sup.watchdog, daemon=True).start()
         # «چرا دیروز یهو آفلاین شد؟» — از ضربانِ اجرای قبلی می‌گوییم.
         try:
@@ -16488,7 +16503,7 @@ class Manager:
             print(f"  ⚠️ گزارشِ مرگِ قبلی: {type(e).__name__}", flush=True)
         write_heartbeat(BASE_DIR, {"stage": "boot"})
         print(f"{'='*54}\n")
-        self._spawn_boot(notify_admins=False, why="بوت")
+        self._spawn_boot(notify_admins=False, why="بوت", startup=True)
         # ارجاع را نگه دار؛ وگرنه حلقهٔ پشتیبان ممکن است وسط کار جمع شود و بک‌آپ نرود.
         self._bg_tasks = []
         for _coro in (self.heartbeat_loop(), self.duplicate_watch_loop(),
