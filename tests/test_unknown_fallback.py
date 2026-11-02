@@ -23,6 +23,24 @@ APP = os.path.join(ROOT, "app")
 DATA = os.path.join(ROOT, "data")
 
 DRIVER = r"""
+# ── نام‌های تازه‌ی ۹۵.py (سنتینلِ «نرفت» + علتِ چک) ──
+# برش‌های کد در namespaceهای این درایور exec می‌شوند، پس هر گلوبالی که کدِ
+# برش‌خورده می‌خواند باید این‌جا هم تعریف شده باشد.
+class _CdStub:
+    def __repr__(self):
+        return "CHECK_DEFERRED"
+
+
+def _ns(d):
+    d.setdefault("_LAST_CHECK_WHY", {"why": "", "at": 0})
+    d.setdefault("_note_check_why", (lambda w: None))
+    for _nm in ("ChannelInvalidError", "UsernameInvalidError"):
+        d.setdefault(_nm, type(_nm, (Exception,), {}))
+    if "CHECK_DEFERRED" not in d:
+        _m = globals().get("m")
+        d["CHECK_DEFERRED"] = getattr(_m, "CHECK_DEFERRED", None) or _CdStub()
+    return d
+
 import asyncio, importlib.util, os, sys, time
 sys.path.insert(0, os.getcwd())
 
@@ -60,6 +78,7 @@ assert a > 0 and b > a, "unk_fallback not found"
 ded = "\n".join(ln[4:] if ln.startswith("    ") else ln
                 for ln in src[a:b].splitlines())
 uns = {"eng": eng}
+_ns(uns)
 exec(ded, uns)
 unk_fallback = uns["unk_fallback"]
 
@@ -117,6 +136,7 @@ async def always_out(uid, rec_id=None, queue=True):
     return False
 cns = {"eng": eng, "asyncio": FakeAsyncio, "peer_in_my_channel": always_out,
        "membership_check_delay": lambda: 20, "ex_cd": CD0}
+_ns(cns)
 exec(cf_src, cns)
 confirm = cns["confirm_peer_membership"]
 
@@ -135,6 +155,7 @@ async def always_in(uid, rec_id=None, queue=True):
     CALLS.append(queue)
     return True
 cns["peer_in_my_channel"] = always_in
+_ns(cns)
 exec(cf_src, cns)
 confirm2 = cns["confirm_peer_membership"]
 CALLS.clear()
@@ -173,6 +194,7 @@ harness = (
     + "\n"
 )
 hns = {"CD0": CD0}
+_ns(hns)
 exec(harness, hns)
 run_reminder = hns["_run"]
 
@@ -292,6 +314,7 @@ wharness = (
     + "\n"
 )
 whns = {"CD0": CD0, "m": m, "asyncio": asyncio}
+_ns(whns)
 exec(wharness, whns)
 run_watch = whns["_runw"]
 

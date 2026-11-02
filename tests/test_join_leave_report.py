@@ -52,6 +52,26 @@ SRC_REPO = REPO
 
 
 DRIVER = r"""
+# ── نام‌های تازه‌ی ۹۵.py (سنتینلِ «نرفت» + علتِ چک) ──
+# برش‌های کد در namespaceهای این درایور exec می‌شوند، پس هر گلوبالی که کدِ
+# برش‌خورده می‌خواند باید این‌جا هم تعریف شده باشد.
+class _CdStub:
+    def __repr__(self):
+        return "CHECK_DEFERRED"
+
+
+def _ns(d):
+    d.setdefault("_LAST_CHECK_WHY", {"why": "", "at": 0})
+    d.setdefault("_note_check_why", (lambda w: None))
+    for _nm in ("ChannelInvalidError", "UsernameInvalidError"):
+        d.setdefault(_nm, type(_nm, (Exception,), {}))
+    d.setdefault("manual_leave_retry_plan", m.manual_leave_retry_plan)
+    d.setdefault("leave_error_is_transient", m.leave_error_is_transient)
+    if "CHECK_DEFERRED" not in d:
+        _m = globals().get("m")
+        d["CHECK_DEFERRED"] = getattr(_m, "CHECK_DEFERRED", None) or _CdStub()
+    return d
+
 import asyncio, importlib.util, os, sys, time
 from types import SimpleNamespace
 sys.path.insert(0, os.getcwd())
@@ -125,6 +145,7 @@ def make_harness(block, extra=""):
         + "\n".join("    " + ln for ln in block.splitlines())
         + "\n")
     ns = {"m": m, "ex_cd": m.ExCooldown(gap_min=0, gap_max=0)}
+    _ns(ns)
     exec(src_txt, ns)
     return ns["_run"]
 
@@ -314,6 +335,7 @@ def make_manual_harness():
         + "\n".join("    " + ln for ln in manual_ded.splitlines())
         + "\n")
     ns = {"m": m}
+    _ns(ns)
     exec(txt, ns)
     return ns["_run"]
 

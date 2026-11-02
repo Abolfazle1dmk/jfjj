@@ -41,6 +41,24 @@ SRC_REPO = REPO
 
 
 DRIVER = r"""
+# ── نام‌های تازه‌ی ۹۵.py (سنتینلِ «نرفت» + علتِ چک) ──
+# برش‌های کد در namespaceهای این درایور exec می‌شوند، پس هر گلوبالی که کدِ
+# برش‌خورده می‌خواند باید این‌جا هم تعریف شده باشد.
+class _CdStub:
+    def __repr__(self):
+        return "CHECK_DEFERRED"
+
+
+def _ns(d):
+    d.setdefault("_LAST_CHECK_WHY", {"why": "", "at": 0})
+    d.setdefault("_note_check_why", (lambda w: None))
+    for _nm in ("ChannelInvalidError", "UsernameInvalidError"):
+        d.setdefault(_nm, type(_nm, (Exception,), {}))
+    if "CHECK_DEFERRED" not in d:
+        _m = globals().get("m")
+        d["CHECK_DEFERRED"] = getattr(_m, "CHECK_DEFERRED", None) or _CdStub()
+    return d
+
 import asyncio, importlib.util, os, sys, time
 sys.path.insert(0, os.getcwd())
 
@@ -101,6 +119,7 @@ harness_src = (
 )
 # صف تک‌عملکردی با فاصله‌ی صفر → رفتارِ این تست‌ها مثل قبل می‌ماند
 hns = {"m": m, "ex_cd": m.ExCooldown(gap_min=0, gap_max=0)}
+_ns(hns)
 exec(harness_src, hns)
 run_reminder = hns["_run"]
 
@@ -258,6 +277,7 @@ pharness = (
     + "\n".join("    " + ln for ln in ded.splitlines())
     + "\n"
 )
+_ns(ph)
 exec(pharness, ph)
 run_periodic = ph["_run"]
 
