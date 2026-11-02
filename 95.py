@@ -350,6 +350,7 @@ import random
 import subprocess
 import sqlite3
 import asyncio
+import atexit
 import threading
 import traceback
 import http.cookiejar
@@ -6228,6 +6229,133 @@ def record_boot_crash(exc=None, tb=""):
 
 
 # ─────────────────────────────────────────────
+#  قفلِ اکانت (نه پوشه) — «دو نسخه روی یک سشن» = پنلِ بی‌جواب
+# ─────────────────────────────────────────────
+# قفلِ `jafj.run.lock` فقط هم‌پوشه را می‌بیند. اگر همان اکانت از یک پوشه‌ی
+# دیگر هم اجرا شود (نسخه‌ی قدیمی در ریشه‌ی اپ، پوشه‌ی مشتری، کانتینرِ دوم
+# که همان دیسک را می‌بیند)، دو اتصال روی یک سشن باز می‌شود؛ تلگرام
+# آپدیت‌ها را بینِ هر دو پخش می‌کند و نتیجه‌اش این است: پروسه «روشن»
+# است، ولی پیامِ کاربر به یکی می‌رسد و به یکی نه — یعنی «پنل جواب نمی‌دهد».
+# قفل بر اساسِ شناسه‌ی اکانت (بعد از ورود) و در DATA_DIR نوشته می‌شود که
+# بینِ همه‌ی پوشه‌های همان میزبان مشترک است.
+INSTANCE_STALE_SEC = 900
+
+
+def _instances_dir():
+    base = (os.environ.get("DATA_DIR") or "").strip() or os.getcwd()
+    d = os.path.join(base, ".jafj_instances")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _instance_path(uid):
+    return os.path.join(_instances_dir(), f"{int(uid)}.json")
+
+
+def _pid_cmdline(pid):
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            return f.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+    except Exception:
+        return ""
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _looks_like_selfbot(pid):
+    cmd = _pid_cmdline(pid)
+    if not cmd:
+        return True                      # نمی‌دانیم → محافظه‌کارانه «بله»
+    return "95.py" in cmd or "jafj" in cmd.lower()
+
+
+def claim_instance(uid, now=None):
+    """اکانت را برای همین پروسه قفل کن → (اجازه؟, pidِ دیگر, پوشه‌ی دیگر, دلیل)."""
+    if (os.environ.get("JAFJ_ALLOW_DUPLICATE_INSTANCE") or "").strip() in (
+            "1", "true", "yes"):
+        return True, 0, "", ""       # کلیدِ خاموش‌کن: اگر روزی لازم شد
+    now = time.time() if now is None else float(now)
+    path = _instance_path(uid)
+    mine = os.path.abspath(os.getcwd())
+    rec = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+    except Exception:
+        rec = {}
+    if isinstance(rec, dict) and rec:
+        try:
+            pid = int(rec.get("pid") or 0)
+        except Exception:
+            pid = 0
+        try:
+            ts = float(rec.get("ts") or 0)
+        except Exception:
+            ts = 0.0
+        cwd = str(rec.get("cwd") or "")
+        if (pid and pid != os.getpid() and (now - ts) < INSTANCE_STALE_SEC
+                and _pid_alive(pid) and _looks_like_selfbot(pid)
+                and os.path.abspath(cwd or "/") != mine):
+            return False, pid, cwd, (
+                "نسخه‌ی دیگری از همین اکانت در پوشه‌ی دیگری در حال اجراست")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "cwd": mine, "ts": now,
+                       "session": os.path.abspath(SESSION)}, f)
+    except Exception:
+        return True, 0, "", ""           # نشد بنویسیم → مانعِ اجرا نشو
+    return True, 0, "", ""
+
+
+def release_instance(uid=None):
+    if not uid:
+        return
+    path = _instance_path(uid)
+    try:
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+        if int(rec.get("pid") or 0) == os.getpid():
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def start_instance_heartbeat(uid, every=60):
+    """قفل را تازه نگه دار؛ وگرنه بعد از ۱۵ دقیقه «کهنه» شمرده می‌شود."""
+    def _beat():
+        while True:
+            time.sleep(every)
+            try:
+                path = _instance_path(uid)
+                with open(path, encoding="utf-8") as f:
+                    rec = json.load(f)
+                if int(rec.get("pid") or 0) != os.getpid():
+                    return
+                rec["ts"] = time.time()
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(rec, f)
+            except Exception:
+                return
+
+    try:
+        threading.Thread(target=_beat, daemon=True,
+                         name="jafj-instance-beat").start()
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────
 #  کدهای خروج — مدیر از همین عدد علت را می‌فهمد
 # ─────────────────────────────────────────────
 #  ۷۶ = نسخه‌ی دومِ همین اکانت (سشن سالم است، اجرا نکردیم)
@@ -6528,6 +6656,27 @@ async def connect_and_run(eng, creds):
     eng.write_status()
     eng.log("ok", "login", f"{eng.me} | id={me.id}")
     _boot_step("ورود انجام شد", f"{eng.me} | id={me.id}")
+
+    _ok_inst, _other_pid, _other_cwd, _why_inst = claim_instance(me.id)
+    if not _ok_inst:
+        _msg = (f"⛔ این اکانت ({me.id}) همین حالا از پوشه‌ی دیگری اجرا "
+                f"می‌شود (pid={_other_pid} · {_other_cwd or '?'}).\n"
+                f"   دلیل: {_why_inst}.\n"
+                "   دو نسخه روی یک سشن = تلگرام آپدیت‌ها را بینِ هر دو پخش "
+                "می‌کند؛ نتیجه دقیقاً همین است: ربات «روشن» به نظر می‌رسد "
+                "ولی پنل جواب نمی‌دهد.\n"
+                "   نسخه‌ی اضافه را ببند (یا مسیرِ شروعِ آن را اصلاح کن) و "
+                "همین یکی را نگه دار.")
+        print("\n" + _msg, flush=True)
+        record_boot_crash(None, tb=_msg)
+        _boot_step("بوت متوقف شد", "اکانت از پوشه‌ی دیگر در حال اجراست")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return "dup_instance"
+    atexit.register(release_instance, me.id)
+    start_instance_heartbeat(me.id)
 
     for tier in ("standard", "vip"):
         p = eng.st.prof(tier)
@@ -9994,6 +10143,12 @@ async def run_bot():
                 print("\n⛔ تا لاگینِ دوباره، این سشن اجرا نمی‌شود (کلید باطل "
                       "شده).", flush=True)
                 return EXIT_KEY_BURNED
+            if r == "dup_instance":
+                # دو نسخه روی یک اکانت: پنل بی‌جواب می‌شود. مثلِ قفلِ
+                # هم‌پوشه رفتار می‌کنیم تا مدیر «نسخه‌ی تکراری» ببیند.
+                print("\n⛔ این نسخه اجرا نشد — اکانت از پوشه‌ی دیگری "
+                      "روشن است.", flush=True)
+                return EXIT_DUP
             if r == "needs_relogin":
                 # عمداً retry نمی‌کنیم: هر تلاشِ دوباره = یک کدِ ورودِ تازه
                 # برای مشتری. مدیر باید از پنل دوباره لاگین کند.
