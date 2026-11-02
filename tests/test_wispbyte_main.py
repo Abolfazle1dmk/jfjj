@@ -150,7 +150,18 @@ srv = slim.boot_listener(port=0)
 check("T6: شنونده‌ی بوت ساخته شد", srv is not None)
 if srv is not None:
     port = srv.server_address[1]
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=15) as r:
+    # مسیرِ مرورگر: HTML فارسی (کاربر ترمینال ندارد)
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=20) as r:
+        page = r.read().decode("utf-8")
+    check("T6: صفحه‌ی مرورگر HTML است", page.lstrip().startswith("<!doctype"),
+          page[:80])
+    check("T6: عنوانِ فارسی دارد", "وضعیتِ بوتِ جفج" in page, page[:200])
+    check("T6: کامیت در صفحه دیده می‌شود", "abc1234" in page)
+    check("T6: وضعیتِ «قدیمی» در صفحه هشدار می‌دهد",
+          "قدیمی" in page or "stale" in page, page[:200])
+    # مسیرِ برنامه‌ای: ?json=1
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/?json=1",
+                                timeout=20) as r:
         data = json.loads(r.read().decode("utf-8"))
     check("T6: پاسخ JSON است", isinstance(data, dict), data)
     check("T6: commit در پاسخ هست", data.get("commit") == "abc1234", data)
@@ -158,6 +169,11 @@ if srv is not None:
     check("T6: علتِ قدیمی‌بودن هم می‌آید", data.get("why") == "git fetch نشد",
           data)
     check("T6: وضعیتِ وابستگی‌ها هم می‌آید", data.get("deps") is True, data)
+    check("T6: فهرستِ چک‌ها در پاسخ هست",
+          isinstance(data.get("checks"), list) and len(data["checks"]) >= 5,
+          len(data.get("checks") or []))
+    check("T6: بدترین سطح گزارش می‌شود",
+          data.get("worst") in ("red", "yellow", "green"), data.get("worst"))
     buf = io.StringIO()
     with redirect_stdout(buf):
         slim.boot_listener_stop()
@@ -200,6 +216,36 @@ check("T8: پیام می‌گوید با نبودِ telethon سلف بالا ن�
       "بالا نمی‌آید" in out, out[-400:])
 check("T8: دستورِ نصب را با همان مفسر می‌دهد",
       "pip install -r" in out and sys.executable in out, out[-400:])
+
+# ── T10: die() باید علت را ذخیره کند و صفحه را نگه دارد ──
+slim.STATUS_FILE = tmp / "boot-status.txt"
+slim.HERE = tmp
+slim._boot_srv = None                     # شنونده‌ای نیست → نگه‌داشتن لازم نیست
+os.environ["JAFJ_DIE_HOLD"] = "0"
+rc = None
+buf = io.StringIO()
+try:
+    with redirect_stdout(buf):
+        slim.die("تست-خطای-بوت", 7)
+except SystemExit as e:
+    rc = e.code
+finally:
+    os.environ.pop("JAFJ_DIE_HOLD", None)
+check("T10: die با کدِ خودش خارج می‌شود", rc == 7, rc)
+check("T10: متنِ خطا در boot-status.txt ذخیره شده",
+      slim.STATUS_FILE.is_file() and
+      "تست-خطای-بوت" in slim.STATUS_FILE.read_text(encoding="utf-8"))
+check("T10: فایلِ وضعیت کامیت را هم دارد",
+      "commit=" in slim.STATUS_FILE.read_text(encoding="utf-8"))
+check("T10: فازِ بوت روی «خطا» می‌رود", slim._boot_phase["phase"] == "خطا",
+      slim._boot_phase)
+check("T10: پیامِ خطا در خروجی چاپ می‌شود", "تست-خطای-بوت" in buf.getvalue())
+os.environ["JAFJ_DIE_HOLD"] = "77"
+check("T10: JAFJ_DIE_HOLD خوانده می‌شود", slim.hold_seconds() == 77.0,
+      slim.hold_seconds())
+os.environ.pop("JAFJ_DIE_HOLD", None)
+check("T10: پیش‌فرضِ نگه‌داشتن ۱۰ دقیقه است", slim.hold_seconds() == 600.0,
+      slim.hold_seconds())
 
 # ── T9: git_head روی مخزنِ واقعی ──
 slim.run, slim.git_head = _real_run, _real_git_head
