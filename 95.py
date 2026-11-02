@@ -832,6 +832,20 @@ def dur(m):
     return f"{fa(h)} ساعت" + (f" و {fa(r)} دقیقه" if r else "")
 
 
+def when_fa(ts):
+    """«آخرین بار کِی بود؟» به‌صورتِ خوانا — ۰ یعنی هرگز."""
+    try:
+        ts = int(ts or 0)
+    except Exception:
+        ts = 0
+    if ts <= 0:
+        return "هرگز"
+    try:
+        return f"{datetime.fromtimestamp(ts):%m-%d %H:%M}"
+    except Exception:
+        return "؟"
+
+
 def secs(s):
     s = int(s)
     if s < 60:
@@ -1391,6 +1405,56 @@ class DB:
         except Exception:
             return 0
 
+    def ex_mark_peer_joined(self, eid, now_ts=None):
+        """«طرف برگشت و عضوِ کانالِ من شد» را یک‌بار ثبت کن؛ True اگر تازه بود.
+
+        باگِ «تعدادِ جذب آپدیت نمی‌شود»: این ستون فقط در **یک** مسیر (چکِ
+        دوره‌ایِ نگهبانی) نوشته می‌شد. هر مسیرِ دیگری که عضویت را تأیید
+        می‌کرد — پیامِ «جوین شدم» در پیوی، یا رکوردی که قبلاً joined بود —
+        بی‌صدا رد می‌شد، پس آمار همیشه صفر می‌ماند. حالا همه‌ی مسیرها از
+        همین یک تابع رد می‌شوند و «تازه بودن» را برمی‌گرداند تا پیامِ
+        «🤝 تبادل کامل شد» فقط یک‌بار برود.
+        """
+        try:
+            r = self.ex_get(int(eid))
+        except (TypeError, ValueError):
+            return False
+        if not r or int(r.get("peer_joined_at") or 0):
+            return False
+        # فقط رکوردِ «پیش‌قدم» (out): آن‌جا من اول رفتم و لحظه‌ی تکمیلِ
+        # تبادل، عضویتِ طرف است. در رکوردِ «in» طرف از اول عضوِ کانال من
+        # بود و شمارش با `joined_at` انجام می‌شود؛ اگر این‌جا هم ثبت شود،
+        # پیامِ «تبادل کامل شد» بی‌دلیل و تکراری می‌رفت.
+        if (r.get("direction") or "in") != "out":
+            return False
+        ts = int(now_ts if now_ts is not None else time.time())
+        try:
+            self.ex_set(int(eid), peer_joined_at=ts)
+        except Exception:
+            return False
+        return True
+
+    def ex_last_ts(self):
+        """(آخرین جوین، آخرین لفت واقعی) — برای اینکه «۰» با «کهنه» قاطی نشود."""
+        out = {"last_join": 0, "last_peer_join": 0, "last_left": 0}
+        try:
+            r = self._x("SELECT MAX(joined_at) m FROM exchange", (), "one")
+            out["last_join"] = int((r or {}).get("m") or 0)
+        except Exception:
+            pass
+        try:
+            r = self._x("SELECT MAX(peer_joined_at) m FROM exchange", (), "one")
+            out["last_peer_join"] = int((r or {}).get("m") or 0)
+        except Exception:
+            pass
+        try:
+            r = self._x("SELECT MAX(ts) m FROM events WHERE kind='ex_left'",
+                        (), "one")
+            out["last_left"] = int((r or {}).get("m") or 0)
+        except Exception:
+            pass
+        return out
+
     def ex_report_counts(self, since):
         """آمار تبادل برای گزارش خصوصی، از timestamp داده‌شده تا الان."""
         since = int(since or 0)
@@ -1413,6 +1477,10 @@ class DB:
             "pending": q("SELECT COUNT(*) c FROM exchange WHERE status='pending'"),
             "approved": q("SELECT COUNT(*) c FROM exchange WHERE status='approved'"),
             "not_returned": q("SELECT COUNT(*) c FROM exchange WHERE direction='out' AND status='joined' AND strikes>0"),
+            # «کیف»ِ زمان‌ها: بدونِ این، کاربر نمی‌فهمد «۰» یعنی «هنوز
+            # چیزی نبوده» یا «شمارنده گیر کرده». همه‌ی مسیرها این را
+            # نشان می‌دهند (پنل، گزارش، پیام‌های لحظه‌ای).
+            **self.ex_last_ts(),
         }
 
     def ex_joins_today(self):
@@ -4658,9 +4726,19 @@ class Engine:
                 "`کانال @mychannel` · یا کلِ راه: `تبادل سریع`",
                 "",
             ]
+        # جذب/لفت در خودِ پنل هم دیده شود؛ قبلاً فقط در گزارش‌ها بود و
+        # کاربر همان‌جا دنبالش می‌گشت.
+        try:
+            st = self.db.ex_report_counts(self._day_start())
+        except Exception:
+            st = {}
         lines += [
             f"جوین امروز: {fad(today)} · انجام‌شده: {fad(c.get('joined', 0))}"
             f" · در صف: {fad(c.get('approved', 0))}",
+            f"👥 جذب امروز: {fad(st.get('in_joined', 0))} نفر"
+            f" · 👋 لفت امروز: {fad(st.get('left', 0))} کانال",
+            f"🕘 آخرین جذب: {when_fa(st.get('last_peer_join'))}"
+            f" · آخرین لفت: {when_fa(st.get('last_left'))}",
             "",
             f"فاصله Join: {gap} ({adapt})",
             "",
@@ -4965,6 +5043,10 @@ class Engine:
             f"⏳ در صف Join: {fa(c['approved'])}",
             f"⌛ منتظر بررسی: {fa(c['pending'])}",
             f"❌ Join ناموفق: {fa(c['failed'])}",
+            "",
+            f"🕘 آخرین جذب: {when_fa(c.get('last_peer_join'))}"
+            f" · آخرین لفت: {when_fa(c.get('last_left'))}"
+            f" · آخرین Join: {when_fa(c.get('last_join'))}",
             "",
             f"📈 نتیجه: {fa(c['in_joined'])} تبادل موفق برای جذب",
             "━━━━━━━━━━━━━━━━",
@@ -8812,6 +8894,13 @@ async def connect_and_run(eng, creds):
         if not rec:
             return
         if rec["status"] == "joined":
+            # اینجا هم «طرف عضو است» تأیید شد؛ قبلاً همین مسیر بی‌صدا رد
+            # می‌شد و ستونِ «جذب موفق» خالی می‌ماند (باگِ آمارِ آپدیت‌نشده).
+            if eng.db.ex_mark_peer_joined(rec["id"]):
+                eng.log("ok", "ex_peer_joined", f"#{rec['id']} {link}")
+                if eng.ex_cfg().get("report_mode", "live") == "live":
+                    await note(eng.ex_live_peer_join_text(
+                        eng.db.ex_get(rec["id"]) or rec))
             delay = response_delay_seconds()
             if delay:
                 await asyncio.sleep(delay)
@@ -8823,6 +8912,14 @@ async def connect_and_run(eng, creds):
         eng.db.ex_set(rec["id"], src_chat=event.chat_id, src_msg=event.id,
                       replied=0, peer_id=sender.id, peer_name=sender_name,
                       reminders_total=0)   # عضو واقعی بود — سابقه «نیومدی» پاک شود
+        # عضویت همین حالا تأیید شد → «جذب» را همین‌جا ثبت کن. اگر فقط به
+        # چکِ دوره‌ای تکیه کنیم، رکوردی که طرفش سریع جواب می‌دهد هرگز
+        # شمرده نمی‌شد و آمار صفر می‌ماند.
+        if eng.db.ex_mark_peer_joined(rec["id"]):
+            eng.log("ok", "ex_peer_joined", f"#{rec['id']} {link}")
+            if x.get("report_mode", "live") == "live":
+                await note(eng.ex_live_peer_join_text(
+                    eng.db.ex_get(rec["id"]) or rec))
 
         if x["auto_join"]:
             eng.db.ex_set(rec["id"], status="approved", strikes=0,
@@ -9422,15 +9519,14 @@ async def connect_and_run(eng, creds):
                         # «جذب موفق» هم هیچ‌وقت بالا نمی‌رفت. الان با اولین
                         # تأییدِ عضویت، زمانش ذخیره و یک‌بار هم به خودت
                         # گزارش می‌شود (فقط یک‌بار، چون ستون دیگر خالی نیست).
-                        _peer_back = (rec.get("direction") == "out"
-                                      and not int(rec.get("peer_joined_at") or 0))
                         eng.db.ex_set(rec["id"], last_check=now,
                                       next_check=next_action_after(
                                           rec, now + watch_delay_seconds(rec)),
                                       strikes=0, unk_streak=0, reminders_total=0,
-                                      note="عضو است",
-                                      **({"peer_joined_at": now} if _peer_back else {}))
-                        if _peer_back:
+                                      note="عضو است")
+                        # همان ثبت‌کننده‌ی مشترک: هر مسیری که عضویت را
+                        # تأیید کند، «جذب» را یک‌بار بالا می‌برد.
+                        if eng.db.ex_mark_peer_joined(rec["id"], now):
                             eng.log("ok", "ex_peer_joined",
                                     f"#{rec['id']} {rec['link']}")
                             if eng.ex_cfg().get("report_mode", "live") == "live":
