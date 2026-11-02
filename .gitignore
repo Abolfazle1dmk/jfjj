@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .jafj_deploy_id
 .venv/
+.jafj_instances/
+jafj_boot.log
+jafj_boot_error.txt
+boot-status.txt
