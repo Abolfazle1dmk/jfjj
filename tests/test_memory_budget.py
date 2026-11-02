@@ -97,7 +97,11 @@ def main():
     check("بدونِ eng → خطا نمی‌دهد", trim_link(FakeEng()) == 0)
 
     # ── ۴) حلقه‌ی دوره‌ای در سلف ثبت شده ──────────────────────────
-    check("حلقه‌ی memory_loop ساخته می‌شود", "asyncio.create_task(memory_loop())" in src)
+    # از PRِ «نگهبانِ حلقه‌ها» به بعد، هر حلقه زیرِ _supervise راه می‌افتد
+    # تا اگر مرده خودش برگردد؛ قرارداد همان است: memory_loop اجرا شود.
+    check("حلقه‌ی memory_loop ساخته می‌شود",
+          ('asyncio.create_task(memory_loop())' in src
+           or '_supervise("memory", memory_loop)' in src))
     check("حلقه‌ی حافظه در پاک‌سازیِ خروج لغو می‌شود",
           "mem_task" in src and "st_task, mem_task)" in src)
     # محلِ استفاده: سقف باید همان‌جا هم چک شود (نه فقط در trim_link_cache)
