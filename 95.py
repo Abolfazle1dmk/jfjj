@@ -701,6 +701,53 @@ def capacity_round_exhausted(started, now, limit_sec=CAPACITY_CLEANUP_MAX_SEC):
         return False
 
 
+MANUAL_LEAVE_MAX_FAILS = 3
+# خطاهایی که «موقتی» هستند: تلاشِ بعدی می‌تواند موفق شود.
+_LEAVE_TRANSIENT_ERRORS = ("FloodWait", "Timeout", "RPCError", "ConnectionError",
+                           "OSError", "NetworkError", "ServerError",
+                           "ConnectionReset", "ReadTimeout")
+
+
+def leave_error_is_transient(err):
+    """خطای لفت موقتی است یا قطعی؟
+
+    موقتی = FloodWait/شبکه/تایم‌اوت. قطعی = لینک و کانال قابلِ حل نیست
+    (پیامِ فارسیِ «منقضی/باطل») یا هر چیزِ ناشناخته‌ای که تکرارش بی‌فایده
+    است.
+    """
+    e = str(err or "")
+    if not e:
+        return False
+    if "منقضی" in e or "باطل" in e:
+        return False
+    return e.startswith(_LEAVE_TRANSIENT_ERRORS)
+
+
+def manual_leave_retry_plan(rec, now=None, err=""):
+    """بعد از شکستِ یک «لفتِ دستی»، رکورد را چه کنیم؟
+
+    باگِ قبلی: در حلقه‌ی لفت‌های دستی، هر شکستی (حتی یک FloodWait کوتاه یا
+    تایم‌اوتِ شبکه) رکورد را مستقیم ``failed`` می‌کرد؛ یعنی دستورِ
+    `تبادل خروج ۵` برای همیشه بی‌اثر می‌شد و کانال در حساب می‌ماند.
+
+    رفتارِ تازه:
+      * خطای موقتی → رکورد در وضعیتِ ``leaving`` می‌ماند و با عقب‌نشینیِ
+        پلکانی (۶۰ث → ۵دق → ۲۵دق) دوباره تلاش می‌شود؛
+      * خطای قطعی یا رسیدن به سقفِ تلاش → ``failed`` با همان پیامِ خطا،
+        تا کاربر بداند چه کاری لازم است (لینک تازه / دستی).
+    """
+    now = int(time.time() if now is None else now)
+    fails = int((rec or {}).get("leave_fail") or 0) + 1
+    if not leave_error_is_transient(err) or fails >= MANUAL_LEAVE_MAX_FAILS:
+        return {"status": "failed", "leave_fail": fails,
+                "leave_blocked_until": 0, "note": str(err or "لفت دستی نشد")}
+    back = min(6 * 3600, 60 * (5 ** (fails - 1)))
+    return {"status": "leaving", "leave_fail": fails,
+            "leave_blocked_until": now + back,
+            "note": f"لفت دستی نشد (تلاش {fails}): {err} — "
+                    f"تلاش بعدی تا {secs(back)} دیگر"}
+
+
 def clamp_capacity_batch(value):
     """عدد دور پاکسازی را به بازه‌ی مجاز می‌چسباند؛ ورودی نامعتبر → پیش‌فرض."""
     try:
@@ -4435,9 +4482,24 @@ class Engine:
             if not rec:
                 return "پیدا نشد."
             if sub == "no":
+                if rec.get("status") in ("joined", "leaving"):
+                    # اگر عضوِ کانالِ طرف هستیم، «رد کردن» نباید ما را آن‌جا
+                    # نگه دارد: هر عضویتِ بی‌مصرف یکی از ۵۰۰ جای اکانت را
+                    # می‌گیرد و همان چیزی است که به ChannelsTooMuch می‌رسد.
+                    self.db.ex_set(rec["id"], status="leaving",
+                                   note="رد شد — لفت از کانال طرف در نوبت")
+                    return (f"🚫 `#{fa(rec['id'])}` رد شد و در نوبتِ لفت قرار "
+                            "گرفت (از کانالش خارج می‌شوم).")
                 self.db.ex_set(rec["id"], status="rejected")
                 return f"🚫 `#{fa(rec['id'])}` رد شد."
             if sub == "del":
+                if rec.get("status") in ("joined", "leaving"):
+                    # حذفِ رکورد یعنی از دست دادنِ لینک/آیدیِ کانال؛ بعدش
+                    # دیگر راهی برای لفت نمی‌ماند و حساب پر می‌ماند.
+                    return ("⚠️ این رکورد جوین است و اگر حذف شود راهِ لفتش را "
+                            "از دست می‌دهیم.\n"
+                            f"اول `تبادل خروج {fa(rec['id'])}` بده (لفت انجام "
+                            "می‌شود) و بعد حذفش کن.")
                 self.db.ex_delete(rec["id"])
                 return f"🗑 `#{fa(rec['id'])}` حذف شد."
             if sub == "ok":
@@ -9312,10 +9374,22 @@ async def connect_and_run(eng, creds):
                         continue
 
                 # ۱) لفت‌های دستی
-                for rec in eng.db.ex_list("leaving", 5):
+                _now_ml = int(time.time())
+                _tried_ml = 0
+                for rec in eng.db.ex_list("leaving", 20):
+                    # رکوردی که تلاشِ قبلی‌اش شکست خورده تا پایانِ
+                    # عقب‌نشینی دوباره امتحان نمی‌شود (هم به اکانت فشار
+                    # نمی‌آید، هم نوبتِ بقیه را نمی‌گیرد).
+                    if int(rec.get("leave_blocked_until") or 0) > _now_ml:
+                        continue
+                    _tried_ml += 1
                     ok, err = await leave_link(rec["link"], rec["id"])
-                    eng.db.ex_set(rec["id"], status="left" if ok else "failed",
-                                  note="لفت دستی" if ok else err)
+                    if ok:
+                        eng.db.ex_set(rec["id"], status="left", leave_fail=0,
+                                      leave_blocked_until=0, note="لفت دستی")
+                    else:
+                        plan = manual_leave_retry_plan(rec, _now_ml, err)
+                        eng.db.ex_set(rec["id"], **plan)
                     # لفتِ دستی هم در آمار شمرده می‌شود (ex_left فقط برای
                     # لفتِ واقعی) و نتیجه‌اش هم به خودت گزارش می‌شود؛ قبلاً
                     # اگر لفت دستی شکست می‌خورد، هیچ پیامی نمی‌آمد.
@@ -9327,6 +9401,8 @@ async def connect_and_run(eng, creds):
                             eng.db.ex_get(rec["id"]) or rec,
                             "" if ok else err, "manual"))
                     await asyncio.sleep(3)
+                    if _tried_ml >= 5:
+                        break
 
                 # ۲) جوین تأییدشده‌ها — تطبیقی + سقف ساعتی
                 # گیتِ سقفِ عضویت — فقط جوین را متوقف می‌کند.

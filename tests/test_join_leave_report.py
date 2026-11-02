@@ -65,6 +65,8 @@ def _ns(d):
     d.setdefault("_note_check_why", (lambda w: None))
     for _nm in ("ChannelInvalidError", "UsernameInvalidError"):
         d.setdefault(_nm, type(_nm, (Exception,), {}))
+    d.setdefault("manual_leave_retry_plan", m.manual_leave_retry_plan)
+    d.setdefault("leave_error_is_transient", m.leave_error_is_transient)
     if "CHECK_DEFERRED" not in d:
         _m = globals().get("m")
         d["CHECK_DEFERRED"] = getattr(_m, "CHECK_DEFERRED", None) or _CdStub()
