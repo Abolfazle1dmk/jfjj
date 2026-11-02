@@ -573,8 +573,20 @@ def _capacity_pool(records):
 
 
 def _capacity_candidates(records, own_channels=(), exclude_id=None,
-                         exclude_ids=None):
-    """کاندیدهای امنِ لفت، قدیمی‌ترین اول — بدونِ حلقه‌ی تودرتو."""
+                         exclude_ids=None, relax=0):
+    """کاندیدهای امنِ لفت، قدیمی‌ترین اول — بدونِ حلقه‌ی تودرتو.
+
+    `relax` درجه‌ی نرم‌شدن است و فقط وقتی بالا می‌رود که سقفِ تلگرام
+    واقعاً پر شده باشد (ChannelsTooMuch) و هیچ کاندیدِ کاملی نمانده باشد:
+
+      ۰ = فقط تبادلِ کامل و امن (رفتارِ همیشگی؛ پیش‌فرض)
+      ۱ = + پیش‌قدم‌هایی که طرف برنگشته (همان‌ها که نگهبانی هم بالاخره
+          لفتشان می‌دهد) — این‌ها **اول** لفت می‌شوند
+      ۲ = + رکوردهای دستیِ بدونِ طرف (کانالی که فقط خودمان جوین شدیم)
+
+    کانالِ خودِ کاربر، رکوردِ یادآوردار و کانالِ تکراری در هیچ درجه‌ای
+    لفت نمی‌شوند.
+    """
     joined, by_chat, by_link = _capacity_pool(records)
     own_keys = {peer_ref_key(c) for c in (own_channels or []) if c}
     own_keys.discard("")
@@ -595,9 +607,15 @@ def _capacity_candidates(records, own_channels=(), exclude_id=None,
         rid = _safe_id(rec)
         if rid in skip:
             continue
-        if not rec.get("peer_id"):
+        # درجه ۲: رکوردِ دستی (بدونِ طرف) هم کاندید است؛ کسی طرفِ معامله
+        # نیست که لفت‌شدنش ناعادلانه باشد.
+        if relax < 2 and not rec.get("peer_id"):
             continue
-        if (str(rec.get("direction") or "in").lower() == "out"
+        # درجه ۱: پیش‌قدمی که طرف هیچ‌وقت برنگشت — دقیقاً همان رکوردی که
+        # نگهبانی (strikes) هم بالاخره لفتش می‌دهد. قبلاً همین‌ها کنار
+        # گذاشته می‌شدند و اکانتِ ۵۰۰تایی هیچ‌وقت جا آزاد نمی‌کرد.
+        if (relax < 1
+                and str(rec.get("direction") or "in").lower() == "out"
                 and not rec.get("peer_joined_at")):
             continue
         try:
@@ -620,18 +638,27 @@ def _capacity_candidates(records, own_channels=(), exclude_id=None,
         out.append(rec)
 
     def _age_key(rec):
+        # در درجه‌ی ۱+ اول «برنگشته‌ها» می‌روند (کم‌ارزش‌ترین‌ها) و بعد
+        # قدیمی‌ترین‌ها؛ وگرنه ترتیبِ همیشگی: قدیمی‌ترین اول.
+        # ۰ = «برگشت‌نداده» (اول لفت می‌شود) · ۱ = بقیه
+        _prio = 1
+        if (relax >= 1
+                and str(rec.get("direction") or "in").lower() == "out"
+                and not rec.get("peer_joined_at")):
+            _prio = 0
         try:
-            return (int(rec.get("joined_at") or rec.get("created_at") or 0),
+            return (_prio,
+                    int(rec.get("joined_at") or rec.get("created_at") or 0),
                     int(rec.get("id") or 0))
         except (TypeError, ValueError):
-            return (0, 0)
+            return (_prio, 0, 0)
 
     out.sort(key=_age_key)
     return out
 
 
 def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None,
-                                   exclude_ids=None):
+                                   exclude_ids=None, relax=0):
     """قدیمی‌ترین کاندیدِ امنِ لفت (یا None).
 
     قواعد: فقط joined، با peer_id، یادآورِ فعال نداشته باشد، کانال خودِ
@@ -640,7 +667,7 @@ def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None,
     """
     cands = _capacity_candidates(records, own_channels=own_channels,
                                  exclude_id=exclude_id,
-                                 exclude_ids=exclude_ids)
+                                 exclude_ids=exclude_ids, relax=relax)
     return cands[0] if cands else None
 
 
@@ -663,6 +690,9 @@ LOOP_LAG_WARN_SEC = 20
 # اگر بعد از یک دور پاکسازیِ موفق، تلگرام هنوز سقف را پر اعلام کند (ثبتِ
 # آزادشدن slot در سرور تلگرام کمی تأخیر دارد)، جوین چقدر مکث کند؟
 CAPACITY_REBLOCK_SEC = 300
+# «هیچ کاندیدی برای لفت نیست» حداکثر هر چند ثانیه یک‌بار گفته شود. قبلاً هر
+# دور (هر ۵ دقیقه) تکرار می‌شد و کاربر فقط دو پیامِ پشتِ‌سرهم می‌دید.
+CAPACITY_NOTE_GAP_SEC = 6 * 3600
 
 
 class _CheckDeferred:
@@ -762,7 +792,7 @@ def clamp_capacity_batch(value):
 
 def select_capacity_leave_batch(records, own_channels=(),
                                 limit=CAPACITY_CLEANUP_BATCH_DEFAULT,
-                                exclude_id=None):
+                                exclude_id=None, relax=0):
     """فهرست مرتب‌شده‌ی کاندیدهای لفتِ امن برای یک دور پاکسازی.
 
     هر بار قدیمی‌ترین کاندید را با همان قواعد
@@ -774,29 +804,93 @@ def select_capacity_leave_batch(records, own_channels=(),
     """
     limit = clamp_capacity_batch(limit)
     cands = _capacity_candidates(records, own_channels=own_channels,
-                                 exclude_id=exclude_id)
+                                 exclude_id=exclude_id, relax=relax)
     return cands[:limit]
 
 
-def format_capacity_cleanup_note(left_links, target, stopped=None):
-    """خلاصه‌ی یک‌پیامیِ فرایند پاکسازی سقف (به‌جای نوتیف per لفت)."""
+def capacity_diag(records, own_channels=()):
+    """چرا هیچ کاندیدی برای لفت نیست؟ — شمارشِ دقیق به‌ازای هر دلیل.
+
+    بدونِ این، پیامِ «هیچ تبادلِ کاملی پیدا نشد» کاربر را در بن‌بست
+    می‌گذاشت: معلوم نبود چند کانال در حالِ یادآور است، چندتا کانالِ خودش
+    است، و چندتا پیش‌قدمِ برگشت‌نداده که باید آزاد شوند.
+    """
+    joined = [r for r in (records or []) if r.get("status") == "joined"]
+    own_keys = {peer_ref_key(c) for c in (own_channels or []) if c}
+    own_keys.discard("")
+    _j, by_chat, by_link = _capacity_pool(joined)
+    d = {"joined": len(joined), "own": 0, "reminder": 0,
+         "unreturned": 0, "no_peer": 0, "dup": 0}
+    for r in joined:
+        key = peer_ref_key(r.get("link"))
+        if key and key in own_keys:
+            d["own"] += 1
+            continue
+        try:
+            if int(r.get("next_reminder") or 0) > 0:
+                d["reminder"] += 1
+                continue
+        except (TypeError, ValueError):
+            pass
+        if (str(r.get("direction") or "in").lower() == "out"
+                and not r.get("peer_joined_at")):
+            d["unreturned"] += 1
+            continue
+        if not r.get("peer_id"):
+            d["no_peer"] += 1
+            continue
+        try:
+            cid = int(r.get("chat_id") or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        if ((cid and len(by_chat.get(cid, ())) > 1)
+                or (key and len(by_link.get(key, ())) > 1)):
+            d["dup"] += 1
+    return d
+
+
+def format_capacity_cleanup_note(left_links, target, stopped=None,
+                                 diag=None, relax=0):
+    """خلاصه‌ی یک‌پیامیِ فرایند پاکسازی سقف (به‌جای نوتیف per لفت).
+
+    `diag` (خروجیِ ``capacity_diag``) و `relax` برای حالتی است که هیچ
+    کاندیدِ «کامل» نبود: پیام باید بگوید چرا و چه کاری از دستِ کاربر
+    برمی‌آید — نه فقط «هیچ تبادلی پیدا نشد».
+    """
     links = [str(l) for l in (left_links or []) if l]
     n = len(links)
     if n == 0:
-        return ("🧹 سقف عضویت تلگرام پر بود ولی هیچ تبادلِ کامل‌شده‌ی امنی "
-                "برای لفت پیدا نشد؛ یک عضویت را دستی آزاد کن و بعد "
-                "`تبادل لفت خودکار ریست` را بفرست.")
+        out = ["🧹 سقف عضویت تلگرام پر بود ولی هیچ تبادلِ کامل‌شده‌ی امنی "
+               "برای لفت پیدا نشد."]
+        d = diag or {}
+        if d.get("joined"):
+            out.append(
+                f"از {fa(d.get('joined', 0))} کانالِ ثبت‌شده: "
+                f"{fa(d.get('reminder', 0))} در حالِ یادآور · "
+                f"{fa(d.get('own', 0))} کانالِ خودت · "
+                f"{fa(d.get('unreturned', 0))} پیش‌قدمِ برگشت‌نداده · "
+                f"{fa(d.get('no_peer', 0))} بدونِ طرف · "
+                f"{fa(d.get('dup', 0))} تکراری.")
+        out += ["یک عضویت را دستی آزاد کن و بعد "
+                "`تبادل لفت خودکار ریست` را بفرست.",
+                "لفتِ یک موردِ مشخص: `تبادل خروج <لینک یا آیدی>`"]
+        return "\n".join(out)
     head = links[:STALE_NOTE_MAX_LINKS]
-    lines = [f"🧹 پاکسازی سقف عضویت: از {fa(n)} کانالِ جفج‌زده لفت دادم "
-             f"(هدف هر دور: {fa(target)})."]
-    lines += [f"`{l}`" for l in head]
+    out = [f"🧹 پاکسازی سقف عضویت: از {fa(n)} کانالِ جفج‌زده لفت دادم "
+           f"(هدف هر دور: {fa(target)})."]
+    if relax >= 1:
+        # شفاف باش: این‌ها «تبادلِ کامل» نبودند، ولی وقتی سقف پر است
+        # آزادکردنشان از بیکار ماندنِ کلِ تبادل بهتر است.
+        out.append("ℹ️ تبادلِ کاملِ امنی برای لفت نبود؛ از پیش‌قدم‌های "
+                   "برگشت‌نداده/رکوردهای بدونِ طرف لفت دادم.")
+    out += [f"`{l}`" for l in head]
     if n > len(head):
-        lines.append(f"و {fa(n - len(head))} مورد دیگر…")
+        out.append(f"و {fa(n - len(head))} مورد دیگر…")
     if stopped:
-        lines.append(f"⏹ پاکسازی زودتر تمام شد: {stopped}")
+        out.append(f"⏹ پاکسازی زودتر تمام شد: {stopped}")
     else:
-        lines.append("جا آزاد شد؛ جوینِ معلق دوباره تلاش می‌شود.")
-    return "\n".join(lines)
+        out.append("جا آزاد شد؛ جوینِ معلق دوباره تلاش می‌شود.")
+    return "\n".join(out)
 
 
 VERSION = "3.0"
@@ -8107,15 +8201,46 @@ async def connect_and_run(eng, creds):
         joined = eng.db.ex_list("joined", 1000)
         own_channels = [eng.st.prof(t).get("channel")
                         for t in ("standard", "vip")]
+        # ── پله‌های نرم‌شدن ──
+        # قبلاً فقط «تبادلِ کامل و امن» کاندید بود. روی اکانتِ نزدیکِ ۵۰۰
+        # کانال، بیشترِ رکوردها پیش‌قدمِ برگشت‌نداده‌اند؛ نتیجه: هیچ کاندیدی
+        # پیدا نمی‌شد، هیچ کانالی لفت نمی‌رفت، و جوین برای همیشه
+        # ChannelsTooMuch می‌خورد — همان «نه لفت می‌ده».
+        relax_used = 0
         candidates = select_capacity_leave_batch(
             joined, own_channels=own_channels, limit=target)
         if not candidates:
+            relax_used = 1
+            candidates = select_capacity_leave_batch(
+                joined, own_channels=own_channels, limit=target, relax=1)
+        if not candidates:
+            relax_used = 2
+            candidates = select_capacity_leave_batch(
+                joined, own_channels=own_channels, limit=target, relax=2)
+        if candidates and relax_used:
+            eng.log("warn", "ex_capacity_relax",
+                    f"درجه‌ی {relax_used}: کاندیدِ کامل نبود؛ "
+                    f"{len(candidates)} رکوردِ کم‌ارزش‌تر برای آزادکردنِ سقف")
+        if not candidates:
             eng.log("warn", "ex_capacity_no_candidate",
-                    "هیچ تبادلِ کامل و قابل‌تشخیص برای آزادسازی ظرفیت نبود")
-            try:
-                await note(format_capacity_cleanup_note([], target))
-            except Exception:
-                pass
+                    "حتی با نرم‌شدن هم کاندیدی برای آزادسازی ظرفیت نبود")
+            # پیامِ «هیچ کاندیدی نیست» بی‌نهایت تکرار می‌شد (هر ۵ دقیقه یک
+            # بار) و کاربر فقط دو پیامِ پشتِ‌سرهم می‌دید. حالا حداکثر هر
+            # CAPACITY_NOTE_GAP_SEC یک‌بار، با شمارشِ دلیل‌ها.
+            _now_n = int(time.time())
+            _last_n = int(cfg.get("_capacity_note_at", 0) or 0)
+            if _now_n - _last_n >= CAPACITY_NOTE_GAP_SEC:
+                cfg["_capacity_note_at"] = _now_n
+                try:
+                    eng.st.save()
+                except Exception:
+                    pass
+                try:
+                    await note(format_capacity_cleanup_note(
+                        [], target,
+                        diag=capacity_diag(joined, own_channels)))
+                except Exception:
+                    pass
             return 0, "هیچ تبادلِ کامل‌شدهٔ امنی برای لفت پیدا نشد."
 
         left_links = []
@@ -8160,7 +8285,8 @@ async def connect_and_run(eng, creds):
         if had_outbound:
             eng.ex_cfg()["_scan_now"] = True
         try:
-            await note(format_capacity_cleanup_note(left_links, target, stopped))
+            await note(format_capacity_cleanup_note(
+                left_links, target, stopped, relax=relax_used))
         except Exception:
             pass
         if not left_links:
