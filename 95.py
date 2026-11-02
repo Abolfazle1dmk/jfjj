@@ -2966,6 +2966,11 @@ class Engine:
                 "ai": bool(self.ai.ready),
                 "plan": self.lim["plan"],
                 "last_error": self.last_error,
+                # حافظه و سلامتِ حلقه‌ها: پنل با همین دو عدد جوابِ «چرا هیچ
+                # کاری نمی‌کند» را می‌دهد، بی‌آنکه کسی ترمینال داشته باشد.
+                "mem": mem_info(),
+                "loops": {k: dict(v) for k, v in
+                          (getattr(self, "loop_state", None) or {}).items()},
                 "risk": self.risk_current()[0],
                 "risk_on": bool(self.st["risk"].get("on", True)),
                 "risk_trigger": self.st["risk"].get("trigger", 75),
@@ -6353,6 +6358,97 @@ def start_instance_heartbeat(uid, every=60):
                          name="jafj-instance-beat").start()
     except Exception:
         pass
+
+
+# ─────────────────────────────────────────────
+#  حافظه — «رم کم است» باید یک عددِ واقعی باشد، نه حس
+# ─────────────────────────────────────────────
+# در کانتینر، `/proc/meminfo` حافظه‌ی کلِ **میزبان** را نشان می‌دهد: ممکن است
+# «۴۰۰ مگابایت آزاد» ببینیم و همان لحظه کرنل با OOM پروسه را بکشد. عددِ
+# واقعی همان سقفِ cgroup است (v1 و v2). این تابع اول او را می‌خواند تا
+# گزارشِ «حافظه» در پنل دروغ نگوید.
+def _read_mem_int(path):
+    try:
+        with open(path, encoding="ascii") as f:
+            raw = f.read().strip()
+        if not raw or raw.lower() == "max":
+            return None
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _cgroup_dirs(root="/sys/fs/cgroup", proc_cgroup="/proc/self/cgroup"):
+    """پوشه‌های cgroupِ همین پروسه (ریشه + مسیرِ خودمان)."""
+    dirs = [root]
+    try:
+        with open(proc_cgroup, encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(":", 2)
+                if len(parts) != 3:
+                    continue
+                _h, ctrl, group = parts
+                group = group.lstrip("/")
+                if not group:
+                    continue
+                if not ctrl:                       # cgroup v2
+                    dirs.append(os.path.join(root, group))
+                elif "memory" in ctrl.split(","):  # cgroup v1
+                    dirs.append(os.path.join(root, "memory", group))
+                    dirs.append(os.path.join(root, group))
+    except Exception:
+        pass
+    return dirs
+
+
+def cgroup_mem_mb(root="/sys/fs/cgroup", proc_cgroup="/proc/self/cgroup"):
+    """(سقف, مصرف) به مگابایت یا (None, None) اگر سقفی نبود."""
+    seen = set()
+    for d in _cgroup_dirs(root, proc_cgroup):
+        if d in seen:
+            continue
+        seen.add(d)
+        for lim_name, use_name in (("memory.max", "memory.current"),
+                                   ("memory.limit_in_bytes",
+                                    "memory.usage_in_bytes")):
+            lim = _read_mem_int(os.path.join(d, lim_name))
+            if not lim or lim <= 0 or lim > (1 << 60):
+                continue
+            use = _read_mem_int(os.path.join(d, use_name)) or 0
+            return (round(lim / 1048576.0, 1), round(use / 1048576.0, 1))
+    return None, None
+
+
+def mem_info():
+    """{'free_mb','limit_mb','used_mb','source'} — free از سقفِ کانتینر."""
+    lim, use = cgroup_mem_mb()
+    if lim is not None:
+        return {"free_mb": int(max(0.0, lim - (use or 0.0))),
+                "limit_mb": int(lim), "used_mb": int(use or 0),
+                "source": "cgroup"}
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return {"free_mb": int(line.split()[1]) // 1024,
+                            "limit_mb": None, "used_mb": None,
+                            "source": "meminfo"}
+    except Exception:
+        pass
+    return {"free_mb": None, "limit_mb": None, "used_mb": None, "source": "?"}
+
+
+# نامِ فارسیِ حلقه‌ها — پیامِ «حلقه از کار افتاد» باید برای مشتری خوانا باشد.
+LOOP_LABELS = {
+    "sender": "ارسال",
+    "exchange": "تبادل",
+    "scan": "اسکنِ گروه‌ها",
+    "membership": "بررسیِ عضویت",
+    "report": "گزارشِ خلاصه",
+    "risk": "محافظِ ریپ",
+    "status": "وضعیت",
+    "memory": "آزادسازیِ حافظه",
+}
 
 
 # ─────────────────────────────────────────────
@@ -10020,14 +10116,86 @@ async def connect_and_run(eng, creds):
             await asyncio.sleep(600)
 
     _boot_step("هندلرها و حلقه‌ها ثبت شدند")
-    task = asyncio.create_task(sender_loop())
-    ex_task = asyncio.create_task(exchange_worker())
-    scan_task = asyncio.create_task(scan_loop())
-    member_task = asyncio.create_task(membership_loop())
-    report_task = asyncio.create_task(report_loop())
-    risk_task = asyncio.create_task(risk_loop())
-    st_task = asyncio.create_task(status_loop())
-    mem_task = asyncio.create_task(memory_loop())
+
+    # ── نگهبانِ حلقه‌ها ────────────────────────────────────────────────
+    # چرا: هر حلقه یک Task است. اگر یکی بمیرد (خطای غیرمنتظره در جایی که
+    # try/except ندارد، MemoryError، لغوِ درونیِ wait_for)، هیچ‌کس خبر
+    # نمی‌دهد: `run_until_disconnected` زنده می‌ماند، پنل جواب می‌دهد، ولی
+    # تبادل/ارسال/اسکن هرگز اجرا نمی‌شود — همان «ربات روشن است ولی کار
+    # نمی‌کند» که تا ری‌استارتِ دستی ادامه داشت. حالا هر حلقه زیرِ نگهبان
+    # است: می‌میرد، خودکار با تأخیرِ پله‌ای برمی‌گردد، و علتش هم در Saved
+    # Messages و هم در `jafj_status.json` (بخشِ loops) می‌نشیند.
+    eng.loop_state = {}
+    _loop_note_at = {}
+
+    def _loop_mark(name, state, err=""):
+        rec = eng.loop_state.setdefault(name, {"restarts": 0, "errors": 0})
+        rec["state"] = state
+        rec["ts"] = int(time.time())
+        if err:
+            rec["errors"] = int(rec.get("errors", 0)) + 1
+            rec["last_error"] = str(err)[:200]
+        return rec
+
+    async def _loop_restart_note(name, exc, n):
+        now_t = time.time()
+        if now_t - _loop_note_at.get(name, 0.0) < 1800:
+            return
+        _loop_note_at[name] = now_t
+        label = LOOP_LABELS.get(name, name)
+        await note(
+            f"♻️ حلقه‌ی «{label}» از کار افتاد و خودم دوباره راهش انداختم "
+            f"(دفعه‌ی {fa(n)}).\n"
+            f"`{type(exc).__name__}: {str(exc)[:120] or 'بدون پیام'}`\n"
+            "اگر تکرار شد «🩺 عیب‌یابی» را بزن؛ علت و ساعتش همان‌جا هست.")
+
+    def _supervise(name, factory, first_delay=5.0, max_delay=300.0):
+        async def _runner():
+            delay = first_delay
+            try:
+                while True:
+                    try:
+                        _loop_mark(name, "running")
+                        await factory()
+                        # این حلقه‌ها بی‌پایان‌اند؛ رسیدن به اینجا یعنی
+                        # تمام شده — پس باید دوباره راه بیفتد.
+                        _loop_mark(name, "ended")
+                        eng.log("warn", "loop_ended", name)
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException as e:
+                        rec = _loop_mark(name, "crashed",
+                                         f"{type(e).__name__}: {e}")
+                        eng.log("error", "loop_crash",
+                                f"{name}: {type(e).__name__}: {e}")
+                        try:
+                            await _loop_restart_note(
+                                name, e, int(rec.get("errors", 1)))
+                        except Exception:
+                            pass
+                    rec = eng.loop_state.setdefault(
+                        name, {"restarts": 0, "errors": 0})
+                    rec["restarts"] = int(rec.get("restarts", 0)) + 1
+                    try:
+                        eng.write_status()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, max_delay)
+            except asyncio.CancelledError:
+                # خاموشیِ عادی (ری‌استارت/بستنِ سلف) نباید «کرش» شمرده شود.
+                _loop_mark(name, "cancelled")
+                raise
+        return asyncio.create_task(_runner())
+
+    task = _supervise("sender", sender_loop)
+    ex_task = _supervise("exchange", exchange_worker)
+    scan_task = _supervise("scan", scan_loop)
+    member_task = _supervise("membership", membership_loop)
+    report_task = _supervise("report", report_loop)
+    risk_task = _supervise("risk", risk_loop)
+    st_task = _supervise("status", status_loop)
+    mem_task = _supervise("memory", memory_loop)
 
     sent = await note(_startup_text())
     # این خط، مرزِ «کار می‌کند / نمی‌کند» است: اگر در jafj_boot.log نبود،

@@ -1937,6 +1937,71 @@ def _extract_zip_member_streaming(zf, arc, dest, chunk_size=64 * 1024):
         raise
 
 
+# نامِ فارسیِ حلقه‌های سلف — همان کلیدهایی که 95.py در
+# jafj_status.json → loops می‌نویسد.
+LOOP_LABELS_FA = {
+    "sender": "ارسال", "exchange": "تبادل", "scan": "اسکنِ گروه‌ها",
+    "membership": "بررسیِ عضویت", "report": "گزارشِ خلاصه",
+    "risk": "محافظِ ریپ", "status": "وضعیت",
+    "memory": "آزادسازیِ حافظه",
+}
+
+
+def cgroup_mem_mb(root="/sys/fs/cgroup", proc_cgroup="/proc/self/cgroup"):
+    """(سقف, مصرف) حافظه‌ی همین کانتینر به مگابایت یا (None, None).
+
+    برای گزارش لازم است، نه تصمیم: `/diag` باید بگوید «۴۰۰MB آزاد از
+    ۵۱۲MB سقف» تا معلوم شود کمبودِ رم واقعی است یا توهمِ meminfo.
+    """
+    seen = set()
+    dirs = [root]
+    try:
+        with open(proc_cgroup, encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(":", 2)
+                if len(parts) != 3:
+                    continue
+                _h, ctrl, group = parts
+                group = group.lstrip("/")
+                if not group:
+                    continue
+                if not ctrl:
+                    dirs.append(os.path.join(root, group))
+                elif "memory" in ctrl.split(","):
+                    dirs.append(os.path.join(root, "memory", group))
+                    dirs.append(os.path.join(root, group))
+    except Exception:
+        pass
+    for d in dirs:
+        if d in seen:
+            continue
+        seen.add(d)
+        for lim_name, use_name in (("memory.max", "memory.current"),
+                                   ("memory.limit_in_bytes",
+                                    "memory.usage_in_bytes")):
+            try:
+                with open(os.path.join(d, lim_name), encoding="ascii") as f:
+                    raw = f.read().strip()
+            except Exception:
+                continue
+            if not raw or raw.lower() == "max":
+                continue
+            try:
+                lim = int(raw)
+            except Exception:
+                continue
+            if lim <= 0 or lim > (1 << 60):
+                continue
+            use = 0
+            try:
+                with open(os.path.join(d, use_name), encoding="ascii") as f:
+                    use = int(f.read().strip() or 0)
+            except Exception:
+                use = 0
+            return round(lim / 1048576.0, 1), round(use / 1048576.0, 1)
+    return None, None
+
+
 def mem_available_mb():
     """حافظه‌ی آزادِ واقعیِ پروسه (MB) یا None اگر معلوم نبود."""
     limited = _cgroup_memory_available_mb()
@@ -4168,7 +4233,18 @@ def resume_grace_plan(data_dir, env=None, now_ts=None):
 #  آزاد و تعدادِ سلف‌ها می‌نویسیم. بوتِ بعد با مقایسه‌ی آن با ثبتِ خروج
 #  می‌فهمد پروسه «تمیز» مرده یا ناگهانی — و همان را در لاگ می‌گوید.
 def total_ram_mb():
-    """کلِ حافظه‌ی دستگاه (MB) از /proc/meminfo — None اگر معلوم نشد."""
+    """کلِ حافظه‌ای که **ما** داریم (MB) — اول سقفِ cgroup، بعد meminfo.
+
+    چرا سقفِ کانتینر اول است: انتخابِ خودکارِ حالتِ اجرا (`spawn_mode`) روی
+    همین عدد تصمیم می‌گیرد. اگر سقفِ کانتینر ۵۱۲MB باشد ولی میزبان ۳۲GB،
+    meminfo عددِ ۳۲GB را می‌دهد، حالتِ «fork» انتخاب می‌شود (~۱۲MB سربارِ
+    هر اکانت) و همان لحظه که سلف‌ها بالا می‌آیند OOM می‌شویم — «رم کم
+    می‌آورد». با خواندنِ سقفِ کانتینر، روی همین ۵۱۲MB حالتِ shard
+    (~۴MB برای هر اکانت) انتخاب می‌شود.
+    """
+    lim, _use = cgroup_mem_mb()
+    if lim:
+        return float(lim)
     try:
         with open("/proc/meminfo", encoding="utf-8") as f:
             for line in f:
@@ -5134,13 +5210,27 @@ class Supervisor:
                 self.db.log(uid, "ram_gate", f"free={_free} limit={_limit}")
             except Exception:
                 pass
+            try:
+                _run = self.running_count()
+            except Exception:
+                _run = None
+            try:
+                _kids = self.children_rss()
+                _kid_tot = int(round(sum(k[2] for k in _kids))) if _kids else 0
+            except Exception:
+                _kid_tot = 0
+            _short = max(0, int(round(float(_limit) - float(_free))))
             return self._why(
                 uid, "manager",
                 f"حافظه‌ی آزاد کافی نیست: {int(_free)} مگابایت "
-                f"(حدِ لازم {int(_limit)}). سلف‌های دیگر را خاموش کن یا "
-                "پلن/سقفِ حافظه را بالا ببر — وگرنه کلِ سرور با OOM خاموش "
-                "می‌شود و همه‌ی سرویس‌ها می‌افتند. "
-                "(خاموش‌کردنِ نگهبان: JAFJ_MIN_FREE_MB=0)",
+                f"(حدِ لازم {int(_limit)} — {_short} مگابایت کم است). "
+                + (f"الان {_run} سلف روشن است و روی‌هم {_kid_tot} مگابایت "
+                   "می‌خورند. " if _run else "")
+                + "یا یکی-دو سلف را خاموش کن، یا پلن/سقفِ حافظه را بالا "
+                "ببر، یا `JAFJ_MIN_FREE_MB` را پایین‌تر بگذار (مثلاً ۳۰) — "
+                "ولی زیرِ ۳۰ خطرِ OOM و خوابیدنِ کلِ سرور هست؛ نگهبان برای "
+                "همین گذاشته شده. (خاموش‌کردنِ کاملِ نگهبان: "
+                "JAFJ_MIN_FREE_MB=0)",
                 hint="کمبودِ حافظه")
         logf = open(os.path.join(folder, "run.log"), "a", encoding="utf-8")
         # هدرِ کامل: بدونِ این، «چرا بالا نیامد» فقط با آزمون و خطا فهمیده
@@ -16147,6 +16237,65 @@ class Manager:
         return ok, msg
 
 
+    def _alive_notes(self, uid):
+        """نکته‌های مهم درباره‌ی سلفی که «روشن» است ولی ممکن است کار نکند.
+
+        دو حالتِ واقعی: (۱) حلقه‌ای مرده و خودش را ری‌استارت کرده — یعنی
+        مدتی هیچ کاری نکرده؛ (۲) ضربانِ jafj_status.json پیر شده — یعنی
+        پروسه هست ولی حلقه‌ی اصلی گیر کرده. هر دو قبلاً بی‌صدا بودند.
+        """
+        notes = []
+        try:
+            stt = self.sup.read_status(uid) or {}
+        except Exception:
+            stt = {}
+        try:
+            age = float(stt.get("age") or 0)
+        except Exception:
+            age = 0.0
+        if age > 300:
+            notes.append(f"⚠️ ضربان {_fa_digits(int(age // 60))} دقیقه "
+                         "است تازه نشده")
+        # سه دلیلِ بی‌صدای «پنل جواب می‌دهد ولی هیچ کاری انجام نمی‌شود»:
+        # pause، تبادلِ خاموش، و نبودِ کانالِ خودت (قاعده‌ی «اول کانال»).
+        if stt.get("paused"):
+            notes.append("⏸ در حالتِ Pause است — هیچ کاری اجرا نمی‌شود")
+        ex = stt.get("exchange") or {}
+        if isinstance(ex, dict) and ex.get("on") is False:
+            notes.append("🔁 تبادل خاموش است («تبادل روشن» را بزن)")
+        chans = stt.get("channels") or {}
+        if isinstance(chans, dict) and chans:
+            if not any(str(v or "").strip() for v in chans.values()):
+                notes.append("📣 کانالِ خودت ثبت نشده — بدونِ کانال "
+                             "جوین/تبادل اجرا نمی‌شود")
+        loops = stt.get("loops") or {}
+        if isinstance(loops, dict):
+            restarts = 0
+            worst = None
+            for name, rec in loops.items():
+                if not isinstance(rec, dict):
+                    continue
+                n = int(rec.get("restarts") or 0)
+                errs = int(rec.get("errors") or 0)
+                restarts += n
+                if errs and (worst is None or errs > worst[1]):
+                    worst = (name, errs, str(rec.get("last_error") or ""))
+            if restarts:
+                notes.append(f"♻️ {_fa_digits(restarts)} ری‌استارتِ حلقه")
+            if worst:
+                label = LOOP_LABELS_FA.get(worst[0], worst[0])
+                notes.append(f"آخرین خطای «{self._esc(label)}»: "
+                             f"{self._esc(worst[2])[:70] or '—'}")
+        try:
+            mem = stt.get("mem") or {}
+            fr = mem.get("free_mb")
+            # فقط وقتی کم است — وگرنه هر سلفِ سالم هم یک خطِ بی‌مصرف می‌گیرد.
+            if fr is not None and float(fr) < 100:
+                notes.append(f"🧠 در زمانِ آخرین ضربان {_fa_digits(fr)}MB آزاد")
+        except Exception:
+            pass
+        return notes
+
     def selfbot_diag_lines(self, limit=3):
         """خطوطِ /diag برای سلف‌هایی که روشن نشده‌اند: علت + آخرین خطِ لاگ.
 
@@ -16173,25 +16322,123 @@ class Manager:
                 detail = self.sup.last_detail.get(uid) or ""
             except Exception:
                 detail = ""
-            if alive and not detail:
-                continue
             nm = c.get("name") or str(uid)
             if alive:
-                out.append(f"  • {self._esc(nm)[:24]} <code>{uid}</code>: "
-                           "روشن ✅")
-            else:
-                out.append(f"  • {self._esc(nm)[:24]} <code>{uid}</code>: "
-                           f"خاموش — {self._esc(detail or 'علت ثبت نشده')[:90]}")
-                try:
-                    tail = self.sup.tail(uid, 8)
-                except Exception:
-                    tail = ""
-                firsts = [ln.strip() for ln in (tail or "").splitlines()
-                          if ln.strip() and not ln.strip().startswith(
-                              ("File ", "~", "=====", "python=", "self="))]
-                if firsts:
-                    out.append(f"    <pre>{_h(firsts[-1], 160)}</pre>")
+                # «روشن» به‌تنهایی دروغِ راحت‌طلبی است: پروسه می‌تواند بالا
+                # باشد و هیچ حلقه‌ای کار نکند. این‌جا ضربانِ وضعیت و
+                # ری‌استارت‌شدنِ حلقه‌ها را هم می‌گوییم.
+                notes = self._alive_notes(uid)
+                if not detail and not notes:
+                    continue
+                line = (f"  • {self._esc(nm)[:24]} <code>{uid}</code>: "
+                        "روشن ✅")
+                if notes:
+                    line += "\n    " + " · ".join(notes)
+                out.append(line)
+                shown += 1
+                continue
+            out.append(f"  • {self._esc(nm)[:24]} <code>{uid}</code>: "
+                       f"خاموش — {self._esc(detail or 'علت ثبت نشده')[:90]}")
+            try:
+                tail = self.sup.tail(uid, 8)
+            except Exception:
+                tail = ""
+            firsts = [ln.strip() for ln in (tail or "").splitlines()
+                      if ln.strip() and not ln.strip().startswith(
+                          ("File ", "~", "=====", "python=", "self="))]
+            if firsts:
+                out.append(f"    <pre>{_h(firsts[-1], 160)}</pre>")
             shown += 1
+        return out
+
+    def mem_diag_lines(self, free=None):
+        """«حافظه» با اعدادِ واقعی — تا «کم‌آوردنِ رم» قابلِ اثبات باشد.
+
+        /diag قبلاً فقط یک عددِ آزاد نشان می‌داد. اگر سقفِ کانتینر پایین‌تر
+        از حافظه‌ی میزبان باشد (که در اکثر هاست‌های کوچک هست)، آن عدد
+        گمراه‌کننده است: «۴۰۰ مگابایت آزاد» می‌بینیم و همان لحظه OOM
+        پروسه را می‌کشد. حالا سقف/مصرفِ cgroup + تصمیمِ نگهبان + مصرفِ
+        واقعیِ سلف‌ها هم می‌آید.
+        """
+        out = []
+        if free is None:
+            try:
+                free = mem_available_mb()
+            except Exception:
+                free = None
+        try:
+            limit, used = cgroup_mem_mb()
+        except Exception:
+            limit, used = None, None
+        line = (f"🧠 حافظه‌ی آزاد: {free}MB" if free is not None
+                else "🧠 حافظه: ؟")
+        if limit:
+            line += f" از {int(limit)}MB سقفِ کانتینر"
+            if used is not None:
+                line += f" (مصرف: {int(used)}MB)"
+        out.append(line)
+        try:
+            limit_mb = ram_gate_mb()
+            ok, fr, lim = ram_gate_check()
+        except Exception:
+            ok, fr, lim = True, free, 0
+        if lim and lim > 0:
+            verdict = ("✅ روشن‌کردنِ سلفِ تازه مجاز است" if ok
+                       else "⛔ سلفِ تازه بالا نمی‌آید — حافظه کم است")
+            out.append(f"🧪 نگهبانِ حافظه: حدِ {int(lim)}MB → {verdict}")
+            if not ok:
+                out.append("  <i>«سلف‌های روشن‌نشده» پایین‌تر همین را با "
+                           "عددِ دقیقِ کمبود می‌گویند؛ یک سلف خاموش کن یا "
+                           "JAFJ_MIN_FREE_MB را کم کن.</i>")
+        else:
+            out.append("🧪 نگهبانِ حافظه: خاموش (JAFJ_MIN_FREE_MB=0)")
+        # حالتِ اجرا + ظرفیت: جوابِ «چند سلفِ دیگر جا می‌شود؟» با همین
+        # حافظه. اگر shard انتخاب شود، هر اکانت ~۴MB است نه ~۶۲MB — همان تفاوتی که
+        # «رم کم می‌آورد» را حل می‌کند.
+        try:
+            mode = spawn_mode()
+            cap, per, _fr = capacity_estimate(free, mode)
+        except Exception:
+            mode, cap, per = "", None, None
+        if mode:
+            line = f"🧵 حالتِ اجرا: {mode}"
+            if per:
+                line += f" (~{_fa_digits(int(per))}MB هر اکانت)"
+            if cap is not None:
+                line += (" · با حافظه‌ی فعلی "
+                         f"{_fa_digits(int(cap))} اکانتِ دیگر جا می‌شود")
+            out.append(line)
+
+        # مصرفِ سلف‌ها: روی pidِ یکتا حساب می‌شود، نه روی اکانت — در حالتِ
+        # شارد چند اکانت یک پروسه‌اند و جمعِ «سهمِ هر اکانت» عددِ غلط می‌داد.
+        tot, seen_pid, worst, n_acc = 0.0, set(), (None, 0.0), 0
+        try:
+            for uid, p in list(getattr(self.sup, "procs", {}).items()):
+                if p is None or p.poll() is not None:
+                    continue
+                n_acc += 1
+                pid = getattr(p, "pid", None)
+                if pid in seen_pid:
+                    continue
+                seen_pid.add(pid)
+                mb = proc_pss_mb(pid)
+                if mb is None:
+                    mb = proc_rss_mb(pid)
+                if not mb:
+                    continue
+                tot += mb
+                if mb > worst[1]:
+                    worst = (uid, mb)
+        except Exception:
+            pass
+        if n_acc:
+            line = (f"👶 سلف‌های روشن: {_fa_digits(n_acc)} اکانت در "
+                    f"{_fa_digits(len(seen_pid))} پروسه · "
+                    f"{_fa_digits(int(round(tot)))}MB")
+            if worst[0] is not None:
+                line += (f" · سنگین‌ترین <code>{worst[0]}</code> "
+                         f"{_fa_digits(int(worst[1]))}MB")
+            out.append(line)
         return out
 
     def diag_text(self):
@@ -16235,7 +16482,7 @@ class Manager:
              f"{'✅ فعال' if token else '❌ تنظیم نشده — کرش = پاک‌شدنِ داده'}",
              (f"🔑 نیاز به لاگین: {_fa_digits(n_login)}"
               f" (کد نمی‌رود؛ /needlogin)" if n_login else "🔑 نیاز به لاگین: ۰"),
-             f"🧠 حافظه‌ی آزاد: {free}MB" if free is not None else "🧠 حافظه: ؟",
+             *self.mem_diag_lines(free),
              f"⏱ بالا: {up // 60} دقیقه"]
         try:
             sb_lines = self.selfbot_diag_lines()
