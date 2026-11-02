@@ -77,6 +77,12 @@ for path in (SELF, REPO_MAIN, SLIM_MAIN):
     check(f"T2: هیچ رشته‌ی HTML-escape در {os.path.relpath(path, ROOT)} نیست",
           not bad, bad)
 
+for path in (SELF, REPO_MAIN, SLIM_MAIN):
+    raw = open(path, encoding="utf-8").read()
+    check(f"T2: حتی در کامنت‌های {os.path.relpath(path, ROOT)} هم موجودیتِ "
+          "HTML نیست", "&gt;" not in raw and "&lt;" not in raw
+          and "&amp;" not in raw)
+
 slim_src = open(SLIM_MAIN, encoding="utf-8").read()
 check("T2: argvِ pip تمیز است", '"telethon>=1.34.0"' in slim_src)
 
