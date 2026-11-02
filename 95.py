@@ -118,7 +118,10 @@ DEFAULTS = {
         "group_failover_on": False, # جایگزینی خودکار اختیاری؛ خاموش پیش‌فرض
         "group_failover_after_sec": 300, # چند ثانیه بدون لینک معتبر تا گروه بعدی
         "auto_leave_completed_on_limit": True, # هنگام رسیدن سقف تلگرام، فقط تبادل تمام‌شده
-        "capacity_cleanup_batch": 30,  # هر دور پاکسازی سقف، چند کانالِ جفج‌زده لفت شود
+        # هر دور پاکسازی سقف، چند کانالِ جفج‌زده لفت شود (هم‌ارزِ
+        # CAPACITY_CLEANUP_BATCH_DEFAULT پایین‌تر؛ این‌جا عددِ خام است چون
+        # DEFAULTS قبل از آن ثابت‌ها تعریف می‌شود).
+        "capacity_cleanup_batch": 3,
         "_capacity_join_blocked_until": 0,
         "_group_failover_active_index": 0,
         "_group_failover_last_activity": 0,
@@ -410,15 +413,23 @@ def normalize_peer_ref(value):
     return None
 
 
+def peer_ref_key(ref):
+    """کلیدِ نرمال‌شده‌ی یک لینک/یوزرنیم برای مقایسه (بدونِ regex در حلقه).
+
+    جدا کردنش از ``same_peer_ref`` برای سرعت است: در پاکسازیِ سقف عضویت،
+    همین نرمال‌سازی میلیون‌ها بار صدا زده می‌شد و کلِ event loop را
+    ده‌ها ثانیه قفل می‌کرد (باعثِ «آفلاین شدن» اکانت می‌شد).
+    """
+    s = str(ref or "").strip().lower().rstrip("/")
+    s = re.sub(r"^https?://", "", s)
+    s = re.sub(r"^(www\.)?(t|telegram)\.me/", "", s)
+    s = s.replace("joinchat/+", "+")
+    return s.lstrip("@")
+
+
 def same_peer_ref(a, b):
     """آیا دو مقدار به یک کانال/گروه اشاره می‌کنند؟ (برای ردِ کانال=گروه)"""
-    def _norm(s):
-        s = str(s or "").strip().lower().rstrip("/")
-        s = re.sub(r"^https?://", "", s)
-        s = re.sub(r"^(www\.)?(t|telegram)\.me/", "", s)
-        s = s.replace("joinchat/+", "+")
-        return s.lstrip("@")
-    na, nb = _norm(a), _norm(b)
+    na, nb = peer_ref_key(a), peer_ref_key(b)
     return bool(na) and na == nb
 
 def group_failover_index(ex_cfg, groups, now_ts):
@@ -535,68 +546,100 @@ def _safe_id(rec):
         return 0
 
 
-def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None,
-                                    exclude_ids=None):
-    """Choose the oldest reciprocated exchange channel to leave for a slot.
+def _capacity_pool(records):
+    """استخرِ joined + شمارشِ idها به‌ازای هر chat_id/لینک (یک پاس).
 
-    An outbound exchange is complete only after the partner joined back.
-    Active reminders, the user's own channels, and duplicate joined-channel
-    records are kept untouched. Completion does not wait for the normal
-    membership-watch window; the account-cap error is the cleanup trigger.
-
-    ``exclude_ids`` برای پاکسازی دسته‌ای است: id رکوردهایی که در همین دور
-    قبلاً برداشته شده‌اند رد می‌شوند. رکوردهای برداشته‌شده از استخر حذف
-    نمی‌شوند تا تشخیص تکراری (chat_id/لینک یکسان) نسبت به آن‌ها سالم بماند.
+    تشخیص «تکراری» قبلاً برای هر رکورد کلِ استخر را می‌گشت (O(n²) با
+    regex داخلش). روی ۱۰۰۰ رکورد همان کار **۶۱ ثانیه** طول می‌کشید و چون
+    همگام (sync) است، ثبت/وقفه‌ی event loop می‌کرد و اتصالِ تلگرام
+    می‌افتاد — یعنی اکانت «آفلاین» می‌شد. حالا یک پاسِ خطی است.
     """
     joined = [r for r in (records or []) if r.get("status") == "joined"]
-    candidates = []
-    own_channels = tuple(c for c in (own_channels or ()) if c)
-    skip_ids = set()
+    by_chat, by_link = {}, {}
+    for r in joined:
+        rid = _safe_id(r)
+        try:
+            cid = int(r.get("chat_id") or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        if cid:
+            by_chat.setdefault(cid, set()).add(rid)
+        key = peer_ref_key(r.get("link"))
+        if key:
+            by_link.setdefault(key, set()).add(rid)
+    return joined, by_chat, by_link
+
+
+def _capacity_candidates(records, own_channels=(), exclude_id=None,
+                         exclude_ids=None):
+    """کاندیدهای امنِ لفت، قدیمی‌ترین اول — بدونِ حلقه‌ی تودرتو."""
+    joined, by_chat, by_link = _capacity_pool(records)
+    own_keys = {peer_ref_key(c) for c in (own_channels or []) if c}
+    own_keys.discard("")
+    skip = set()
     for v in (exclude_ids or ()):
         try:
-            skip_ids.add(int(v))
+            skip.add(int(v))
         except (TypeError, ValueError):
             pass
     if exclude_id:
         try:
-            skip_ids.add(int(exclude_id))
+            skip.add(int(exclude_id))
         except (TypeError, ValueError):
             pass
+
+    out = []
     for rec in joined:
         rid = _safe_id(rec)
-        if rid in skip_ids:
+        if rid in skip:
             continue
         if not rec.get("peer_id"):
             continue
-        if str(rec.get("direction") or "in").lower() == "out" and not rec.get("peer_joined_at"):
+        if (str(rec.get("direction") or "in").lower() == "out"
+                and not rec.get("peer_joined_at")):
             continue
-        if int(rec.get("next_reminder") or 0) > 0:
-            continue
-        if any(same_peer_ref(rec.get("link"), own) for own in own_channels):
-            continue
-        duplicate = False
-        cid = rec.get("chat_id")
-        for other in joined:
-            if other is rec or int(other.get("id") or 0) == rid:
+        try:
+            if int(rec.get("next_reminder") or 0) > 0:
                 continue
-            same_chat = (cid and other.get("chat_id")
-                         and int(cid) == int(other.get("chat_id")))
-            same_link = same_peer_ref(rec.get("link"), other.get("link"))
-            if same_chat or same_link:
-                duplicate = True
-                break
-        if duplicate:
+        except (TypeError, ValueError):
+            pass
+        key = peer_ref_key(rec.get("link"))
+        if key and key in own_keys:
             continue
-        candidates.append(rec)
-    if not candidates:
-        return None
+        try:
+            cid = int(rec.get("chat_id") or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        # تکراری = رکوردِ دیگری (با id متفاوت) که همان کانال/لینک را دارد.
+        if cid and len(by_chat.get(cid, ())) > 1:
+            continue
+        if key and len(by_link.get(key, ())) > 1:
+            continue
+        out.append(rec)
+
     def _age_key(rec):
         try:
             return (int(rec.get("joined_at") or rec.get("created_at") or 0),
                     int(rec.get("id") or 0))
         except (TypeError, ValueError):
             return (0, 0)
-    return min(candidates, key=_age_key)
+
+    out.sort(key=_age_key)
+    return out
+
+
+def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None,
+                                   exclude_ids=None):
+    """قدیمی‌ترین کاندیدِ امنِ لفت (یا None).
+
+    قواعد: فقط joined، با peer_id، یادآورِ فعال نداشته باشد، کانال خودِ
+    کاربر نباشد، تبادلِ outbound فقط اگر طرف متقابلاً جوین زده باشد، و
+    کانالِ تکراری (چند رکورد روی یک کانال) کنار گذاشته می‌شود.
+    """
+    cands = _capacity_candidates(records, own_channels=own_channels,
+                                 exclude_id=exclude_id,
+                                 exclude_ids=exclude_ids)
+    return cands[0] if cands else None
 
 
 # ── پاکسازی دسته‌ای سقف عضویت (فرایند لفت موقع پر شدن ۵۰۰) ──────────
@@ -604,12 +647,28 @@ def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None,
 # «دور پاکسازی» اجرا می‌شود و تا این تعداد از قدیمی‌ترین کانال‌هایی که
 # خود جفج جوین زده (تبادل‌های کامل‌شده‌ی امن) لفت می‌شوند. عدد با دستور
 # «تبادل لفت خودکار تعداد <عدد>» قابل تغییر است.
-CAPACITY_CLEANUP_BATCH_DEFAULT = 30
+CAPACITY_CLEANUP_BATCH_DEFAULT = 3
 CAPACITY_CLEANUP_BATCH_MIN = 1
 CAPACITY_CLEANUP_BATCH_MAX = 100
+# سقفِ زمانیِ یک دور پاکسازی. هر لفت از صفِ تک‌عملکردی رد می‌شود و فاصله‌ی
+# ۱۵–۲۰ ثانیه‌ای دارد؛ دورِ طولانی، صفِ تبادل را دقایقی در انحصار می‌گیرد و
+# پاسخ به پیوی هم عقب می‌افتد. با این سقف، دورِ نیمه‌کاره در حلقه‌ی بعد
+# ادامه پیدا می‌کند.
+CAPACITY_CLEANUP_MAX_SEC = 120
+# اگر حلقه‌ی اصلی بیش از این مقدار عقب بیفتد (کارِ همگامِ طولانی)، در لاگ
+# و status ثبت می‌شود — همان چیزی که «آفلاین شدنِ ناگهانی» را توضیح می‌دهد.
+LOOP_LAG_WARN_SEC = 20
 # اگر بعد از یک دور پاکسازیِ موفق، تلگرام هنوز سقف را پر اعلام کند (ثبتِ
 # آزادشدن slot در سرور تلگرام کمی تأخیر دارد)، جوین چقدر مکث کند؟
 CAPACITY_REBLOCK_SEC = 300
+
+
+def capacity_round_exhausted(started, now, limit_sec=CAPACITY_CLEANUP_MAX_SEC):
+    """آیا وقتِ یک دور پاکسازی تمام شده است؟ (توقفِ نرم، ادامه در دور بعد)"""
+    try:
+        return (float(now) - float(started)) >= float(limit_sec)
+    except (TypeError, ValueError):
+        return False
 
 
 def clamp_capacity_batch(value):
@@ -635,22 +694,9 @@ def select_capacity_leave_batch(records, own_channels=(),
     تبادل‌های ناتمام/یادآوردار و تکراری‌ها طبق همان قواعد وارد نمی‌شوند.
     """
     limit = clamp_capacity_batch(limit)
-    pool = [r for r in (records or []) if r.get("status") == "joined"]
-    picked = []
-    skip = set()
-    if exclude_id:
-        try:
-            skip.add(int(exclude_id))
-        except (TypeError, ValueError):
-            pass
-    while len(picked) < limit:
-        rec = select_capacity_leave_candidate(
-            pool, own_channels=own_channels, exclude_ids=skip)
-        if rec is None:
-            break
-        picked.append(rec)
-        skip.add(_safe_id(rec))
-    return picked
+    cands = _capacity_candidates(records, own_channels=own_channels,
+                                 exclude_id=exclude_id)
+    return cands[:limit]
 
 
 def format_capacity_cleanup_note(left_links, target, stopped=None):
@@ -2813,6 +2859,10 @@ class Engine:
                 "sent_24h": self.db.sent_since(now_t - 86400),
                 "sent_1h": self.db.sent_since(now_t - 3600),
                 "phase": {t: self.cyc[t].phase()[0] for t in ("standard", "vip")},
+                "capacity_blocked_until": int(self.ex_cfg().get(
+                    "_capacity_join_blocked_until", 0) or 0),
+                "cleanup_pending": bool(self.ex_cfg().get(
+                    "_capacity_cleanup_pending", 0)),
                 "exchange": {"on": bool(self.ex_cfg()["enabled"]),
                              "initiate": bool(self.ex_cfg()["initiate"]),
                              "joined": ec.get("joined", 0),
@@ -7432,7 +7482,19 @@ async def connect_and_run(eng, creds):
         stopped = None
         left_at = int(time.time())
         had_outbound = False
+        round_started = time.time()
         for cand in candidates:
+            # سقفِ زمانی: دورِ طولانی صفِ تبادل را در انحصار می‌گیرد و پاسخ
+            # به پیوی عقب می‌افتد؛ بقیه در دور بعدِ حلقه ادامه می‌یابد.
+            if capacity_round_exhausted(round_started, time.time()):
+                stopped = (f"سقفِ زمانیِ دور پاکسازی ({secs(CAPACITY_CLEANUP_MAX_SEC)})؛ "
+                           "بقیه در دور بعد ادامه می‌یابد")
+                cfg["_capacity_cleanup_pending"] = True
+                try:
+                    eng.st.save()
+                except Exception:
+                    pass
+                break
             ok, err = await leave_link(cand.get("link"), cand.get("id"))
             if not ok:
                 eng.log("warn", "ex_capacity_leave_fail",
@@ -8986,13 +9048,10 @@ async def connect_and_run(eng, creds):
                     await asyncio.sleep(20)
                     continue
 
-                capacity_blocked_until = int(x.get("_capacity_join_blocked_until", 0) or 0)
-                if capacity_blocked_until > int(time.time()):
-                    await asyncio.sleep(min(30, max(1, capacity_blocked_until - int(time.time()))))
-                    continue
-                if capacity_blocked_until:
-                    x["_capacity_join_blocked_until"] = 0
-                    eng.st.save()
+                # توجه: گیتِ «سقفِ عضویت» دیگر این‌جا نیست. قبلاً این‌جا با
+                # `continue` کلِ حلقه (چکِ عضویت، یادآور، گزارش) تا یک ساعت
+                # می‌خوابید و اکانت عملاً «آفلاین» دیده می‌شد؛ حالا فقط
+                # بخشِ جوین پشتِ گیت است.
 
                 # ── شفافیتِ صف: اگر یک عملیات FloodWait خورده باشد، صفِ
                 # تک‌عملکردی تا پایان جریمه بسته است و هیچ پاسخ خودکاری
@@ -9034,9 +9093,11 @@ async def connect_and_run(eng, creds):
                         eng.log("warn", "ex_capacity_cleanup_error", stopped)
                     x["_last_capacity_cleanup_at"] = int(time.time())
                     eng.st.save()
-                    if left_count <= 0:
+                    if left_count <= 0 and not str(stopped or "").startswith("سقفِ زمانی"):
                         # کاندید امن نبود/همه لفت‌ها شکست خورد؛ بدون این بلاک
                         # هر جوین دوباره فلگ می‌زد و دور بی‌فایده تکرار می‌شد.
+                        # (اگر فقط «سقفِ زمانی» دور را بست، بلاک نمی‌کنیم؛
+                        # دور بعد ادامه می‌دهد.)
                         block_joins_for_capacity(
                             stopped or "کاندید امن برای لفت پیدا نشد")
                         # گیتِ بلاک بالای حلقه است؛ همین دور دیگر جوین نزن تا
@@ -9061,6 +9122,15 @@ async def connect_and_run(eng, creds):
                     await asyncio.sleep(3)
 
                 # ۲) جوین تأییدشده‌ها — تطبیقی + سقف ساعتی
+                # گیتِ سقفِ عضویت — فقط جوین را متوقف می‌کند.
+                capacity_blocked_until = int(x.get("_capacity_join_blocked_until", 0) or 0)
+                if capacity_blocked_until > int(time.time()):
+                    await asyncio.sleep(min(30, max(1, capacity_blocked_until - int(time.time()))))
+                    continue
+                if capacity_blocked_until:
+                    x["_capacity_join_blocked_until"] = 0
+                    eng.st.save()
+
                 # قاعده‌ی «اول کانال»: لفتِ دستی (بالا) چون خودِ کاربر
                 # خواسته و به کانالِ من کاری ندارد اجرا می‌شود؛ ولی
                 # جوین/چک/پیامِ خودکار بدون کانالِ ثبت‌شده معنا ندارد و
@@ -9247,9 +9317,29 @@ async def connect_and_run(eng, creds):
                 await asyncio.sleep(5)
 
     async def status_loop():
+        """گزارشِ وضعیت + تشخیصِ «قفل‌شدنِ event loop».
+
+        چرا: بزرگ‌ترین دلیلِ «اکانت آفلاین شد» یک کارِ همگامِ طولانی در
+        همان loop است (مثلِ انتخابِ کاندیدِ پاکسازی که قبلاً O(n²) بود و
+        روی ۱۰۰۰ رکورد ۶۱ ثانیه CPU می‌گرفت). آن‌وقت هیچ پینگ/پاسخی
+        نمی‌رود و تلگرام اتصال را می‌بندد. حالا هر تأخیرِ محسوس در همین
+        حلقه ثبت می‌شود تا علت از لاگ معلوم باشد.
+        """
+        last_tick = time.time()
         while True:
             try:
-                eng.write_status()
+                now_tick = time.time()
+                lag = int(now_tick - last_tick - 60)
+                last_tick = now_tick
+                if lag >= LOOP_LAG_WARN_SEC:
+                    eng.log("warn", "loop_lag", f"{lag}s")
+                    try:
+                        eng.write_status({"loop_lag_sec": lag,
+                                          "loop_lag_at": int(now_tick)})
+                    except Exception:
+                        pass
+                else:
+                    eng.write_status()
             except Exception:
                 pass
             await asyncio.sleep(60)
@@ -9506,7 +9596,8 @@ async def run_bot():
         print(f"\n🔄 اتصال قطع شد — {backoff} ثانیه دیگر دوباره وصل می‌شوم…")
         print("   (پیام‌های صف حفظ شده‌اند. Ctrl+C برای خروج)")
         await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, 300)
+        # سقفِ ۹۰ ثانیه (نه ۳۰۰): هر ثانیه‌ی این انتظار، اکانت «آفلاین» است.
+        backoff = min(backoff * 2, 90)
 
 
 def main():

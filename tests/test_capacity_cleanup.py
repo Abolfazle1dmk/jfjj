@@ -57,8 +57,10 @@ check(m.clamp_capacity_batch(0) == 1, "clamp: صفر → کف ۱")
 check(m.clamp_capacity_batch(-5) == 1, "clamp: منفی → کف ۱")
 check(m.clamp_capacity_batch(999) == 100, "clamp: بزرگ → سقف ۱۰۰")
 check(m.clamp_capacity_batch(30) == 30, "clamp: ۳۰ دست‌نخورده")
-check(m.clamp_capacity_batch(None) == 30, "clamp: None → پیش‌فرض ۳۰")
-check(m.clamp_capacity_batch("abc") == 30, "clamp: رشته‌ی نامعتبر → پیش‌فرض ۳۰")
+check(m.clamp_capacity_batch(None) == m.CAPACITY_CLEANUP_BATCH_DEFAULT,
+      "clamp: None → پیش‌فرض")
+check(m.clamp_capacity_batch("abc") == m.CAPACITY_CLEANUP_BATCH_DEFAULT,
+      "clamp: رشته‌ی نامعتبر → پیش‌فرض")
 print("DONE G1 clamp")
 
 # ── G2 ورودی خالی ──
@@ -148,8 +150,11 @@ print("DONE G6 summary note")
 # ── G7 قفل‌های سورسی ──
 dflt = next(v for k, v in m.DEFAULTS.items() if isinstance(v, dict)
             and "capacity_cleanup_batch" in v)
-check(dflt["capacity_cleanup_batch"] == 30,
-      "پیش‌فرض تنظیمات: ۳۰ لفت در هر دور پاکسازی")
+check(dflt["capacity_cleanup_batch"] == m.CAPACITY_CLEANUP_BATCH_DEFAULT,
+      "پیش‌فرض تنظیمات = ثابتِ CAPACITY_CLEANUP_BATCH_DEFAULT")
+check(1 <= m.CAPACITY_CLEANUP_BATCH_DEFAULT <= 5,
+      "پیش‌فرضِ دور پاکسازی کوچک است (دورِ بلند صفِ تبادل را قفل می‌کرد): %r"
+      % m.CAPACITY_CLEANUP_BATCH_DEFAULT)
 check("leave_completed_exchange_for_slot" not in src,
       "تابع قدیمی تک‌لفت کاملاً حذف شده")
 check("_after_capacity_cleanup" not in src,
@@ -169,6 +174,37 @@ check("await cleanup_capacity_for_slots()" in stage,
       "دور پاکسازی در ابتدای حلقه‌ی worker و بیرون از timeout جوین اجرا می‌شود")
 check("block_joins_for_capacity(" in stage and "continue" in stage,
       "نبودِ کاندید → بلاک + توقف همان دور تا رکورد approved دست‌نخورده بماند")
+
+# ── G8 کارایی: انتخابِ کاندید باید خطی باشد، نه O(n²) ──
+# باگِ واقعی: روی ۱۰۰۰ رکوردِ joined، نسخه‌ی قبلی ۶۱ ثانیه CPU می‌گرفت و
+# چون sync است کلِ event loop را قفل می‌کرد → اکانت «آفلاین» می‌شد.
+import time as _t
+_big = [rec(i, chat_id=5000 + i, link="@chan%d" % i) for i in range(1, 1001)]
+_t0 = _t.perf_counter()
+_b = m.select_capacity_leave_batch(_big, limit=30)
+_ms = (_t.perf_counter() - _t0) * 1000
+check(len(_b) == 30, "روی ۱۰۰۰ رکورد، ۳۰ کاندید برمی‌گردد")
+check(_ms < 200, "انتخابِ ۳۰ کاندید روی ۱۰۰۰ رکورد سریع است: %.1f ms" % _ms)
+
+check(m.capacity_round_exhausted(0, 10, 5) is True, "سقفِ زمانی: گذشته → True")
+check(m.capacity_round_exhausted(0, 4, 5) is False, "سقفِ زمانی: نگذشته → False")
+check(m.capacity_round_exhausted(None, 10, 5) is False, "سقفِ زمانی: ورودی خراب → False")
+check("capacity_round_exhausted(" in src and "CAPACITY_CLEANUP_MAX_SEC" in src,
+      "دورِ پاکسازی سقفِ زمانی دارد و نیمه‌کاره رها نمی‌شود")
+check('cfg["_capacity_cleanup_pending"] = True' in
+      src[src.index("async def cleanup_capacity_for_slots("):
+          src.index("async def reply_joined")],
+      "دورِ نیمه‌کاره برای ادامه در حلقه‌ی بعد دوباره فلگ می‌شود")
+check("LOOP_LAG_WARN_SEC" in src and '"loop_lag"' in src,
+      "قفل‌شدنِ event loop در لاگ/status ثبت می‌شود")
+check("min(backoff * 2, 90)" in src,
+      "سقفِ انتظارِ اتصالِ دوباره ۹۰ ثانیه است (نه ۵ دقیقه آفلاین)")
+_w = src[src.index("async def exchange_worker()"):]
+_w = _w[:_w.index("async def sender_loop()")]
+check(_w.index("capacity_blocked_until") > _w.index("# ۱) لفت‌های دستی"),
+      "گیتِ سقفِ عضویت فقط جلوی جوین است، نه کلِ حلقه")
+print("DONE G8 performance/no-lock")
+
 ci = src.index("async def cleanup_capacity_for_slots(")
 cf = src.index("async def ", ci + 40)
 cleanup_src = src[ci:cf]
