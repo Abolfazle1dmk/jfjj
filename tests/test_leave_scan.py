@@ -125,8 +125,11 @@ class FakeClient:
         raise AssertionError("unexpected request %r" % (req,))
 
     def iter_dialogs(self, limit=None):
+        # مثلِ تلگرام: اگر limit داده شود فقط همان تعداد اول برگردانده
+        # می‌شود. این‌طور تست واقعاً نشان می‌دهد `limit=300` کانالِ طرف را
+        # از دست می‌دهد (باگِ گزارش‌شده) و اسکنِ کامل پیدایش می‌کند.
         async def gen():
-            for d in self.dialogs:
+            for d in (self.dialogs if limit is None else self.dialogs[:limit]):
                 self.scanned += 1
                 yield d
         return gen()

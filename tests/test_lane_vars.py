@@ -294,13 +294,27 @@ def main():
           every == [], every[:8])
 
     # ── خودِ ابزار هم باید باگِ واقعی را بگیرد، وگرنه تستِ توخالی است ──
-    broken = src.replace(
-        "                        if still is CHECK_DEFERRED:",
-        "                        if _conf is CHECK_DEFERRED:", 1)
-    check("V2: نمونه‌ی باگ‌دار عوض شد", broken != src)
-    bprobs = analyze(broken)
-    names = sorted({n for _, n in bprobs})
-    check("V2: ابزار همان باگِ `_conf` را می‌گیرد", "_conf" in names, bprobs)
+    # نمونه دقیقاً شکلِ باگی است که در حلقه‌های تبادل دیده شد: مقدارگیری
+    # داخلِ یک شاخه‌ی تو در تو، و خواندن در شاخه‌ی `else` بیرونی.
+    buggy_sample = '''
+async def membership_loop():
+    for rec in items:
+        still = await check(rec)
+        if still is True:
+            done()
+        elif still is False:
+            count += 1
+            if rec["status"] == "joined":
+                conf = await confirm(rec)
+                if conf is True:
+                    continue
+        else:
+            if conf is DEFERRED:
+                continue
+'''
+    flagged = sorted({n for _, n in analyze(buggy_sample)})
+    check("V2: ابزار همان باگِ `conf` (خواندن در else بیرونی) را می‌گیرد",
+          flagged == ["conf"], flagged)
 
     # ── سالم‌بودنِ الگوی متعارف: انتساب در هر دو شاخه ──
     ok_sample = '''
