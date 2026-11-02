@@ -33,6 +33,7 @@
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -129,9 +130,26 @@ def shown(url):
     return "https://github.com/***@…" if t and t in url else url
 
 
+def redact(text):
+    """توکن/رمز را از متن حذف کن قبل از اینکه در لاگ بیفتد.
+
+    قبلاً دستورِ `git clone https://<token>@github.com/...` عیناً در لاگ
+    چاپ می‌شد؛ هر کسی که لاگِ اپ را ببیند، دسترسیِ نوشتن به ریپو را
+    می‌گرفت. حالا هر چیزی شبیهِ توکن در URL و در متغیرهای `*TOKEN*`
+    ماسک می‌شود.
+    """
+    t = token()
+    out = str(text)
+    if t:
+        out = out.replace(t, "***")
+    out = re.sub(r"https://[^/\s@]+@", "https://***@", out)
+    out = re.sub(r"(?i)(token|password|secret)(=|:)\s*\S+", r"\1\2***", out)
+    return out
+
+
 def run(cmd, cwd=None, env=None, quiet=False):
     """اجرای دستور؛ اگر خودِ برنامه نصب نباشد پیامِ روشن می‌دهد (نه Traceback)."""
-    log("$ " + " ".join(str(c) for c in cmd))
+    log("$ " + redact(" ".join(str(c) for c in cmd)))
     out = subprocess.DEVNULL if quiet else None
     try:
         return subprocess.run(
@@ -164,8 +182,8 @@ def boot_listener(port=None):
     global _boot_srv
     if _boot_srv is not None:
         return _boot_srv
-    port = port or os.environ.get("PORT")
-    if not port:
+    port = port if port is not None else os.environ.get("PORT")
+    if port in (None, "") or str(port).strip() == "":
         return None
     try:
         from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -174,8 +192,13 @@ def boot_listener(port=None):
 
         class _H(BaseHTTPRequestHandler):
             def do_GET(self):
+                # commit/stale از همین‌جا جواب «آیا آپدیتم رسید؟» را می‌دهد:
+                # curl <host>/  → {"commit": "...", "stale": false}
                 body = ('{"ok": true, "boot": true, "mode": "%s", '
-                        '"version": "%s"}' % (md, ver)).encode("utf-8")
+                        '"version": "%s", "commit": "%s", "stale": %s}'
+                        % (md, ver, CODE_STATE.get("commit", ""),
+                           "true" if CODE_STATE.get("stale") else "false")
+                        ).encode("utf-8")
                 try:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -274,6 +297,9 @@ def boot_report(py, env):
           all((CODE_DIR / n).is_file() for n in (MANAGER_NAME, SELF_NAME)),
           str(CODE_DIR))
     check("entrypoint ریپو موجود است", (CODE_DIR / ENTRY_NAME).is_file(), ENTRY_NAME)
+    check("کد از گیت به‌روز شد", not CODE_STATE.get("stale"),
+          f"commit={CODE_STATE.get('commit') or '?'}"
+          + (f" — {CODE_STATE.get('why')}" if CODE_STATE.get("stale") else ""))
     try:
         ok_dep = subprocess.run([str(py), "-c", "import telethon"],
                                 stdout=subprocess.DEVNULL,
@@ -313,6 +339,24 @@ def boot_report(py, env):
 
 
 # ─────────────────────────────────────────────────────── 1) code from git ──
+# وضعیتِ «کدِ در حالِ اجرا» — در لاگ، در /health و در پیامِ بوت دیده می‌شود.
+# چرا لازم است: اگر `git fetch` شکست بخورد (توکن نبود/شبکه بسته)، این فایل
+# با نسخه‌ی قبلی ادامه می‌داد و هیچ‌جا هم نمی‌گفت؛ کاربر آپدیت می‌کرد،
+# سرویس ری‌استارت می‌شد و «عینِ قبل» می‌ماند، بدونِ هیچ سرنخی.
+CODE_STATE = {"commit": "", "branch": branch(), "stale": False, "why": ""}
+
+
+def git_head(folder=None):
+    """کامیتِ کوتاهِ کدِ موجود در ./code (خالی اگر نبود)."""
+    d = str(folder or CODE_DIR)
+    try:
+        r = subprocess.run(["git", "-C", d, "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=20)
+        return (r.stdout or "").strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
 def sync_code():
     CODE_DIR.parent.mkdir(parents=True, exist_ok=True)
     url = repo_url()
@@ -339,7 +383,22 @@ def sync_code():
             # فایل‌های جامانده‌ی نسخه‌های قبلی (مثل 78.py قدیمی) پاک شوند
             run(["git", "-C", str(CODE_DIR), "clean", "-fdq"])
         else:
-            log("⚠️ git fetch نشد — با نسخه‌ی موجود ادامه می‌دهم")
+            CODE_STATE["stale"] = True
+            CODE_STATE["why"] = "git fetch نشد"
+            log("⛔ به‌روزرسانیِ کد از گیت انجام نشد — با نسخه‌ی موجود ادامه "
+                "می‌دهم، ولی **این نسخه قدیمی است**. اگر فایل را آپدیت "
+                "کرده‌ای، این بار اثر نمی‌کند.")
+            log("   علت‌های رایج: نبودِ JAFJ_GIT_TOKEN (ریپوی خصوصی)، "
+                "نبودِ شبکه به github.com، یا برنچِ اشتباه در JAFJ_BRANCH "
+                f"(الان: {branch()}).")
+
+    CODE_STATE["commit"] = git_head()
+    if not CODE_STATE["commit"]:
+        CODE_STATE["stale"] = True
+        CODE_STATE["why"] = CODE_STATE["why"] or "کامیت خوانده نشد"
+    log(f"کدِ در حالِ اجرا: commit={CODE_STATE['commit'] or '?'} "
+        f"branch={CODE_STATE['branch']}"
+        + (" ⛔ (قدیمی — به‌روزرسانی نشد)" if CODE_STATE["stale"] else ""))
 
     for need in (MANAGER_NAME, SELF_NAME):
         if not (CODE_DIR / need).is_file():
@@ -387,8 +446,11 @@ def ensure_python():
     if os.environ.get("JAFJ_SKIP_VENV", "").strip() in ("1", "true", "yes"):
         py = Path(sys.executable)
         log(f"venv رد شد (JAFJ_SKIP_VENV=1) — python={py}")
-        if not deps_ok(py):
-            install_deps(py)
+        if not deps_ok(py) and not install_deps(py):
+            die(f"telethon در همین مفسر نصب نشد: {py}\n"
+                f'    "{py}" -m pip install -r {CODE_DIR / "requirements.txt"}\n'
+                "   با نبودِ telethon، سلف اصلاً بالا نمی‌آید و پنل هم "
+                "جواب نمی‌دهد.")
         return py
 
     py = VENV_DIR / "bin" / "python"
@@ -398,8 +460,10 @@ def ensure_python():
         if r is None or r.returncode != 0:
             log("⚠️ venv ساخته نشد — با پایتون سیستم ادامه می‌دهم")
             py = Path(sys.executable)
-            if not deps_ok(py):
-                install_deps(py)
+            if not deps_ok(py) and not install_deps(py):
+                die(f"telethon در پایتونِ سیستم نصب نشد: {py}\n"
+                    f'    "{py}" -m pip install -r '
+                    f'{CODE_DIR / "requirements.txt"}')
             return py
         if not install_deps(py):
             die("نصب وابستگی‌ها شکست خورد (pip install -r requirements.txt)")
@@ -411,7 +475,14 @@ def ensure_python():
     if want != have or not deps_ok(py):
         log("وابستگی‌ها تغییر کرده/ناقص است — نصب دوباره…")
         if not install_deps(py):
-            log("⚠️ pip install شکست خورد — با نسخه‌ی فعلی ادامه می‌دهم")
+            if not deps_ok(py):
+                die(f"وابستگی‌ها نصب نشد و telethon هم قابلِ import نیست "
+                    f"({py}).\n"
+                    f'    "{py}" -m pip install -r '
+                    f'{CODE_DIR / "requirements.txt"}\n'
+                    "   (بدون این، سلف بالا نمی‌آید)")
+            log("⚠️ pip install شکست خورد — ولی telethon موجود است، ادامه "
+                "می‌دهم")
         else:
             stamp_file().write_text(want)
     else:
@@ -510,7 +581,11 @@ def health_server(port):
 
         class H(BaseHTTPRequestHandler):
             def do_GET(self):
-                body = b'{"ok": true, "mode": "selfbot"}'
+                body = ('{"ok": true, "mode": "selfbot", "commit": "%s", '
+                        '"stale": %s}'
+                        % (CODE_STATE.get("commit", ""),
+                           "true" if CODE_STATE.get("stale") else "false")
+                        ).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))

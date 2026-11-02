@@ -1,0 +1,8 @@
+2026-11-02 13:03:02
+boot=2026-11-02-slim3
+cwd=/tmp/jafj_slim_ajvuw2ht
+commit=abc1234
+
+telethon در این مفسر نصب نیست: /usr/bin/python3
+   راهِ حل: "/usr/bin/python3" -m pip install -r /tmp/jafj_slim_ajvuw2ht/code/requirements.txt
+   با نبودِ telethon سلف اصلاً بالا نمی‌آید (نه پنل، نه پیامِ آنلاین‌شدن). اگر پایتونِ سرویس با پایتونِ pip یکی نباشد همین اتفاق می‌افتد.
