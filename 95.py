@@ -347,6 +347,7 @@ import time
 import glob
 import shutil
 import random
+import subprocess
 import sqlite3
 import asyncio
 import threading
@@ -6149,6 +6150,84 @@ def release_run_lock():
 
 
 # ─────────────────────────────────────────────
+#  ردیِ بوت — «۹۵.py اجرا شد؟ تا کجا رسید؟»
+# ─────────────────────────────────────────────
+# مشکلِ واقعی: وقتی سلف بالا نمی‌آید و پنل جواب نمی‌دهد، تنها چیزی که از
+# بیرون می‌شود فهمید یک جمله است: «کار نمی‌کند». خیلی از میزبان‌ها stderr
+# را نشان نمی‌دهند و بعد از ری‌استارت هم فقط لاگِ سرویس می‌ماند.
+# پس هر مرحله‌ی بوت یک خط در `jafj_boot.log` می‌نویسد و هر خطای بوت در
+# `jafj_boot_error.txt` می‌نشیند. آخرین خطِ فایلِ اول = آخرین مرحله‌ی سالم.
+BOOT_LOG = "jafj_boot.log"
+BOOT_CRASH = "jafj_boot_error.txt"
+_BOOT_SEEN = set()
+_BOOT_LAST = {"step": ""}
+BOOT_OK_STEP = "آنلاین شد — پنل فعال"
+
+
+def _boot_step(name, extra=""):
+    """یک مرحله‌ی بوت را ثبت کن (هر مرحله در هر پروسه فقط یک‌بار)."""
+    key = str(name)
+    if key in _BOOT_SEEN:
+        return key
+    _BOOT_SEEN.add(key)
+    _BOOT_LAST["step"] = key
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} {key}"
+    if extra:
+        line += f" | {extra}"
+    try:
+        with open(BOOT_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    print(f"  ◦ بوت: {key}" + (f" | {extra}" if extra else ""), flush=True)
+    return key
+
+
+def boot_last_step():
+    """آخرین مرحله‌ای که این پروسه (یا پروسه‌ی قبلی) رد کرده است."""
+    if _BOOT_LAST["step"]:
+        return _BOOT_LAST["step"]
+    try:
+        with open(BOOT_LOG, encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+        return lines[-1] if lines else ""
+    except Exception:
+        return ""
+
+
+def record_boot_crash(exc=None, tb=""):
+    """خطای بوت را در فایل بریز و مسیرش را برگردان.
+
+    چرا فایل: پنلِ تلگرام که جواب نمی‌دهد، تنها راهِ رساندنِ علت به کاربر
+    همین فایل است. ترتیبِ خواندن در عیب‌یابی: آخرِ همین فایل، بعد
+    `jafj_boot.log`.
+    """
+    if tb:
+        text = tb
+    else:
+        text = "".join(traceback.format_exception(
+            type(exc), exc, getattr(exc, "__traceback__", None)))
+    head = (f"⏱ {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"pid={os.getpid()} cwd={os.getcwd()} python={sys.executable}\n"
+            f"argv={sys.argv}\n"
+            f"آخرین مرحله‌ی بوت: {boot_last_step() or '—'}\n")
+    try:
+        with open(BOOT_CRASH, "w", encoding="utf-8") as f:
+            f.write(head + "\n" + text + "\n")
+        _boot_step("خطای بوت ثبت شد", BOOT_CRASH)
+    except Exception:
+        pass
+    full = os.path.abspath(BOOT_CRASH)
+    try:
+        print("\n" + "─" * 52, flush=True)
+        print(f"⛔ 95.py با خطا بست — جزئیات در {full}", flush=True)
+        print(head + "\n" + text, flush=True)
+    except Exception:
+        pass
+    return full
+
+
+# ─────────────────────────────────────────────
 #  کدهای خروج — مدیر از همین عدد علت را می‌فهمد
 # ─────────────────────────────────────────────
 #  ۷۶ = نسخه‌ی دومِ همین اکانت (سشن سالم است، اجرا نکردیم)
@@ -6159,6 +6238,7 @@ EXIT_DUP = 76
 EXIT_KEY_BURNED = 77
 EXIT_NEEDS_RELOGIN = 78
 EXIT_NET_DEAD = 79
+EXIT_DEPS = 71          # telethon نصب نیست و نصبِ خودکار هم نشد
 
 # چرا این تشخیص مهم است: متنِ واقعیِ تلگرام
 #   «AuthKeyDuplicatedError: The authorization key (session file) was used
@@ -6344,9 +6424,12 @@ async def connect_and_run(eng, creds):
     from telethon.tl.functions.channels import (JoinChannelRequest, LeaveChannelRequest,
                                                 GetParticipantRequest)
     from telethon.tl.functions.messages import ImportChatInviteRequest
+    _boot_step("telethon بارگذاری شد")
 
     client = TelegramClient(SESSION, creds["api_id"], creds["api_hash"],
                             flood_sleep_threshold=0)
+
+    _boot_step("کلاینتِ تلگرام ساخته شد", f"session={SESSION}")
 
     async def phone_cb():
         if creds.get("phone"):
@@ -6375,6 +6458,7 @@ async def connect_and_run(eng, creds):
     #      لاگینِ دوباره» علامت بزند و حلقهٔ ری‌استارت کد نسازد.
     #    • بدون آن (اجرای دستی روی لپ‌تاپ) → رفتار قبلی، با پرسیدن از کاربر.
     # ═══════════════════════════════════════════════════════════════════
+    _boot_step("شروعِ اتصال به تلگرام")
     no_auto = (os.environ.get("JAFJ_NO_AUTO_LOGIN") or "").strip() not in ("", "0", "false", "نه")
     authorized = False
     try:
@@ -6443,6 +6527,7 @@ async def connect_and_run(eng, creds):
     eng.my_id = me.id
     eng.write_status()
     eng.log("ok", "login", f"{eng.me} | id={me.id}")
+    _boot_step("ورود انجام شد", f"{eng.me} | id={me.id}")
 
     for tier in ("standard", "vip"):
         p = eng.st.prof(tier)
@@ -9785,6 +9870,7 @@ async def connect_and_run(eng, creds):
                 pass
             await asyncio.sleep(600)
 
+    _boot_step("هندلرها و حلقه‌ها ثبت شدند")
     task = asyncio.create_task(sender_loop())
     ex_task = asyncio.create_task(exchange_worker())
     scan_task = asyncio.create_task(scan_loop())
@@ -9794,7 +9880,11 @@ async def connect_and_run(eng, creds):
     st_task = asyncio.create_task(status_loop())
     mem_task = asyncio.create_task(memory_loop())
 
-    await note(_startup_text())
+    sent = await note(_startup_text())
+    # این خط، مرزِ «کار می‌کند / نمی‌کند» است: اگر در jafj_boot.log نبود،
+    # یعنی ربات هرگز به پنل نرسیده و باید بالاتر را نگاه کرد.
+    _boot_step(BOOT_OK_STEP, "پیامِ شروع رفت" if sent else
+               "⚠️ پیامِ شروع نرفت (ارسال به Saved Messages خطا داد)")
 
     # خطای اولیه‌ای که باعث ورود به پاک‌سازی شد را نگه می‌داریم؛ اگر لغوِ
     # بیرونی (CancelledError) بود، در پایان دوباره پرتاب می‌شود تا خاموشی
@@ -9832,14 +9922,51 @@ async def connect_and_run(eng, creds):
 async def run_bot():
     print(f"\n{BUILD_TAG}", flush=True)
     if need_telethon():
-        print("\n📦 Telethon نصب نیست — نصبش می‌کنم…")
-        os.system(f'"{sys.executable}" -m pip install telethon')
+        # این یکی از رایج‌ترین علت‌های «بالا نمی‌آید» است: سرویس با یک
+        # پایتون اجرا می‌شود که telethon داخلش نیست، و نصبِ خودکار هم
+        # (شبکه‌ی بسته، site-packages فقط‌خواندنی، venvِ دیگر) شکست
+        # می‌خورد. قبلاً فقط یک خط در کنسول می‌نوشت و با کدِ ۱ می‌مرد؛
+        # روی میزبان‌هایی که کنسول را نشان نمی‌دهند یعنی «هیچ».
+        _boot_step("telethon نصب نیست", f"python={sys.executable}")
+        print("\n📦 Telethon نصب نیست — نصبش می‌کنم…", flush=True)
+        pip_out = ""
+        try:
+            _pr = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "telethon"],
+                capture_output=True, text=True, timeout=300)
+            pip_out = ((_pr.stdout or "") + (_pr.stderr or "")).strip()
+            if pip_out:
+                print(pip_out[-900:], flush=True)
+        except Exception as _e:
+            pip_out = f"{type(_e).__name__}: {_e}"
+            print(f"   اجرای pip ممکن نشد: {pip_out}", flush=True)
         if need_telethon():
-            print("\n❌ نصب خودکار نشد. دستی بزن:\n\n   pip install telethon\n")
-            return 1
+            msg = (
+                "❌ Telethon نصب نیست و نصبِ خودکار هم نشد — ربات با همین "
+                "بالا نمی‌آید.\n\n"
+                f"پایتونی که این سرویس را اجرا می‌کند:\n   {sys.executable}\n"
+                f"پوشه‌ی اجرا: {os.getcwd()}\n\n"
+                f"آخرین خطوطِ pip:\n{(pip_out or '—')[-700:]}\n\n"
+                "راهِ حل (با همان پایتون):\n"
+                f'   "{sys.executable}" -m pip install -r requirements.txt\n'
+                f'   یا:  "{sys.executable}" -m pip install '
+                f'"telethon>=1.34" cryptg\n\n'
+                "اگر میزبان venv دارد، همان venv را نصب کن، نه پایتونِ سیستم؛ "
+                "و اگر pip به اینترنت دسترسی ندارد، بسته را از جای دیگری "
+                "بگیر."
+            )
+            print("\n" + msg + "\n", flush=True)
+            record_boot_crash(None, tb=msg)
+            _boot_step("بوت متوقف شد", "نبودِ telethon")
+            return EXIT_DEPS
 
     creds = ensure_creds()
     if not creds:
+        record_boot_crash(None, tb=(
+            "❌ تنظیمات/اعتبارنامه آماده نشد (ensure_creds → None).\n"
+            f"پوشه: {os.getcwd()}\n"
+            "معمولاً یعنی پوشه قابلِ نوشتن نیست یا api_id/api_hash داخلِ "
+            "95.py خالی است."))
         return 1
 
     eng = Engine()
@@ -9904,6 +10031,7 @@ def main():
     # اتصال شکست خورده است.
     print(f"\n▶️ 95.py اجرا شد | pid={os.getpid()} | python={sys.executable} "
           f"| cwd={os.getcwd()}", flush=True)
+    _boot_step("اجرا شد", f"python={sys.executable} cwd={os.getcwd()}")
     ok, other = acquire_run_lock()
     if not ok:
         print("\n" + "─" * 52, flush=True)
@@ -9914,11 +10042,17 @@ def main():
         print("   این نسخه اجرا نشد تا سشنِ سالم خراب نشود.", flush=True)
         print(f"   اگر مطمئنی آن پروسه مرده است: rm {RUN_LOCK}", flush=True)
         return 76
+    _boot_step("قفلِ اجرا گرفته شد")
     try:
         return asyncio.run(run_bot())
     except KeyboardInterrupt:
         print("\n\nخاموش شد. صف و تنظیمات ذخیره شدند.")
         return 0
+    except Exception as e:
+        # بدونِ این، خطای بوت فقط به stderr می‌رفت و روی میزبان‌هایی که
+        # stderr را نشان نمی‌دهند هیچ اثری نمی‌ماند.
+        record_boot_crash(e)
+        return 70
     finally:
         release_run_lock()
 
