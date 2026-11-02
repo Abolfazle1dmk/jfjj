@@ -663,6 +663,36 @@ LOOP_LAG_WARN_SEC = 20
 CAPACITY_REBLOCK_SEC = 300
 
 
+class _CheckDeferred:
+    """نتیجه‌ی «حتی درخواست هم فرستاده نشد» (صف/گیت بسته بود).
+
+    چرا لازم است: قبلاً این حالت هم `None` برمی‌گرداند — یعنی دقیقاً مثلِ
+    «خطای API / نتیجه نامشخص». نتیجه: هر بار که صفِ عملکردها با FloodWait
+    بسته بود، هیچ درخواستی نمی‌رفت ولی شمارنده‌ی «نامشخص» بالا می‌رفت تا
+    به ۵ برسد و پیامِ «بررسی عضویت مدتی است نامشخص می‌ماند» هر ۱۰ دقیقه
+    تکرار شود. حالا این دو حالت از هم جدا هستند: «نرفت» ≠ «نمی‌دانم».
+    """
+    __slots__ = ()
+
+    def __repr__(self):
+        return "CHECK_DEFERRED"
+
+
+CHECK_DEFERRED = _CheckDeferred()
+
+# آخرین علتِ «نامشخص» بودنِ چکِ عضویت — تا هشدار و پنل، علتِ واقعی را
+# بگویند نه یک متنِ کلیِ «FloodWait یا محدودیت API». مقادیر:
+#   ""             → علتی ثبت نشده (آخرین چک قطعی بوده)
+#   "deferred: …"  → درخواستی نرفت (نوبتِ صف/گیت) — «نامشخص» نیست
+#   متنِ دیگر      → خطای واقعیِ همان لحظه (FloodWait / نامِ کلاسِ خطا)
+_LAST_CHECK_WHY = {"why": "", "at": 0}
+
+
+def _note_check_why(why):
+    _LAST_CHECK_WHY["why"] = str(why or "")[:120]
+    _LAST_CHECK_WHY["at"] = int(time.time())
+
+
 def capacity_round_exhausted(started, now, limit_sec=CAPACITY_CLEANUP_MAX_SEC):
     """آیا وقتِ یک دور پاکسازی تمام شده است؟ (توقفِ نرم، ادامه در دور بعد)"""
     try:
@@ -1296,6 +1326,21 @@ class DB:
         return {r["status"]: r["c"] for r in
                 self._x("SELECT status,COUNT(*) c FROM exchange GROUP BY status",
                         (), "all")}
+
+    def ex_unknown_count(self):
+        """چند رکوردِ فعال، چکِ عضویتشان در وضعیت «نامشخص» مانده است؟
+
+        فقط شمارنده‌ی unk_streak>0 شمرده می‌شود؛ «در انتظار نوبت»
+        (CHECK_DEFERRED) اصلاً این شمارنده را بالا نمی‌برد، پس در این عدد
+        نمی‌آید — دقیقاً همان تفکیکی که پیامِ گمراه‌کننده را می‌بندد.
+        """
+        try:
+            r = self._x("SELECT COUNT(*) c FROM exchange WHERE unk_streak>0"
+                        " AND status IN ('pending','approved','joined')",
+                        (), "one")
+            return int(r["c"])
+        except Exception:
+            return 0
 
     def ex_report_counts(self, since):
         """آمار تبادل برای گزارش خصوصی، از timestamp داده‌شده تا الان."""
@@ -5535,6 +5580,16 @@ class Engine:
                 f"⏳ در صف Join: {fa(ex_counts.get('approved', 0))}",
                 f"⌛ منتظر بررسی: {fa(ex_counts.get('pending', 0))}",
             ]
+            try:
+                _unkn = self.db.ex_unknown_count()
+            except Exception:
+                _unkn = 0
+            if _unkn:
+                _whyy = (_LAST_CHECK_WHY.get("why") or "").strip()
+                if _whyy.startswith("deferred:"):
+                    _whyy = "در انتظار نوبت"
+                lines.append(f"🕵️ چکِ نامشخص: {fa(_unkn)}"
+                             + (f" · {_whyy}" if _whyy else ""))
         else:
             lines.append("🔁 تبادل: خاموش")
 
@@ -6214,6 +6269,16 @@ async def connect_and_run(eng, creds):
                                  UserNotParticipantError, UserAlreadyParticipantError,
                                  InviteHashExpiredError, InviteHashInvalidError,
                                  ChannelsTooMuchError, InviteRequestSentError)
+    # این دو در بعضی نسخه‌های قدیمیِ telethon نیستند؛ نبودنشان نباید
+    # جلوی بالا آمدنِ سلف‌بات را بگیرد.
+    try:
+        from telethon.errors import ChannelInvalidError, UsernameInvalidError
+    except Exception:                     # pragma: no cover
+        class ChannelInvalidError(Exception):
+            pass
+
+        class UsernameInvalidError(Exception):
+            pass
     from telethon.tl.functions.channels import (JoinChannelRequest, LeaveChannelRequest,
                                                 GetParticipantRequest)
     from telethon.tl.functions.messages import ImportChatInviteRequest
@@ -6415,9 +6480,18 @@ async def connect_and_run(eng, creds):
         has_ch = any((eng.st.prof(t)["channel"] or "").strip()
                      for t in ("standard", "vip"))
         if has_ch:
+            why = (_LAST_CHECK_WHY.get("why") or "").strip()
+            if why.startswith("deferred:"):
+                why = ""      # درخواستی نرفته بود؛ این علت نیست
+            if why:
+                tail = f"\n🔎 آخرین علتِ واقعی: {why}"
+            else:
+                tail = ("\n🔎 جزئیاتِ خطا در لاگ ثبت شده — "
+                        "با `تبادل وضعیت` ببین")
             await note("🕵️ بررسی عضویت مدتی است **نامشخص** می‌ماند "
-                       "(FloodWait یا محدودیت API). خودم دوباره امتحان "
-                       "می‌کنم؛ اگر ادامه داشت اکانت را کمی استراحت بده.")
+                       "(تلگرام جوابِ قطعی نمی‌دهد). خودم دوباره امتحان "
+                       "می‌کنم؛ اگر ادامه داشت اکانت را کمی استراحت بده."
+                       + tail)
         else:
             await note("⚠️ **کانال من تنظیم نشده است** — تا وقتی با "
                        "`کانال @username` ستش نکنی، هیچ عضویتی تأیید "
@@ -7126,15 +7200,27 @@ async def connect_and_run(eng, creds):
                 chans.append(ch)
         if not chans:
             return None
+        # سه حالت را جدا نگه می‌داریم: «عضو نیست» (False)، «نمی‌دانم»
+        # (None) و «درخواست نرفت» (CHECK_DEFERRED). قبلاً فقط False/None
+        # بود و در حالتِ دو کانال (عادی + VIP) اگر کانالِ اول False می‌داد
+        # و دومی خطا، نتیجه False می‌شد — یعنی ممکن بود طرف واقعاً عضوِ
+        # VIP باشد ولی ربات بگوید «نیومدی» و از کانالش لفت بدهد.
         saw_false = False
+        saw_unknown = False
+        saw_deferred = False
         for ch in chans:
             async def _one_req():
                 # درون قفل: درخواستِ منتظر صف باید FloodWait جدید را هم ببیند.
+                # «نرفت» با «نمی‌دانم» فرق دارد: CHECK_DEFERRED یعنی هیچ
+                # درخواستی به تلگرام نرفت (صف/گیت بسته است) و نباید
+                # شمارنده‌ی «نامشخص» را بسوزاند یا هشدار بدهد.
                 if time.time() < ex_cd.blocked_until:
-                    return None
+                    _note_check_why("deferred: صفِ عملکردها بسته است")
+                    return CHECK_DEFERRED
                 w = check_gate.wait()
                 if w > 45:
-                    return None
+                    _note_check_why("deferred: نوبتِ گیتِ چک دیر می‌رسد")
+                    return CHECK_DEFERRED
                 if w > 0:
                     await asyncio.sleep(w)
                 check_gate.record()
@@ -7153,6 +7239,11 @@ async def connect_and_run(eng, creds):
                 return True
 
             try:
+                # گیتِ چک خودش بسته است؟ آن‌وقت اصلاً درخواست نمی‌فرستیم.
+                if check_gate.blocked():
+                    _note_check_why("deferred: گیتِ چک بسته است")
+                    saw_deferred = True
+                    continue
                 # یک «عملکرد» در صف سراسری: تا عملکرد قبلی تمام نشده و
                 # فاصله‌ی تنظیم‌شده نگذشته باشد، درخواستِ بعدی زده نمی‌شود.
                 # queue=False فقط برای «چک دومِ تأییدی» همان عضویت است: آنجا
@@ -7168,9 +7259,9 @@ async def connect_and_run(eng, creds):
                         out = await _one_req()
                         ex_cd.note_done(rec_id)
                     return out
-                return out
             except UserNotParticipantError:
                 saw_false = True
+                continue
             except FloodWaitError as e:
                 w = getattr(e, "seconds", 60)
                 # فیکس: فلودِ «بررسی عضویت» ربطی به ظرفیت ارسال ندارد؛
@@ -7186,10 +7277,32 @@ async def connect_and_run(eng, creds):
                                "چک‌ها تا پایانش متوقف می‌شوند و بعد خودکار "
                                "ادامه می‌دهند. اگر زیاد تکرار شد، «تبادل بررسی» "
                                "را بلندتر بگذار یا تعداد تبادل‌های فعال را کم کن.")
-                return None
+                _note_check_why(f"FloodWait {secs(w)} روی چکِ {ch}")
+                saw_unknown = True
+                continue
             except Exception as e:
                 eng.log("warn", "ex_check", f"{ch}: {type(e).__name__}: {e}")
-                return None
+                _note_check_why(f"{type(e).__name__} روی چکِ {ch}")
+                saw_unknown = True
+                continue
+
+            if out is True:
+                _note_check_why("")      # جوابِ قطعی گرفتیم؛ علتِ قبلی پاک شود
+                return True
+            if out is False:
+                saw_false = True
+            elif out is CHECK_DEFERRED:
+                saw_deferred = True
+            else:
+                saw_unknown = True
+
+        # جمع‌بندی: «عضو نیست» فقط وقتی که همه‌ی کانال‌ها قطعاً False
+        # داده باشند؛ در غیرِ این صورت «نمی‌دانم» یا «نرفت» برمی‌گردانیم
+        # تا لفت/«نیومدی»ِ اشتباه رخ ندهد.
+        if saw_unknown:
+            return None
+        if saw_deferred:
+            return CHECK_DEFERRED
         return False if saw_false else None
 
     async def confirm_peer_membership(user_id, fast=False, rec_id=None,
@@ -7259,6 +7372,30 @@ async def connect_and_run(eng, creds):
 
         joined_ent = {"e": None}
 
+        async def _remember_existing():
+            """عضوِ از قبل بودیم — هویتِ کانال را ثبت کن.
+
+            چرا مهم است: اگر این‌جا آیدی/access_hash ذخیره نشود، لفتِ
+            بعدی فقط با «لینک» کار می‌کند و اگر طرف لینکش را باطل/منقضی
+            کرده باشد، لفت هیچ‌وقت انجام نمی‌شود و ربات می‌گوید «خودت
+            دستی لفت بده». این حالت دقیقاً همان چیزی است که کاربر گزارش
+            داد. برای لینکِ خصوصی از CheckChatInvite استفاده می‌کنیم که
+            کانال را بدونِ جوینِ دوباره برمی‌گرداند.
+            """
+            if is_invite(link):
+                # ایمپورتِ تنبل: بعضی نسخه‌های telethon این کلاس را ندارند و
+                # ایمپورتِ سراسری، بالا آمدنِ سلف‌بات را می‌شکست.
+                from telethon.tl.functions.messages import CheckChatInviteRequest
+                res = await client(CheckChatInviteRequest(invite_hash(link)))
+                chat = getattr(res, "chat", None)
+                if chat is None:
+                    return ""
+                remember_channel(rec_id, chat)
+                return getattr(chat, "title", "") or ""
+            ent = await client.get_entity(link)
+            remember_channel(rec_id, ent)
+            return getattr(ent, "title", "") or ""
+
         async def _do_join():
             if is_invite(link):
                 upd = await client(ImportChatInviteRequest(invite_hash(link)))
@@ -7281,7 +7418,17 @@ async def connect_and_run(eng, creds):
             return out
 
         except UserAlreadyParticipantError:
-            return True, "already", ""
+            # از قبل عضو بودیم: تلگرام عنوان/آیدی هم نمی‌دهد، ولی هویتِ
+            # کانال را حل می‌کنیم تا لفتِ بعدی به لینک وابسته نماند.
+            title = ""
+            if rec_id:
+                try:
+                    title = await ex_cd.action("identity", rec_id,
+                                               _remember_existing) or ""
+                except Exception as e:
+                    eng.log("warn", "ex_identity_already",
+                            f"#{rec_id}: {type(e).__name__}: {e}")
+            return True, "already", title
         except InviteRequestSentError:
             return False, "درخواست عضویت فرستاده شد — منتظر تأیید ادمین", ""
         except (InviteHashExpiredError, InviteHashInvalidError):
@@ -7376,30 +7523,45 @@ async def connect_and_run(eng, creds):
             return _input_channel(rec.get("chat_id"), rec.get("chat_hash"))
 
         async def resolve_by_title():
-            """آخرین چاره: کانالی که با همین عنوان قبلاً جوینش کرده‌ایم.
-            فقط اگر تطبیقِ یکتا باشد (عنوان تکراری = هیچ‌کاری نکن)."""
+            """کانالِ طرف را از میانِ **همه‌ی** دیالوگ‌ها پیدا می‌کند.
+
+            تطبیق: اول با `chat_id` ذخیره‌شده، بعد با عنوانِ ذخیره‌شده.
+            فقط اگر تطبیق یکتا باشد (چند کانالِ هم‌عنوان = هیچ‌کاری نکن).
+
+            چرا کلِ دیالوگ‌ها و نه ۳۰۰ تای اول: اکانتی که به سقفِ ۵۰۰
+            کانال خورده، صدها دیالوگ دارد؛ با `limit=300` کانالِ طرف
+            دیده نمی‌شد، لفت هیچ‌وقت انجام نمی‌شد و ربات می‌گفت «خودت
+            دستی خارج شو». این همان باگِ گزارش‌شده بود.
+            """
+            want_id = int((rec or {}).get("chat_id") or 0)
             title = ((rec or {}).get("channel_title") or "").strip()
-            if not title:
+            if not want_id and not title:
                 return None
             mine = {(eng.st.prof(t)["channel"] or "").lstrip("@").lower()
                     for t in ("standard", "vip")}
             mine.discard("")
             found = None
             try:
-                async for d in client.iter_dialogs(limit=300):
+                async for d in client.iter_dialogs():
                     e = d.entity
-                    if (getattr(e, "title", "") or "").strip() != title:
-                        continue
                     if not hasattr(e, "access_hash"):
                         continue
                     if (getattr(e, "username", None) or "").lower() in mine:
                         continue
-                    if found is not None:
-                        return None      # عنوان تکراری → لفتِ اشتباه نده
+                    eid = int(getattr(e, "id", 0) or 0)
+                    hit = (want_id and eid == want_id) or (
+                        title and (getattr(e, "title", "") or "").strip() == title)
+                    if not hit:
+                        continue
+                    if found is not None and int(getattr(found, "id", 0) or 0) != eid:
+                        return None      # تطبیقِ چندتایی → لفتِ اشتباه نده
                     found = e
             except Exception as e:
                 eng.log("warn", "ex_leave_scan", f"{type(e).__name__}: {e}")
                 return None
+            if found is not None:
+                # هویتِ کانال را ذخیره کن تا لفتِ بعدی به این اسکن نیاز نداشته باشد.
+                remember_channel(rec_id, found)
             return found
 
         async def _do_leave():
@@ -7407,12 +7569,16 @@ async def connect_and_run(eng, creds):
             if ent is None:
                 try:
                     ent = await client.get_entity(link)
-                except (InviteHashExpiredError, InviteHashInvalidError):
-                    # لینکِ طرف باطل/منقضی شده — با عنوانِ ذخیره‌شده امتحان کن
+                except (InviteHashExpiredError, InviteHashInvalidError,
+                        ChannelInvalidError, UsernameNotOccupiedError,
+                        UsernameInvalidError):
+                    # لینکِ طرف باطل/منقضی شده — با آیدی/عنوانِ ذخیره‌شده یا
+                    # اسکنِ دیالوگ‌ها امتحان کن.
                     ent = await resolve_by_title()
                     if ent is None:
                         eng.log("warn", "ex_leave_expired", str(link))
                         raise
+                remember_channel(rec_id, ent)
             await client(LeaveChannelRequest(ent))
             return True, ""
 
@@ -8655,6 +8821,14 @@ async def connect_and_run(eng, creds):
                                               unk_streak=0, replied=0,
                                               note="لفت لغو شد — تأیید شد عضو است")
                                 continue
+                            if _conf is CHECK_DEFERRED:
+                                # درخواست اصلاً نرفت (صف/گیتِ فلود بسته بود).
+                                # این «نامشخص» نیست: نه شمارنده می‌سوزاند، نه
+                                # هشدار می‌دهد؛ فقط کمی بعد دوباره.
+                                eng.db.ex_set(rec["id"], next_reminder=next_action_after(
+                                    rec, int(time.time()) + 60),
+                                    note="در انتظار نوبت — ۶۰ ثانیه صبر")
+                                continue
                             if _conf is None:
                                 eng.db.ex_set(rec["id"], next_reminder=next_action_after(
                                     rec, int(time.time()) + membership_check_delay()),
@@ -8738,8 +8912,22 @@ async def connect_and_run(eng, creds):
                                            f"📡 کانال: `{rec.get('link') or '—'}`\n"
                                            f"👤 طرف: {rec.get('peer_name') or rec.get('peer_id')}")
                     else:
+                        # «نرفت» (صف/گیت بسته) از «نمی‌دانم» جدا شده است.
+                        # باگِ واقعی: این‌جا به‌جای `still` (خروجیِ چکِ همین
+                        # رکورد) از `_conf` استفاده می‌شد؛ `_conf` فقط در
+                        # شاخه‌ی «status == joined» ساخته می‌شد، پس در حالتِ
+                        # «نامشخصِ» معمولی NameError می‌داد و کل دورِ حلقه
+                        # می‌افتاد (نه شمارنده‌ی نامشخص کار می‌کرد، نه
+                        # فاصله‌ی ۱۰ دقیقه‌ای) — و اگر `_conf` از رکوردِ
+                        # قبلی مانده بود، تصمیمِ رکوردِ بعدی با نتیجه‌ی
+                        # رکوردِ قبلی گرفته می‌شد.
+                        if still is CHECK_DEFERRED:
+                            eng.db.ex_set(rec["id"],
+                                          next_reminder=next_action_after(rec, now2 + 60),
+                                          note="در انتظار نوبت — ۶۰ ثانیه صبر")
+                            continue
                         # نامشخص (FloodWait/خطای API).
-                        if check_gate.blocked():
+                        if check_gate.blocked() or time.time() < ex_cd.blocked_until:
                             # سقف فلود فعال است — شمارنده نسوزان؛ فقط ۶۰
                             # ثانیه دیگر دوباره. قبلاً همین‌جا رکوردها در
                             # حالت «نامشخص» می‌چرخیدند و لفت عقب می‌افتد.
@@ -8881,6 +9069,15 @@ async def connect_and_run(eng, creds):
                                     strikes=0, unk_streak=0,
                                     note="لفت لغو شد — تأیید شد عضو است")
                                 continue
+                            if _conf is CHECK_DEFERRED:
+                                # درخواست اصلاً نرفت (صف/گیت بسته بود) —
+                                # این «عضو نیست» نیست؛ وگرنه همین‌جا لفتِ
+                                # اشتباه زده می‌شد.
+                                eng.db.ex_set(rec["id"], last_check=now,
+                                              next_check=next_action_after(
+                                                  rec, int(time.time()) + 60),
+                                              note="در انتظار نوبت — ۶۰ ثانیه صبر")
+                                continue
                             if _conf is None:
                                 eng.db.ex_set(rec["id"], next_check=next_action_after(
                                     rec, int(time.time()) + membership_check_delay()),
@@ -8976,9 +9173,19 @@ async def connect_and_run(eng, creds):
                             eng.log("info", "ex_strike",
                                     f"#{rec['id']} {st}/{x['max_strikes']}")
                     else:
+                        # «نرفت» ≠ «نمی‌دانم»: اگر درخواست اصلاً نرفت،
+                        # شمارنده‌ی نامشخص و هشدارِ ۱۰دقیقه‌ای اجرا نمی‌شود.
+                        # نکته: متغیرِ درست `still` است (خروجیِ چکِ همین
+                        # رکورد)؛ `_conf` متعلق به شاخه‌ی لفت است و این‌جا
+                        # تعریف نشده بود → NameError و افتادنِ کلِ دور.
+                        if still is CHECK_DEFERRED:
+                            eng.db.ex_set(rec["id"], last_check=now,
+                                          next_check=next_action_after(rec, now + 60),
+                                          note="در انتظار نوبت — ۶۰ ثانیه صبر")
+                            continue
                         # نامشخص در چک نگهبانی (فلود/خطای API) — هرگز اخطارِ
                         # لفت حساب نمی‌شود؛ شمارنده‌ی جدای خودش را دارد.
-                        if check_gate.blocked():
+                        if check_gate.blocked() or time.time() < ex_cd.blocked_until:
                             eng.db.ex_set(rec["id"], last_check=now,
                                           next_check=next_action_after(rec, now + 60),
                                           note="فلود بررسی — ۶۰ ثانیه صبر")

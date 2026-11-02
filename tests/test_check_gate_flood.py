@@ -29,6 +29,24 @@ SRC_REPO = REPO
 
 
 DRIVER = r"""
+# ── نام‌های تازه‌ی ۹۵.py (سنتینلِ «نرفت» + علتِ چک) ──
+# برش‌های کد در namespaceهای این درایور exec می‌شوند، پس هر گلوبالی که کدِ
+# برش‌خورده می‌خواند باید این‌جا هم تعریف شده باشد.
+class _CdStub:
+    def __repr__(self):
+        return "CHECK_DEFERRED"
+
+
+def _ns(d):
+    d.setdefault("_LAST_CHECK_WHY", {"why": "", "at": 0})
+    d.setdefault("_note_check_why", (lambda w: None))
+    for _nm in ("ChannelInvalidError", "UsernameInvalidError"):
+        d.setdefault(_nm, type(_nm, (Exception,), {}))
+    if "CHECK_DEFERRED" not in d:
+        _m = globals().get("m")
+        d["CHECK_DEFERRED"] = getattr(_m, "CHECK_DEFERRED", None) or _CdStub()
+    return d
+
 import asyncio, importlib.util, os, sys, time
 sys.path.insert(0, os.getcwd())
 
@@ -193,6 +211,7 @@ def mk_eng():
 NOOP_CD = m.ExCooldown(gap_min=0, gap_max=0)
 hns = {"m": m, "stub_gpr": stub_gpr, "stub_unp": stub_unp,
        "stub_fwe": stub_fwe, "notes": [], "ex_cd": NOOP_CD}
+_ns(hns)
 exec(harness, hns)
 run_pimc = hns["run_pimc"]
 
@@ -248,8 +267,12 @@ async def scenario_skip():
 
 
 r, made = asyncio.run(scenario_skip())
-check(r is None and made == 0,
-      "G5: داخل سقف فلود → بدون درخواست، بی‌درنگ None (حلقه‌ها نفس می‌کشند)")
+# انتظارِ تازه (باگِ «نامشخصِ» بی‌پایان): «درخواست نرفت» یک نتیجه‌ی جدا
+# (CHECK_DEFERRED) است، نه None. قبلاً همین None بودن باعث می‌شد هر بار
+# که گیت بسته بود شمارنده‌ی «نامشخص» بسوزد و بعد از ۵ بار پیامِ
+# «بررسی عضویت مدتی است نامشخص می‌ماند» برود.
+check(r is hns["CHECK_DEFERRED"] and made == 0,
+      "G5: داخل سقف فلود → بدون درخواست، بی‌درنگ CHECK_DEFERRED")
 
 # خطای معمولی → None (مثل قبل)
 async def scenario_error():
@@ -278,8 +301,19 @@ check("check_gate.penalize(w)" in src,
 check("ex_check_flood" in src, "G6: فلود چک لاگ اختصاصی دارد")
 check('eng.thr["standard"].penalize' not in src[src.find("async def peer_in_my_channel"):src.find("async def confirm_peer_membership")],
       "G6: فلود چک تروتیل ارسال را لمس نمی‌کند")
-check(src.count("if check_gate.blocked():") >= 2,
-      "G6: هر دو حلقه هنگام سقف فلود شمارنده نمی‌سوزانند (۶۰ث صبر)")
+# شرطِ هر دو حلقه بعد از فیکس عریض‌تر شد: «گیت بسته» یا «صفِ عملکردها
+# هنوز در فلود است» — هیچ‌کدام نباید شمارنده‌ی نامشخص را بسوزانند.
+check(src.count("if check_gate.blocked() or time.time() < ex_cd.blocked_until:") == 2,
+      "G6: هر دو حلقه هنگام سقف فلود/صفِ بسته شمارنده نمی‌سوزانند (۶۰ث صبر)")
+# ── فیکس «نامشخصِ بی‌پایان»: «نرفت» از «نمی‌دانم» جدا شده است ──
+check("if still is CHECK_DEFERRED:" in src and
+      src.count("if still is CHECK_DEFERRED:") == 2,
+      "G6: هر دو حلقه «نرفت» را از «نمی‌دانم» جدا می‌کنند")
+check("CHECK_DEFERRED = _CheckDeferred()" in src and
+      "class _CheckDeferred" in src,
+      "G6: سنتینلِ CHECK_DEFERRED تعریف شده است")
+check('note="در انتظار نوبت — ۶۰ ثانیه صبر"' in src,
+      "G6: نوتِ حالتِ «در انتظار نوبت» صادقانه است (نه «فلود»)")
 print("DONE G6 wiring")
 
 

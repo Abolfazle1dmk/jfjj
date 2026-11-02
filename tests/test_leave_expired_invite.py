@@ -42,6 +42,25 @@ SRC_REPO = REPO
 
 
 DRIVER = r"""
+# ── نام‌های تازه‌ی ۹۵.py (سنتینلِ «نرفت» + علتِ چک) ──
+# برش‌های کد در namespaceهای این درایور exec می‌شوند، پس هر گلوبالی که کدِ
+# برش‌خورده می‌خواند باید این‌جا هم تعریف شده باشد.
+class _CdStub:
+    def __repr__(self):
+        return "CHECK_DEFERRED"
+
+
+def _ns(d):
+    d.setdefault("_LAST_CHECK_WHY", {"why": "", "at": 0})
+    d.setdefault("_note_check_why", (lambda w: None))
+    for _nm in ("ChannelInvalidError", "UsernameInvalidError",
+                "UsernameNotOccupiedError"):
+        d.setdefault(_nm, type(_nm, (Exception,), {}))
+    if "CHECK_DEFERRED" not in d:
+        _m = globals().get("m")
+        d["CHECK_DEFERRED"] = getattr(_m, "CHECK_DEFERRED", None) or _CdStub()
+    return d
+
 import asyncio, importlib.util, os, sys, time
 from types import SimpleNamespace
 sys.path.insert(0, os.getcwd())
@@ -184,7 +203,12 @@ ns = {"m": m, "DRY_RUN": m.DRY_RUN, "eng": None, "client": None,
       "FloodWaitError": FloodWaitError,
       "LeaveChannelRequest": LeaveChannelRequest,
       "_input_channel": m._input_channel,
+      # داخلِ connect_and_run تعریف می‌شود و در برشِ leave_link نیست؛
+      # وظیفه‌اش فقط ذخیره‌ی هویتِ کانال است و در test_leave_scan جدا
+      # آزموده می‌شود.
+      "remember_channel": lambda rec_id, ent: None,
       "time": time, "SimpleNamespace": SimpleNamespace}
+_ns(ns)
 exec(fn_src, ns)
 leave_link = ns["leave_link"]
 CD0 = ns["ex_cd"]
@@ -251,7 +275,7 @@ ns["client"] = fake
 ok, err = asyncio.run(leave_link("https://t.me/+gone4", rec["id"]))
 check(ok is True and len(fake.leaves) == 1
       and getattr(fake.leaves[0], "id", None) == -1004444,
-      "L5: با تطبیقِ یکتای عنوان هم لفت انجام شد")
+      "L5: با تطبیقِ یکتای عنوان هم لفت انجام شد (%r)" % ((ok, err, fake.leaves),))
 
 # عنوان تکراری → هیچ لفتِ اشتباهی
 eng = fresh_engine()
@@ -297,6 +321,7 @@ harness = (
     + "\n".join("    " + ln for ln in ded.splitlines())
     + "\n")
 hns = {"m": m, "ex_cd": m.ExCooldown(gap_min=0, gap_max=0)}
+_ns(hns)
 exec(harness, hns)
 run_reminder = hns["_run"]
 
