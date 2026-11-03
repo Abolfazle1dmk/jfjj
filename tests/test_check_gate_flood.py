@@ -40,6 +40,11 @@ class _CdStub:
 def _ns(d):
     d.setdefault("_LAST_CHECK_WHY", {"why": "", "at": 0})
     d.setdefault("_note_check_why", (lambda w: None))
+    # نام‌های سطح-ماژول که بدنهٔ استخراج‌شده می‌خواند؛ از خودِ 95.py گرفته
+    # می‌شوند تا اگر مهلتی تغییر کرد، تست هم با همان عدد برود.
+    _mm = globals().get("m")
+    for _nm, _dv in (("CHECK_CALL_TIMEOUT_SEC", 45), ("NOTE_TIMEOUT_SEC", 30)):
+        d.setdefault(_nm, getattr(_mm, _nm, _dv) if _mm else _dv)
     for _nm in ("ChannelInvalidError", "UsernameInvalidError"):
         d.setdefault(_nm, type(_nm, (Exception,), {}))
     if "CHECK_DEFERRED" not in d:

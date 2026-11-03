@@ -231,6 +231,14 @@ class _FakeClient:
         return SimpleNamespace(participant=SimpleNamespace(left=False))
 
 
+class _HangingClient:
+    """سوکتِ نیمه‌باز: درخواست «هیچ‌وقت» برنمی‌گردد."""
+    calls = []
+
+    async def __call__(self, req):
+        await asyncio.sleep(30)
+
+
 async def _async_note(*a, **k):
     return True
 
@@ -248,7 +256,7 @@ def _peer_check_source(buggy=False):
     return textwrap.dedent(body)
 
 
-def _run_peer_check(queue, answers, buggy=False):
+def _run_peer_check(queue, answers, buggy=False, hang=False, timeout=45):
     """`peer_in_my_channel` واقعی را با دو کانال (عادی + VIP) اجرا می‌کند."""
     ns = {
         "time": time, "asyncio": asyncio,
@@ -259,7 +267,8 @@ def _run_peer_check(queue, answers, buggy=False):
             db=SimpleNamespace(log=lambda *a: None),
             log=lambda *a: None),
         "ex_cd": _FakeCd(), "check_gate": _FakeGate(),
-        "client": _FakeClient(answers),
+        "client": _HangingClient() if hang else _FakeClient(answers),
+        "CHECK_CALL_TIMEOUT_SEC": timeout,
         "GetParticipantRequest": (
             lambda peer, uid: SimpleNamespace(peer=peer, user_id=uid)),
         "FloodWaitError": type("FloodWaitError", (Exception,), {}),
@@ -376,6 +385,114 @@ async def _supervise_cases():
 
 
 asyncio.run(_supervise_cases())
+
+# ════════════════════════════════════════════════════════════
+# ۸) سقفِ زمانِ خودِ عملکرد — قفلِ سراسری آزاد می‌ماند
+# ════════════════════════════════════════════════════════════
+print("── ۸. مهلتِ عملکرد (سوکتِ گیرکرده کل تبادل را نخواباند) ──")
+_a = SRC.index("                try:\n                    if fn is None:")
+_b = SRC.index("    def note_done(self, rec_id=None, now=None):", _a)
+_act = SRC[_a:_b]
+check("بدنه‌ی action داخل wait_for است",
+      "asyncio.wait_for(fn(*a, **kw), timeout=_to)" in _act)
+check("مهلتِ تمام‌شده به TimeoutErrorِ روشن تبدیل می‌شود",
+      "except asyncio.TimeoutError" in _act and "raise TimeoutError" in _act)
+_ops = SRC[SRC.index("OP_TIMEOUT_SEC = {"):SRC.index("class ExCooldown:")]
+for _k in ("check", "leave", "join", "reminder", "say"):
+    check(f"مهلتِ «{_k}» تعریف شده است", f'"{_k}"' in _ops)
+check("ثابت‌های مهلت پیش از کلاس می‌آیند",
+      SRC.index("OP_TIMEOUT_SEC = {") < SRC.index("class ExCooldown:"))
+_cds = SRC[SRC.index("class ExCooldown:"):SRC.index("class Throttle:")]
+check("op_timeout روی همان کلاسِ صف است", "def op_timeout(self, kind)" in _cds)
+
+
+
+async def _op_timeout_case():
+    cd = m.ExCooldown(gap_min=0, gap_max=0)
+    cd.op_timeout = lambda kind: 0.2          # مهلتِ آزمایشی
+    hung = asyncio.Event()
+
+    async def slow_fn():
+        hung.set()
+        await asyncio.sleep(30)               # دقیقاً همان «هیچ‌وقت برنمی‌گردد»
+
+    async def runner():
+        try:
+            await cd.action("check", 9, slow_fn)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError as e:
+            return f"timeout:{type(e).__name__}"
+        return "no-timeout"
+
+    async def next_op():
+        await asyncio.sleep(0.05)             # بگذار first واقعاً قفل را بگیرد
+        return await cd.action("check", 7, lambda: "ran")
+
+    r = await asyncio.wait_for(asyncio.gather(runner(), next_op()), timeout=5)
+    return r, hung.is_set(), (9 in cd._busy), cd._lock.locked()
+
+
+_r, _fired, _still_busy, _lock_held = asyncio.run(_op_timeout_case())
+check("عملکردِ گیرکرده با TimeoutError بسته شد", _r[0] == "timeout:TimeoutError", _r[0])
+check("مهلت بعد از شروعِ تابع کار می‌کند (نه قبل از صف)", _fired)
+check("بعد از مهلت، رکورد دیگر «در حال عملیات» نیست", not _still_busy)
+check("قفلِ سراسری آزاد می‌ماند", not _lock_held)
+check("عملکردِ بعدی پشتِ گیرکردگی اجرا شد", _r[1] == "ran", _r[1])
+check("مهلتِ join زیرِ wait_for(۱۸۰) حلقه است",
+      m.OP_TIMEOUT_SEC["join"] < m.OP_TIMEOUT_SEC["leave"])
+
+# ════════════════════════════════════════════════════════════
+# ۹) «نیومدی» تعویق‌شده ≠ «نیومدی» نرفته
+# ════════════════════════════════════════════════════════════
+print("── ۹. تعویقِ یادآوری اخطار نمی‌سوزاند ──")
+_fn = SRC.index("    async def send_not_joined_reminder(rec):")
+_g = SRC[SRC.index("        wait_op = ex_cd.wait_for(rec.get(\"id\"))", _fn):
+         SRC.index("# لینک طرف هرگز داخل متن ارسالی", _fn)]
+check("مسیرِ تعویق None برمی‌گرداند (نه False)",
+      "return None" in _g and "return False" not in _g)
+check("نوبتِ تازه هنگام تعویق ثبت می‌شود",
+      'note="در صف عملکرد — «نیومدی» کمی دیگر می‌رود"' in _g)
+_ml = SRC[SRC.index("    async def membership_loop():"):
+          SRC.index("    async def exchange_worker()")]
+_rem_loop = _ml[_ml.index("for rec in eng.db.ex_reminder_due"):]
+_rem_loop = _rem_loop[:_rem_loop.index("for rec in eng.db.ex_due(")]
+check("حلقه‌ی یادآوری تعویق را از شکست جدا می‌کند", "sent is None" in _rem_loop)
+check("شمارنده‌ی «سه بار نشد → لفت» فقط با شکستِ واقعی جلو می‌رود",
+      _rem_loop.index("if sent is None") < _rem_loop.index("fails = int(rec.get(\"strikes\")"))
+
+# ════════════════════════════════════════════════════════════
+# ۱۰) درخواستِ گیرکردهٔ چک، حلقه را نمی‌کُشد
+# ════════════════════════════════════════════════════════════
+print("── ۱۰. مهلتِ خودِ درخواستِ چک و نوتیف ──")
+_body = SRC[SRC.index("            async def _one_req():"):
+            SRC.index("            try:\n                # گیتِ چک خودش بسته است؟")]
+check("درخواستِ GetParticipant مهلت دارد",
+      "asyncio.wait_for(\n                        client(GetParticipantRequest" in _body
+      and "timeout=CHECK_CALL_TIMEOUT_SEC)" in _body)
+check("مهلتِ چک از بیرونِ صف هم کار می‌کند",
+      "except asyncio.TimeoutError" in _body and "_note_check_why" in _body)
+check("resolveِ لینکِ خصوصیِ کانالِ من هم مهلت دارد",
+      "asyncio.wait_for(\n                            client(CheckChatInviteRequest" in _body)
+check("مهلتِ نوتیفِ Saved Messages",
+      "timeout=NOTE_TIMEOUT_SEC)" in SRC[SRC.index("    async def note(text):"):
+                                       SRC.index("    def _startup_text():")])
+_t0 = time.time()
+_hang, _ = _run_peer_check(True, {}, hang=True, timeout=0.2)
+_dt = time.time() - _t0
+check("چکِ گیرکرده «نامشخص» می‌شود، نه بلوکه", _hang is None, _hang)
+check("و در چند صدم ثانیه برمی‌گردد (تا ابد صبر نمی‌کند)", _dt < 5, round(_dt, 2))
+
+# ════════════════════════════════════════════════════════════
+# ۱۱) نشانهٔ «اسکن دستی» در تنظیمات گیر نمی‌کند
+# ════════════════════════════════════════════════════════════
+print("── ۱۱. اسکنِ دستی معلق نمی‌ماند ──")
+_pre = sl[sl.index("        while True:") + 12:
+          sl.index("# ۰) اسکن گروه‌ها (حالت پیش‌قدم)")]
+check("نشانه پیش از گیت‌ها دیده می‌شود",
+      'if x.get("_scan_now") and (not x["enabled"] or not eng.ex_channel_ready()):' in _pre)
+check("نشانه پاک می‌شود (اسکنِ شبح‌وارِ بعدی ندارد)", 'x.pop("_scan_now", None)' in _pre)
+check("به جای سکوت، جواب داده می‌شود", "اسکنی در کار نیست" in _pre)
 
 print("DONE PASS" if not FAILS else "FAILED: %d" % len(FAILS))
 for f in FAILS:

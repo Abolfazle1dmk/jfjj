@@ -305,8 +305,15 @@ g6 = eng6.db.ex_get(rec6["id"])
 print("S6 first", first, "second", second, "sent", len(fake6.sent),
       "next_reminder>now", g6["next_reminder"] > int(time.time()))
 check(first is True and len(fake6.sent) == 1, "۶: «نیومدی» اول رفت")
-check(second is False and len(fake6.sent) == 1,
+check(second is None and len(fake6.sent) == 1,
       "۶: «نیومدی» دوم درجا پشتِ اولی نرفت (باگِ گزارش‌شده)")
+# None = تعویق، False = شکستِ واقعی. اگر این دو یکی شوند، حلقه‌ی یادآوری
+# «صف شلوغ است» را «پیام فرستاده نشد → سه بار شد → لفتش کن» می‌خواند و
+# تبادل بی‌آنکه یک «نیومدی» برود لغو می‌شود.
+eng6.ex_cfg()["reply"] = False
+check(asyncio.run(send_rem(eng6.db.ex_get(rec6["id"]))) is False,
+      "۶: شکستِ واقعی (ریپل خاموش) همان False می‌ماند، نه None")
+eng6.ex_cfg()["reply"] = True
 check(g6["next_reminder"] > int(time.time()),
       "۶: نوبتِ بعدی به زمانِ درست منتقل شد (حلقه دوباره تلاش می‌کند)")
 check(g6["reminders_total"] == 0, "۶: شمارنده‌ی مادام‌العمر بی‌دلیل نسوخت")
@@ -695,10 +702,10 @@ check(row("check_allowed_now")[1] is False
       and row("check_allowed_now")[2] >= int(GAP) - 1,
       "۱۲: چکِ درجا بعد از جوین رد شد و به بعد از فاصله منتقل شد")
 r1 = row("reminder1_sent")
-check(r1[1] is False and r1[2] == 0,
+check(r1[1] is None and r1[2] == 0,
       "۱۲: «نیومدی» درجا بعد از جوین نرفت (باگِ گزارش‌شده) — رفت به نوبتِ بعد")
 r2 = row("reminder2_sent")
-check(r2[1] is False and r2[3] == 0,
+check(r2[1] is None and r2[3] == 0,
       "۱۲: تلاشِ دوباره هم درجا پیام نفرستاد")
 check(r2[5] >= 1,
       "۱۲: نوبتِ بعدی به زمانِ درست منتقل شد و شمارنده‌ی یادآوری نسوخت")
@@ -710,7 +717,7 @@ s4 = asyncio.run(send12(eng12.db.ex_get(rec12["id"])))
 g12 = eng12.db.ex_get(rec12["id"])
 print("S12b again", s4, "sent", len(fake12.sent), "next_in",
       g12["next_reminder"] - int(time.time()))
-check(s4 is False and len(fake12.sent) == 1,
+check(s4 is None and len(fake12.sent) == 1,
       "۱۲: «نیومدی» دوم درجا پشتِ اولی نرفت")
 check(g12["next_reminder"] > int(time.time()),
       "۱۲: نوبتِ «نیومدی» دوم به آینده منتقل شد (حلقه سرِ وقت می‌فرستد)")

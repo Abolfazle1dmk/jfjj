@@ -90,6 +90,8 @@ def make_ns(ref, client):
         "_note_check_why": reasons.append,
         "note": lambda text: _append(notes, text),
         "secs": m.secs,
+        # مهلتِ خودِ درخواستِ تلگرام — از خودِ 95.py تا تست با عددِ واقعی برود
+        "CHECK_CALL_TIMEOUT_SEC": getattr(m, "CHECK_CALL_TIMEOUT_SEC", 45),
     }
     exec(block, ns)
     return eng, ns, notes, reasons

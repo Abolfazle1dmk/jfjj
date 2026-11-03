@@ -1836,6 +1836,28 @@ class CheckGate:
         return now < self.cooldown_until
 
 
+# سقفِ زمانِ خودِ هر «عملکرد» (نه صف). یک درخواستِ گیرکردهی تلگرام
+# وگرنه قفلِ سراسریِ عملکردها را تا ابد در دست می‌گیرد و کل تبادل — جوین،
+# چک، «نیومدی»، لفت — بی‌صدا می‌خوابد. join یک لایه بیرون‌تر هم
+# wait_for(180) دارد، پس این‌جا کوتاه‌تر است تا علتِ دقیق‌تر ثبت شود.
+# مهلتِ خودِ درخواستِ تلگرام (نه صف). چکِ عضویت هر ۱۵–۳۰ ثانیه اجرا می‌شود؛
+# اگر سوکتش گیر کند، همان ۴۵ ثانیه آخرِ عمرِ تبادل را هم می‌خورد: قفلِ
+# سراسری در دست می‌ماند، «نیومدی» نمی‌رود و لفت انجام نمی‌شود. مسیرِ
+# «چکِ دومِ تأییدی» اصلاً در صف نیست، پس مهلتِ action هم بالای سرش نیست —
+# مهلت باید همین‌جا، دورِ خودِ درخواست باشد.
+CHECK_CALL_TIMEOUT_SEC = 45
+# نوتیفِ Saved Messages بی‌ضررترین فراخوانیِ شبکه‌ی دنیاست و در همه‌ی
+# حلقه‌ها صدا زده می‌شود؛ یک گیرکردنِ کوچکِ همین‌جا «حلقه‌ی بررسی عضویت»
+# را کامل می‌خواباند. بهترین‌تلاشی است، پس کوتاه بریده می‌شود.
+NOTE_TIMEOUT_SEC = 30
+
+OP_TIMEOUT_DEFAULT_SEC = 240
+OP_TIMEOUT_SEC = {
+    "check": 60, "identity": 90, "join": 165, "leave": 170,
+    "say": 120, "reminder": 120, "reply_joined": 120,
+}
+
+
 class ExCooldown:
     """صفِ «تک‌عملکردی» تبادل + خنک‌کننده‌ی بین عملکرد‌ها.
 
@@ -1913,9 +1935,23 @@ class ExCooldown:
         return random.uniform(lo, hi)
 
     def floor_seconds(self):
-        """کفِ فاصله (کمینه‌ی بازه) — برای زمان‌بندی‌های قطعی."""
+        """کفِ فاصله (کمینه‌ی بازه) — برای زمان‌بندیِ قطعی."""
         self.apply_config()
         return self.gap_min
+
+    def op_timeout(self, kind):
+        """سقفِ زمانِ خودِ عملکرد (نه صف).
+
+        چرا: یک سوکتِ نیمه‌باز (شبکه‌ی لرزانِ میزبان، teleportِ DNS،
+        GetParticipantِ گیرکرده) «هیچ‌وقت» برمی‌گردد. تا برنگردد، **قفلِ
+        سراسریِ عملکردها** در دستِ همان تسک می‌ماند و کل تبادل — جوین،
+        چک، «نیومدی»، لفت — بی‌صدا می‌خوابد؛ از بیرون دقیقاً همان
+        «ربات روشن است ولی هیچ کاری نمی‌کند». نگهبانِ حلقه‌ها هم چیزی
+        نمی‌دید، چون حلقه «مرده» نبود؛ «منتظر» بود. پس هر عملکرد مهلت
+        دارد و بعدش با TimeoutError شکست می‌خورد (که همه‌ی مسیرها
+        شکست را مدیریت می‌کنند) و قفل آزاد می‌شود.
+        """
+        return OP_TIMEOUT_SEC.get(str(kind or ""), OP_TIMEOUT_DEFAULT_SEC)
 
     # ── وضعیتِ یک رکورد ──
     def since_done(self, rec_id, now=None):
@@ -2035,8 +2071,20 @@ class ExCooldown:
                     if fn is None:
                         return None
                     if asyncio.iscoroutinefunction(fn):
+                        _to = self.op_timeout(kind)
+                        if _to:
+                            # مهلت فقط دورِ *خودِ* عملکرد است، نه صف: صبرِ
+                            # فاصله/جریمه می‌تواند ساعت‌ها باشد و باید
+                            # مجاز بماند.
+                            return await asyncio.wait_for(fn(*a, **kw), timeout=_to)
                         return await fn(*a, **kw)
                     return fn(*a, **kw)
+                except asyncio.TimeoutError:
+                    # قفل با finally آزاد می‌شود؛ این‌جا فقط علتِ روشن
+                    # می‌ماند (قبلاً «هیچ» — و کل تبادل بی‌صدا میخکوب).
+                    raise TimeoutError(
+                        f"TimeoutError: عملکرد «{kind}» بیش از "
+                        f"{int(self.op_timeout(kind))} ثانیه کشید و لغو شد")
                 except Exception as e:
                     if kind != "check" and type(e).__name__ in ("FloodWaitError", "FloodPremiumWaitError"):
                         self.blocked_until = max(self.blocked_until,
@@ -7193,10 +7241,14 @@ async def connect_and_run(eng, creds):
 
     async def note(text):
         try:
-            msg = await client.send_message("me", text, link_preview=False)
+            msg = await asyncio.wait_for(
+                client.send_message("me", text, link_preview=False),
+                timeout=NOTE_TIMEOUT_SEC)
             _track_own(msg)
             return msg
         except Exception:
+            # مهلت/خطا = بی‌صدا رد می‌شویم؛ نوتیف هرگز نباید صاحب‌حساب را
+            # بلوکه کند. اگر حلقه‌ای «هیچ پیامی» نمی‌دهد، لاگِ حلقه را ببین.
             return None
 
     def _startup_text():
@@ -8006,7 +8058,9 @@ async def connect_and_run(eng, creds):
                     if channel_peer is None:
                         from telethon.tl.functions.messages import CheckChatInviteRequest
                         h = ch.split('+')[-1].split('/')[-1]
-                        info = await client(CheckChatInviteRequest(h))
+                        info = await asyncio.wait_for(
+                            client(CheckChatInviteRequest(h)),
+                            timeout=CHECK_CALL_TIMEOUT_SEC)
                         ent = getattr(info, 'chat', None)
                         if ent is None:
                             _note_check_why(
@@ -8016,7 +8070,16 @@ async def connect_and_run(eng, creds):
                         channel_peer = ent
                         cache[ch] = ent
                 try:
-                    result = await client(GetParticipantRequest(channel_peer, user_id))
+                    result = await asyncio.wait_for(
+                        client(GetParticipantRequest(channel_peer, user_id)),
+                        timeout=CHECK_CALL_TIMEOUT_SEC)
+                except asyncio.TimeoutError:
+                    # «نامشخص» بهتر از «خوابِ ابدی» است: حلقه‌ی بالا این را
+                    # در نوبتِ بعدی دوباره امتحان می‌کند و قفل آزاد می‌شود.
+                    _note_check_why(
+                        f"چکِ {ch} بیش از {CHECK_CALL_TIMEOUT_SEC} ثانیه کشید "
+                        "و لغو شد (درخواست تلگرام گیر کرده)")
+                    raise
                 except FloodWaitError as e:
                     w = getattr(e, "seconds", 60)
                     check_gate.penalize(w)
@@ -8733,6 +8796,11 @@ async def connect_and_run(eng, creds):
 
     async def send_not_joined_reminder(rec):
         """متن msg_no را روی پیام اصلی می‌فرستد.
+
+        خروجی سه‌حالته: ``True`` رفت · ``False`` نشد (شکستِ واقعی) ·
+        ``None`` **تعویق** — نوبتِ عملکردِ دیگری روی همین رکورد بود؛ این
+        شکست نیست و نباید اخطار بسوزاند یا مسیرِ «سه بار نشد → لفت» را
+        جلو بیاورد.
         - اگر متن سفارشی msg_no ثبت شده باشد: فقط همان متن می‌رود،
           هیچ لینکی (نه کانال طرف، نه کانال خودم) زیرش اضافه نمی‌شود.
         - اگر متنی ثبت نشده باشد: پیش‌فرض «نیومدی» + کانال خودم
@@ -8781,7 +8849,11 @@ async def connect_and_run(eng, creds):
             eng.db.ex_set(rec["id"], next_reminder=nxt,
                           note="در صف عملکرد — «نیومدی» کمی دیگر می‌رود")
             eng.log("info", "ex_reminder_gap", f"#{rec['id']} wait={int(wait_op)}s")
-            return False
+            # `None` یعنی «تعویق، نه شکست». قبلاً False برمی‌گشت و حلقه‌ی
+            # یادآوری آن را «ارسال نشد» می‌شمرد: سه دورِ شلوغ (که
+            # «نیومدی» هیچ‌وقت نوبت نمی‌گرفت) کافی بود تا تبادل بی‌آنکه
+            # حتی یک پیام برود لغو/لفت شود.
+            return None
         # لینک طرف هرگز داخل متن ارسالی قرار نمی‌گیرد؛ حتی placeholderهای
         # قدیمیِ {channel} در ex_render خالی می‌شوند.
         link = (rec.get("link") or "").strip()
@@ -9552,6 +9624,18 @@ async def connect_and_run(eng, creds):
             try:
                 _loop_beat("scan")
                 x = eng.ex_cfg()
+                # درخواستِ دستیِ «تبادل اسکن» نباید در تنظیمات بماند: اگر
+                # الان ممکن نیست، همان لحظه بگو و نشانه را پاک کن — وگرنه
+                # ساعت‌ها بعد (مثلاً لحظه‌ای که کانال را تنظیم می‌کنی) یک
+                # اسکن «خودبه‌خود» می‌روی و پیامِ «اسکن تمام شد» بی‌دلیل
+                # می‌آید. (اسکنِ پسِ لفت/پاکسازی هم همین‌جا مصرف می‌شود.)
+                if x.get("_scan_now") and (not x["enabled"] or not eng.ex_channel_ready()):
+                    x.pop("_scan_now", None)
+                    await note("🔍 اسکنی در کار نیست — "
+                               + ("تبادل خاموش است (`تبادل روشن`)."
+                                  if not x["enabled"] else
+                                  "کانالِ خودت ثبت نشده؛ `کانال @mychannel` "
+                                  "را بفرست."))
                 if not x["enabled"]:
                     await asyncio.sleep(2)
                     continue
@@ -9707,6 +9791,13 @@ async def connect_and_run(eng, creds):
                             # یادآوری بعدی «نیومدی» — فاصله تصادفی تا پیام
                             # بعدی/لفت تا پیام‌ها پشت سر هم نیایند.
                             sent = await send_not_joined_reminder(rec)
+                            if sent is None:
+                                # تعویق (نوبتِ عملکردِ دیگری روی همین رکورد
+                                # / فاصله‌ی سراسری): نه اخطار سوخته، نه
+                                # شمارنده‌ی «ارسال نشد → لفت» جلو می‌رود.
+                                # خودِ تابع next_reminder را به زمانِ درست
+                                # برده است؛ فقط این دور را ببند.
+                                continue
                             if sent:
                                 count += 1
                                 # نوبتِ بعدی هرگز زودتر از پایانِ خنک‌کننده‌ی
