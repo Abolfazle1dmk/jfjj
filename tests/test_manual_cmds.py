@@ -95,10 +95,20 @@ check("T4: حذفِ رکوردِ غیرجوین انجام می‌شود",
 
 # ── T5: «خروج» → نوبتِ لفت ──
 fresh()
-rec = new_rec("https://t.me/+t5", chat_id=-10005, chat_hash=11)
+rec = new_rec("https://telegram.me/joinchat/t5abcdef/", chat_id=-10005, chat_hash=11)
 msg = eng.exchange_cmd("خروج %d" % rec["id"])
 row = eng.db.ex_get(rec["id"])
 check("T5: خروج → وضعیت leaving", row["status"] == "leaving", row["status"])
+
+# دستور صریح باید عقب‌نشینیِ قبلی را پاک کند تا وارد صفِ همین دور شود.
+eng.db.ex_set(rec["id"], leave_fail=3, leave_blocked_until=int(time.time()) + 3600)
+msg = eng.exchange_cmd("خروج https://t.me/+t5abcdef")
+row = eng.db.ex_get(rec["id"])
+check("T5b: لینک joinchat رکوردِ دعوت +hash را پیدا می‌کند",
+      row is not None and row["id"] == rec["id"], msg)
+check("T5b: خروجِ مجدد عقب‌نشینی و شکست‌های قبلی را پاک می‌کند",
+      row["status"] == "leaving" and row["leave_fail"] == 0
+      and row["leave_blocked_until"] == 0 and row["next_check"] == 0, row)
 
 # ── T6: برنامه‌ی تلاشِ دوباره‌ی لفتِ دستی ──
 now = int(time.time())
@@ -146,6 +156,12 @@ check("T8: بعد از ۵ تلاشِ واقعی این دور تمام می‌ش
       "if _tried_ml >= 5:" in src)
 check("T8: حالتِ leaving دیگر مستقیم failed نمی‌شود",
       'status="left" if ok else "failed"' not in src.split("# ۱) لفت‌های دستی")[1][:2000])
+worker = src[src.index("async def exchange_worker") :]
+check("T9: صفِ خروجِ صریح قبل از گیتِ خاموشی اجرا می‌شود",
+      worker.index('eng.db.ex_list("leaving", 20)')
+      < worker.index('if not x["enabled"]:'))
+check("T9: پاکسازیِ خودکار وقتی تبادل خاموش است اجرا نمی‌شود",
+      'if x["enabled"] and int(x.get("_capacity_cleanup_pending", 0) or 0):' in worker)
 
 print()
 shutil.rmtree(TMP, ignore_errors=True)

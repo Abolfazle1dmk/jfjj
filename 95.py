@@ -850,7 +850,7 @@ def capacity_diag(records, own_channels=()):
 
 
 def format_capacity_cleanup_note(left_links, target, stopped=None,
-                                 diag=None, relax=0):
+                                 diag=None, relax=0, failed_count=0):
     """خلاصه‌ی یک‌پیامیِ فرایند پاکسازی سقف (به‌جای نوتیف per لفت).
 
     `diag` (خروجیِ ``capacity_diag``) و `relax` برای حالتی است که هیچ
@@ -860,8 +860,13 @@ def format_capacity_cleanup_note(left_links, target, stopped=None,
     links = [str(l) for l in (left_links or []) if l]
     n = len(links)
     if n == 0:
-        out = ["🧹 سقف عضویت تلگرام پر بود ولی هیچ تبادلِ کامل‌شده‌ی امنی "
-               "برای لفت پیدا نشد."]
+        if failed_count:
+            out = [f"🧹 برای آزادکردنِ سقف، {fa(failed_count)} لفت را امتحان کردم "
+                   "اما هیچ‌کدام با موفقیت انجام نشد؛ این بار دیگر نمی‌گویم "
+                   "«کاندیدی نبود». علتِ هر شکست در گزارش/لاگ ثبت شده است."]
+        else:
+            out = ["🧹 سقف عضویت تلگرام پر بود ولی هیچ تبادلِ کامل‌شده‌ی امنی "
+                   "برای لفت پیدا نشد."]
         d = diag or {}
         if d.get("joined"):
             out.append(
@@ -1417,7 +1422,12 @@ class DB:
         return self._x("SELECT * FROM exchange WHERE id=?", (eid,), "one")
 
     def ex_find(self, key):
-        """با آیدی عددی یا لینک/یوزرنیم پیدا کن"""
+        """با آیدی عددی یا لینک/یوزرنیم پیدا کن.
+
+        اول تطبیق قدیمی (آیدی/زیررشته)، بعد تطبیقِ نرمال‌شده: کاربر ممکن
+        است همان کانال را با `t.me/+hash`، `joinchat/hash` یا `@username`
+        بفرستد در حالی که رکورد شکل دیگری ذخیره شده است.
+        """
         try:
             r = self.ex_get(num(key))
             if r:
@@ -1425,8 +1435,44 @@ class DB:
         except (ValueError, TypeError):
             pass
         k = key.strip().lstrip("@").lower()
-        return self._x("SELECT * FROM exchange WHERE lower(link) LIKE ?"
-                       " ORDER BY id DESC LIMIT 1", (f"%{k}%",), "one")
+        r = self._x("SELECT * FROM exchange WHERE lower(link) LIKE ?"
+                    " ORDER BY id DESC LIMIT 1", (f"%{k}%",), "one")
+        if r:
+            return r
+        norm = normalize_peer_ref(key)
+        if norm:
+            r = self.ex_by_link(norm)
+            if r:
+                return r
+            nk = peer_ref_key(norm)
+            if nk:
+                # فقط لینک‌هایی که می‌توانند همین توکن را داشته باشند
+                # بررسی می‌شوند؛ نتیجه‌ها صفحه‌ای و کوچک‌اند. نسخه‌ی قبلی
+                # کل جدول exchange را با SELECT * در RAM می‌آورد و در دیتابیس
+                # بزرگ، یک دستور دستیِ خروج می‌توانست جهش حافظه بسازد.
+                token = nk[1:] if nk.startswith("+") else nk
+                token = (token.replace("\\", "\\\\")
+                              .replace("%", "\\%")
+                              .replace("_", "\\_"))
+                pattern = f"%{token.lower()}%"
+                before_id = None
+                while True:
+                    sql = ("SELECT id,link FROM exchange "
+                           "WHERE lower(link) LIKE ? ESCAPE '\\'")
+                    args = [pattern]
+                    if before_id is not None:
+                        sql += " AND id < ?"
+                        args.append(before_id)
+                    sql += " ORDER BY id DESC LIMIT 128"
+                    rows = self._x(sql, tuple(args), "all")
+                    if not rows:
+                        break
+                    for row in rows:
+                        row_norm = normalize_peer_ref(row.get("link"))
+                        if row_norm and peer_ref_key(row_norm) == nk:
+                            return self.ex_get(row["id"])
+                    before_id = rows[-1]["id"]
+        return None
 
     def ex_set(self, eid, **kw):
         if not kw:
@@ -2341,13 +2387,20 @@ def _input_channel(cid, chash=None):
     در محیطِ تست که telethon نصب نیست، شیمِ سبک برمی‌گردد تا منطقِ لفت
     قابل‌آزمایش بماند.
     """
+    raw_id = int(cid)
+    # Telethon channel.id / InputChannel.channel_id همیشه شناسه‌ی خامِ
+    # مثبت است؛ داده‌های قدیمی ممکن است marked peer ID یعنی -100… داشته
+    # باشند. فرمتِ طولانی را جدا می‌کنیم تا -1001 (شناسه‌ی منفیِ کوتاه)
+    # اشتباهاً با marked channel id اشتباه نشود.
+    if str(raw_id).startswith("-100") and len(str(raw_id)) >= 13:
+        raw_id = int(str(raw_id)[4:])
     try:
         from telethon.tl.types import InputChannel
-        return InputChannel(int(cid), int(chash or 0))
+        return InputChannel(raw_id, int(chash or 0))
     except Exception:
         try:
             from types import SimpleNamespace
-            return SimpleNamespace(id=int(cid), access_hash=int(chash or 0))
+            return SimpleNamespace(id=raw_id, access_hash=int(chash or 0))
         except Exception:
             return None
 
@@ -4679,7 +4732,10 @@ class Engine:
                 self.db.ex_set(rec["id"], status="approved", strikes=0,
                                replied=0)
                 return f"✅ `#{fa(rec['id'])}` تأیید شد — تو نوبت جوین."
-            self.db.ex_set(rec["id"], status="leaving")
+            # دستور صریحِ کاربر یعنی تلاشِ تازه: پاک کردنِ عقب‌نشینی/خطای
+            # قبلی تا رکورد فوراً دوباره وارد صف شود.
+            self.db.ex_set(rec["id"], status="leaving", leave_fail=0,
+                           leave_blocked_until=0, next_check=0)
             return f"👋 `#{fa(rec['id'])}` تو نوبت لفت."
 
         if sub == "check":
@@ -7792,8 +7848,32 @@ async def connect_and_run(eng, creds):
                 if w > 0:
                     await asyncio.sleep(w)
                 check_gate.record()
+                # کانالِ «من» اگر لینک خصوصی t.me/+… باشد، خودِ رشته برای
+                # GetParticipant قابل‌حل نیست و Telethon ValueError می‌دهد
+                # («Cannot get entity … / not part of»). یک‌بار با
+                # CheckChatInvite موجودیتِ کانال را بگیر و کش کن؛ اگر اکانت
+                # عضوِ کانالِ خودش نباشد، به‌جای «نامشخص»ِ گمراه‌کننده علتِ
+                # تنظیماتی را ثبت کن. کانال عمومی/عددی مثل قبل دست‌نخورده می‌ماند.
+                channel_peer = ch
+                if '+' in ch or 'joinchat' in ch:
+                    cache = getattr(eng, '_own_channel_peer_cache', None)
+                    if cache is None:
+                        cache = eng._own_channel_peer_cache = {}
+                    channel_peer = cache.get(ch)
+                    if channel_peer is None:
+                        from telethon.tl.functions.messages import CheckChatInviteRequest
+                        h = ch.split('+')[-1].split('/')[-1]
+                        info = await client(CheckChatInviteRequest(h))
+                        ent = getattr(info, 'chat', None)
+                        if ent is None:
+                            _note_check_why(
+                                f"کانالِ من با لینک خصوصی قابل بررسی نیست "
+                                f"(خودِ اکانت عضو آن نیست یا لینک باطل است): {ch}")
+                            return None
+                        channel_peer = ent
+                        cache[ch] = ent
                 try:
-                    result = await client(GetParticipantRequest(ch, user_id))
+                    result = await client(GetParticipantRequest(channel_peer, user_id))
                 except FloodWaitError as e:
                     w = getattr(e, "seconds", 60)
                     check_gate.penalize(w)
@@ -8139,13 +8219,19 @@ async def connect_and_run(eng, creds):
                     ent = await client.get_entity(link)
                 except (InviteHashExpiredError, InviteHashInvalidError,
                         ChannelInvalidError, UsernameNotOccupiedError,
-                        UsernameInvalidError):
-                    # لینکِ طرف باطل/منقضی شده — با آیدی/عنوانِ ذخیره‌شده یا
-                    # اسکنِ دیالوگ‌ها امتحان کن.
+                        UsernameInvalidError, ValueError):
+                    # لینکِ طرف باطل/منقضی شده یا Telethon موجودیت را از روی
+                    # لینک پیدا نکرده (ValueError) — با آیدی/عنوانِ ذخیره‌شده
+                    # یا اسکنِ دیالوگ‌ها امتحان کن.
                     ent = await resolve_by_title()
                     if ent is None:
                         eng.log("warn", "ex_leave_expired", str(link))
-                        raise
+                        return (False,
+                                "لینک خصوصی منقضی/نامعتبر از روی پیش‌نمایش "
+                                "قابل لفت نیست و "
+                                "آیدیِ کانال هم ذخیره نشده؛ برای لفتِ امن، "
+                                "یک‌بار لینک/آیدیِ عمومیِ کانال را بفرست یا "
+                                "از خودِ تلگرام دستی خارج شو.")
                 remember_channel(rec_id, ent)
             await client(LeaveChannelRequest(ent))
             return True, ""
@@ -8247,6 +8333,7 @@ async def connect_and_run(eng, creds):
         stopped = None
         left_at = int(time.time())
         had_outbound = False
+        attempted = 0
         round_started = time.time()
         for cand in candidates:
             # سقفِ زمانی: دورِ طولانی صفِ تبادل را در انحصار می‌گیرد و پاسخ
@@ -8260,6 +8347,7 @@ async def connect_and_run(eng, creds):
                 except Exception:
                     pass
                 break
+            attempted += 1
             ok, err = await leave_link(cand.get("link"), cand.get("id"))
             if not ok:
                 eng.log("warn", "ex_capacity_leave_fail",
@@ -8286,7 +8374,8 @@ async def connect_and_run(eng, creds):
             eng.ex_cfg()["_scan_now"] = True
         try:
             await note(format_capacity_cleanup_note(
-                left_links, target, stopped, relax=relax_used))
+                left_links, target, stopped, relax=relax_used,
+                failed_count=max(0, attempted - len(left_links))))
         except Exception:
             pass
         if not left_links:
@@ -9880,10 +9969,6 @@ async def connect_and_run(eng, creds):
                                    + ("ارسال شد." if sent_reply else "ارسال نشد."))
                     eng.st.save()
 
-                if not x["enabled"]:
-                    await asyncio.sleep(20)
-                    continue
-
                 # توجه: گیتِ «سقفِ عضویت» دیگر این‌جا نیست. قبلاً این‌جا با
                 # `continue` کلِ حلقه (چکِ عضویت، یادآور، گزارش) تا یک ساعت
                 # می‌خوابید و اکانت عملاً «آفلاین» دیده می‌شد؛ حالا فقط
@@ -9918,7 +10003,7 @@ async def connect_and_run(eng, creds):
                 # ممکن است چند دقیقه طول بکشد و timeout ۱۸۰ ثانیه‌ای جوین
                 # وسطش کنسلش می‌کرد. لفت‌ها از همان ex_cd.action رد می‌شوند
                 # پس فاصله‌ی ۱۵–۲۰ ثانیه‌ای و محافظ فلود خودکار رعایت می‌شود.
-                if int(x.get("_capacity_cleanup_pending", 0) or 0):
+                if x["enabled"] and int(x.get("_capacity_cleanup_pending", 0) or 0):
                     x["_capacity_cleanup_pending"] = False
                     eng.st.save()
                     try:
@@ -9972,6 +10057,13 @@ async def connect_and_run(eng, creds):
                         break
 
                 # ۲) جوین تأییدشده‌ها — تطبیقی + سقف ساعتی
+                # دستورِ صریحِ «تبادل خروج» حتی وقتی تبادل خودکار خاموش است
+                # باید اجرا شود؛ خاموش بودن فقط جوین/اسکنِ خودکار را متوقف کند.
+                if not x["enabled"]:
+                    await asyncio.sleep(20)
+                    continue
+
+                # ── اجرای جوین‌های تأییدشده — تطبیقی + سقف ساعتی
                 # گیتِ سقفِ عضویت — فقط جوین را متوقف می‌کند.
                 capacity_blocked_until = int(x.get("_capacity_join_blocked_until", 0) or 0)
                 if capacity_blocked_until > int(time.time()):
