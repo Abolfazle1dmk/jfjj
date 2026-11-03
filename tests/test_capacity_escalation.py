@@ -134,6 +134,9 @@ check("پیامِ درجه ۱: همچنان «جا آزاد شد» را می‌�
 note0_plain = m.format_capacity_cleanup_note([], 30)
 check("پیامِ بی‌کاندیدِ بدونِ تشخیص هم خراب نمی‌شود",
       "هیچ تبادل" in note0_plain)
+note_failed = m.format_capacity_cleanup_note([], 30, failed_count=2)
+check("پاکسازیِ دارای کاندید ولی با لفت ناموفق، با بی‌کاندیدی اشتباه نمی‌شود",
+      "2 لفت را امتحان کردم" in note_failed and "هیچ تبادل" not in note_failed)
 
 # ── ۷) سیم‌کشی در cleanup_capacity_for_slots ─────────────────────────
 i = src.index("async def cleanup_capacity_for_slots(")

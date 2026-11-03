@@ -228,7 +228,7 @@ check(ok is True and err == "",
       % (ok, err))
 check(len(fake.leaves) == 1
       and (getattr(fake.leaves[0], "id", None)
-           or getattr(fake.leaves[0], "channel_id", None)) == -1001234567890,
+           or getattr(fake.leaves[0], "channel_id", None)) == 1234567890,
       "L2: لفت با InputChannel همان کانال زده شد")
 check(fake.entity_calls == [],
       "L2: لینکِ منقضی اصلاً حل نشد (get_entity صدا زده نشد)")

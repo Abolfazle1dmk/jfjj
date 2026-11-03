@@ -96,6 +96,11 @@ def main():
           len(eng._exchange_link_id_cache))
     check("بدونِ eng → خطا نمی‌دهد", trim_link(FakeEng()) == 0)
 
+    # جستجوی دستورِ خروج نباید تمام جدولِ exchange را یکجا materialize کند.
+    check("جستجوی لینکِ تبادل صفحه‌ای و RAM-bounded است",
+          "SELECT id,link FROM exchange" in src and "LIMIT 128" in src
+          and "before_id = rows[-1][\"id\"]" in src)
+
     # ── ۴) حلقه‌ی دوره‌ای در سلف ثبت شده ──────────────────────────
     # از PRِ «نگهبانِ حلقه‌ها» به بعد، هر حلقه زیرِ _supervise راه می‌افتد
     # تا اگر مرده خودش برگردد؛ قرارداد همان است: memory_loop اجرا شود.
