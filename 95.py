@@ -506,6 +506,53 @@ SCAN_FOUND_NOTE_GAP_SEC = 300
 # و حداکثر چند ثانیه برای تجمیع صبر شود.
 STALE_NOTE_MAX_LINKS = 10
 STALE_FLUSH_SEC = 20
+# بعد از هر تلاشِ ناموفقِ Join، همان رکورد چند ثانیه از صف کنار می‌رود و
+# چند بار کلاً امتحان می‌شود. بدونِ این، رکوردی که روی «سقف ۵۰۰ کانال» یا
+# خطای موقت گیر کرده، سرِ صف میخکوب می‌ماند و بقیه‌ی صف (و با آن
+# دروازه‌ی اسکن) تا ابد قفل می‌شد.
+JOIN_MAX_ATTEMPTS = 4
+JOIN_RETRY_BACKOFF_SEC = 60
+JOIN_RETRY_BACKOFF_MAX_SEC = 3600
+# سقفِ یک دورِ اسکن: درخواستِ تلگرامِ گیرکرده نباید حلقه‌ی اسکن را برای
+# همیشه بخوابد (بدونِ این، «اسکن می‌میرد» و هیچ لاگی هم نمی‌ماند).
+SCAN_ROUND_TIMEOUT_SEC = 180
+# اگر حلقه‌ی اسکن بیش از این مدت هیچ نشانه‌ای ندهد، نگهبانِ حلقه‌ها
+# (loop supervisor) آن را قطع و از نو راه می‌اندازد. باید از سقفِ خودِ
+# اسکن بزرگ‌تر باشد تا اسکنِ سالمِ چندگروهی (با جیتر) هرگز کشته نشود.
+SCAN_STALL_AFTER_SEC = 300
+
+
+def scan_backlog_count(records, now_ts, max_age_sec, direction="out"):
+    """چند رکوردِ *تازه* در صفِ Join است و واقعاً جلوی اسکنِ تازه را می‌گیرد؟
+
+    دروازه‌ی ضد-انباشت با «تعداد کل رکوردهای approved» کار می‌کرد؛ یعنی هر
+    رکوردی که به هر دلیلی در صف میخکوب می‌شد (خطای موقتِ شبکه، سقف ۵۰۰
+    کانال، سیلِ FloodWait) سقف را پر نگه می‌داشت و اسکنِ خودکار **تا ابد**
+    رد می‌شد — همان «اسکن تبادل می‌میره». دروازه فقط باید رکوردهایی را
+    بشمارد که هنوز امیدِ جوین دارند: پیش‌قدم‌های خودی (direction='out') که
+    داخل پنجره‌ی «سن لینک» هستند. رکوردِ کهنه دیگر با اسکنِ تازه درست
+    نمی‌شود، پس نباید مانعِ اسکن باشد.
+    """
+    try:
+        now_f = float(now_ts)
+        max_age = max(30, int(max_age_sec or 0))
+    except (TypeError, ValueError):
+        return 0
+    n = 0
+    for r in (records or []):
+        if not r:
+            continue
+        try:
+            if (r.get("status") or "pending") != "approved":
+                continue
+            if str(r.get("direction") or "in") != direction:
+                continue
+            if now_f - float(r.get("created_at") or 0) > max_age:
+                continue
+        except (TypeError, ValueError):
+            continue
+        n += 1
+    return n
 
 
 def scan_gate_reason(blocked_until, approved_count, now_ts,
@@ -1175,7 +1222,9 @@ CREATE TABLE IF NOT EXISTS exchange (
     chat_hash INTEGER,
     leave_fail INTEGER NOT NULL DEFAULT 0,
     leave_blocked_until INTEGER NOT NULL DEFAULT 0,
-    peer_joined_at INTEGER
+    peer_joined_at INTEGER,
+    next_join_try INTEGER NOT NULL DEFAULT 0,
+    join_attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_ex ON exchange(status, last_check);
 CREATE TABLE IF NOT EXISTS events (
@@ -1220,7 +1269,14 @@ class DB:
                               # «طرف برگشت و جوینِ کانال من شد» — فقط برای
                               # رکوردهای پیش‌قدم (direction='out') پر می‌شود؛
                               # ستون آمارِ «جذب موفق» از همین ساخته می‌شود.
-                              ("peer_joined_at", "INTEGER")):
+                              ("peer_joined_at", "INTEGER"),
+                              # نوبتِ بعدیِ Join روی همین رکورد (۰ = آماده).
+                              # بدونِ این، یک رکوردِ گیرکرده سرِ صف کلِ صف
+                              # را قفل می‌کرد؛ حالا بعد از هر شکست برای
+                              # مدتی کنار می‌رود و بقیه جلو می‌آیند.
+                              ("next_join_try", "INTEGER NOT NULL DEFAULT 0"),
+                              # چند بار برای همین رکورد Join امتحان شده است.
+                              ("join_attempts", "INTEGER NOT NULL DEFAULT 0")):
                 if col not in have:
                     self.conn.execute(f"ALTER TABLE exchange ADD COLUMN {col} {decl}")
             # بعد از مهاجرت ساخته شود؛ وگرنه دیتابیس قدیمی هنوز ستون next_check ندارد.
@@ -1235,6 +1291,16 @@ class DB:
                 # می‌شد (روی ۲۰ هزار رکورد ~۱۵ms در هر دورِ حلقه).
                 "CREATE INDEX IF NOT EXISTS idx_ex_rem "
                 "ON exchange(status, next_reminder)",
+                # صفِ Join با (status='approved' AND next_join_try<=?) و
+                # ترتیبِ created_at خوانده می‌شود؛ بعد از مهاجرت ساخته
+                # شود وگرنه دیتابیسِ قدیمی ستون next_join_try را ندارد.
+                # ایندکس *partial* است (فقط ردیف‌های approved): کوئری‌های
+                # دیگر — مثلاً یادآورها با status IN ('pending','joined') —
+                # هرگز به سمتِ این ایندکس نمی‌روند، پس ترتیبِ نتیجهٔ آن‌ها
+                # هم عوض نمی‌شود (روی ۲۵۰۰ رکوردِ هم‌ارزش، ترتیبِ «بعدی»
+                # با تغییر پلن sqlite عوض می‌شد).
+                "CREATE INDEX IF NOT EXISTS idx_ex_join_queue "
+                "ON exchange(next_join_try, created_at) WHERE status='approved'",
                 # برای هر پیامِ ورودی از یک طرف، ex_by_peer آخرین رکوردش را
                 # می‌خواهد؛ بدونِ این ایندکس کلِ جدول پیمایش می‌شد
                 # (اندازه‌گیری روی ۵۰ هزار رکورد: ۱.۲ تا ۲.۳ms → ۰.۰۱ms).
@@ -1515,6 +1581,60 @@ class DB:
             " (next_check=0 AND last_check<=?)) "
             "ORDER BY CASE WHEN next_check>0 THEN next_check ELSE last_check END "
             "LIMIT ?", (ts, ts, limit), "all")
+
+    def ex_join_queue(self, ts=None, limit=5):
+        """صفِ Join: قدیمی‌ترینِ «رسیده» اول، با ردِّ رکوردهای ناآماده.
+
+        دو باگ را هم‌زمان می‌بندد:
+          • ترتیب قبلی ``ORDER BY id DESC`` بود (تازه‌ترین اول). هر لینکِ
+            تازه نوبتِ بقیه را می‌زد و رکوردهای ته صف تا پایانِ پنجره‌ی
+            «سن لینک» میخکوب می‌مانند؛ دروازه‌ی ضد-انباشت هم روی همین
+            تعداد قفل می‌شد و اسکن می‌خوابید.
+          • رکوردی که Join‌اش موقتاً ممکن نیست (خطای شبکه، سقف ۵۰۰ کانال،
+            FloodWait) در وضعیت approved می‌ماند و چون همیشه سرِ صف بود،
+            صف را قفل می‌کرد. حالا با ``next_join_try`` کنار می‌رود و صف
+            سراغِ رکوردِ بعدی می‌آید.
+        """
+        ts = int(ts if ts is not None else time.time())
+        # ستون‌های next_join_try/created_at هر دو NOT NULL DEFAULT هستند
+        # (مهاجرت هم آن‌ها را با ۰ پر می‌کند)، پس ایندکسِ partial می‌تواند
+        # استفاده شود؛ COALESCE همان ایندکس را بی‌اثر می‌کرد.
+        return self._x(
+            "SELECT * FROM exchange WHERE status='approved' AND "
+            "next_join_try<=? "
+            "ORDER BY created_at ASC, id ASC LIMIT ?",
+            (ts, limit), "all")
+
+    def ex_join_retry(self, eid, now_ts=None, backoff_sec=JOIN_RETRY_BACKOFF_SEC,
+                      max_attempts=JOIN_MAX_ATTEMPTS, reason="", step=5):
+        """ثبت یک تلاشِ ناموفقِ Join → عقب‌نشینیِ همان رکورد (و سقف تلاش).
+
+        عقب‌نشینی پلکانی است (۶۰ث → ۵د → ۲۵د → سقف ۱ساعت) تا هم رکوردِ
+        مریض سرِ صف نچرخد، هم خطای زودگذر (قطع شبکه) رکورد را زودتر از
+        موعد دور نریزد. ``max_attempts=0`` یعنی بی‌سقف (برای «سقف ۵۰۰
+        کانال» که با آزادشدنِ جا خودبه‌خود درست می‌شود).
+
+        خروجی: ``True`` یعنی رکورد بعد از این شکست از صف خارج شد (failed)
+        و دیگر نوبتی ندارد.
+        """
+        try:
+            rec = self.ex_get(int(eid))
+        except (TypeError, ValueError):
+            return False
+        if not rec:
+            return False
+        now = int(now_ts if now_ts is not None else time.time())
+        tries = int(rec.get("join_attempts") or 0) + 1
+        if max_attempts and tries >= int(max_attempts):
+            self.ex_set(int(eid), status="failed", join_attempts=tries,
+                        next_join_try=0,
+                        note=f"{int(max_attempts)} بار Join امتحان شد و نشد"
+                             + (f": {str(reason)[:120]}" if reason else ""))
+            return True
+        back = max(5, int(backoff_sec or 0)) * max(1, int(step or 1)) ** (tries - 1)
+        back = min(JOIN_RETRY_BACKOFF_MAX_SEC, back)
+        self.ex_set(int(eid), join_attempts=tries, next_join_try=now + back)
+        return False
 
     def ex_reminder_due(self, ts, limit=20):
         """رکوردهایی که نوبتِ پیام «نیومدی» یا لفتِ بعدی‌شان رسیده است.
@@ -1808,13 +1928,17 @@ class ExCooldown:
             return None
         return now - float(last)
 
-    def wait_for(self, rec_id, now=None):
-        """چند ثانیه دیگر باید صبر کرد تا نوبتِ این رکورد برسد (۰ = آماده)."""
+    def wait_for(self, rec_id, now=None, ignore_busy=False):
+        """چند ثانیه دیگر باید صبر کرد تا نوبتِ این رکورد برسد (۰ = آماده).
+
+        ``ignore_busy`` را خودِ ``action`` استفاده می‌کند: آن‌جا رکورد همین
+        الان توسط همان تسک «در جریان» علامت خورده و نباید صبرِ کاذب بسازد.
+        """
         if not rec_id:
             return 0.0
         now = time.time() if now is None else float(now)
         rid = int(rec_id)
-        if rid in self._busy:
+        if rid in self._busy and not ignore_busy:
             # عملکردی روی همین رکورد در جریان است — تا تمام‌شدنش صبر کن.
             return max(1.0, self.gap_min)
         left = self.since_done(rid, now)
@@ -1876,50 +2000,66 @@ class ExCooldown:
         نکته: فاصله **دوبار** جمع نمی‌شود. اگر خنک‌کننده‌ی رکورد به‌اندازه‌ی
         کافی صبر کرده باشد، در قفل سراسری دیگر صبرِ اضافه نمی‌خورد؛ یعنی
         از پایانِ عملکردِ قبلی دقیقاً یک فاصله (پیش‌فرض ۱۵–۲۰ ثانیه) می‌گذرد.
+
+        «در جریان» (busy): مدتِ صف+اجرا روی همان رکورد علامت می‌خورد.
+        بیرون از این علامت، خنک‌کننده‌ی رکورد فقط **پس از** پایانِ عملکرد
+        نوشته می‌شد؛ یعنی تسک دومی که همین حالا شروع به کار کرده بود «آزاد»
+        می‌دید و وسطِ جوین/چکِ یک رکورد، پیامِ «نیومدی» یا لفت می‌فرستاد —
+        همان «چک کرد و درجا گفت نیومدی» و دو پیام پشت‌سرهم.
         """
         self.apply_config()
         rid = int(rec_id) if rec_id else None
-        # ۱) خنک‌کننده‌ی خودِ رکورد: اگر همین رکورد تازه چک/جوین/پیام گرفته،
-        #    ابتدا همان‌قدر صبر می‌شود (پیش از صف رفتن).
         if rid is not None:
-            w = self.wait_for(rid)
-            if w > 0:
-                await asyncio.sleep(w)
-        # ۲) صفِ سراسری
-        async with self._lock:
-            # مبنای «آخرین عملکرد» را **داخل** قفل می‌خوانیم؛ اگر بیرون
-            # خوانده شود، نوبتی که پشتِ قفل معطل مانده با مبنای کهنه صفر
-            # حساب می‌کند و عملکردِ بعدی درجا پشتِ قبلی می‌رود.
-            ref = self.last_global_done
+            self._busy.add(rid)
+        try:
+            # ۱) خنک‌کننده‌ی خودِ رکورد: اگر همین رکورد تازه چک/جوین/پیام گرفته،
+            #    ابتدا همان‌قدر صبر می‌شود (پیش از صف رفتن). busyِ خودِ همین
+            #    تسک نباید اینجا صبرِ کاذب بسازد.
             if rid is not None:
-                ref = max(ref, float(self._last_done.get(rid, 0.0) or 0.0))
-            # زمان سپری‌شده همین حالا در time.time لحاظ شده؛ دوباره کم نکن.
-            w = max(ref + self.seconds(), self.blocked_until) - time.time()
-            if w > 0:
-                await asyncio.sleep(w)
-            try:
-                if fn is None:
-                    return None
-                if asyncio.iscoroutinefunction(fn):
-                    return await fn(*a, **kw)
-                return fn(*a, **kw)
-            except Exception as e:
-                if kind != "check" and type(e).__name__ in ("FloodWaitError", "FloodPremiumWaitError"):
-                    self.blocked_until = max(self.blocked_until,
-                                             time.time() + getattr(e, "seconds", 60) + 2)
-                raise
-            finally:
-                done = time.time()
-                self.last_global_done = done
+                w = self.wait_for(rid, ignore_busy=True)
+                if w > 0:
+                    await asyncio.sleep(w)
+            # ۲) صفِ سراسری
+            async with self._lock:
+                # مبنای «آخرین عملکرد» را **داخل** قفل می‌خوانیم؛ اگر بیرون
+                # خوانده شود، نوبتی که پشتِ قفل معطل مانده با مبنای کهنه صفر
+                # حساب می‌کند و عملکردِ بعدی درجا پشتِ قبلی می‌رود.
+                ref = self.last_global_done
                 if rid is not None:
-                    self._last_done[rid] = done
-                    self._last_kind[rid] = kind
-                    self._order.append(rid)
-                    if len(self._order) > 600:
-                        for k in self._order[:200]:
-                            self._last_done.pop(k, None)
-                            self._last_kind.pop(k, None)
-                        del self._order[:200]
+                    ref = max(ref, float(self._last_done.get(rid, 0.0) or 0.0))
+                # زمان سپری‌شده همین حالا در time.time لحاظ شده؛ دوباره کم نکن.
+                w = max(ref + self.seconds(), self.blocked_until) - time.time()
+                if w > 0:
+                    await asyncio.sleep(w)
+                try:
+                    if fn is None:
+                        return None
+                    if asyncio.iscoroutinefunction(fn):
+                        return await fn(*a, **kw)
+                    return fn(*a, **kw)
+                except Exception as e:
+                    if kind != "check" and type(e).__name__ in ("FloodWaitError", "FloodPremiumWaitError"):
+                        self.blocked_until = max(self.blocked_until,
+                                                 time.time() + getattr(e, "seconds", 60) + 2)
+                    raise
+                finally:
+                    done = time.time()
+                    self.last_global_done = done
+                    if rid is not None:
+                        self._last_done[rid] = done
+                        self._last_kind[rid] = kind
+                        self._order.append(rid)
+                        if len(self._order) > 600:
+                            for k in self._order[:200]:
+                                self._last_done.pop(k, None)
+                                self._last_kind.pop(k, None)
+                            del self._order[:200]
+        finally:
+            # هر مسیری (موفق، خطا، لغوِ wait_for) باید علامت را بردارد؛
+            # اگر بماند، آن رکورد تا ری‌استارت «در جریان» حساب می‌شود و
+            # هیچ عملکردی به آن نمی‌رسد.
+            if rid is not None:
+                self._busy.discard(rid)
 
     def note_done(self, rec_id=None, now=None):
         """پایانِ یک عملکرد را ثبت می‌کند بدون اینکه فاصله‌ی صف را تحمیل کند.
@@ -4729,8 +4869,11 @@ class Engine:
                 # تأیید رفته، replied را ۱ کرده است؛ اگر صفر نشود، بعد از
                 # جوینِ واقعی reply_joined پیام «جوین شدم» را نمی‌فرستد و
                 # طرف فقط همان «در حال بررسی» را می‌بیند و دیگر هیچ.
+                # join_attempts/next_join_try هم صفر می‌شوند: تأییدِ صریحِ
+                # مدیر یعنی «همین حالا تلاش کن»، نه «نوبتِ عقب‌نشینیِ
+                # سه‌دقیقه‌ی قبلی تمام شود».
                 self.db.ex_set(rec["id"], status="approved", strikes=0,
-                               replied=0)
+                               replied=0, join_attempts=0, next_join_try=0)
                 return f"✅ `#{fa(rec['id'])}` تأیید شد — تو نوبت جوین."
             # دستور صریحِ کاربر یعنی تلاشِ تازه: پاک کردنِ عقب‌نشینی/خطای
             # قبلی تا رکورد فوراً دوباره وارد صف شود.
@@ -7906,7 +8049,13 @@ async def connect_and_run(eng, creds):
                     async with ex_cd.lock:
                         out = await _one_req()
                         ex_cd.note_done(rec_id)
-                    return out
+                    # `return out` این‌جا باگ بود: نتیجه بی‌درنگ برمی‌گشت و
+                    # کانال‌های بعدی اصلاً دیده نمی‌شدند. با دو کانال
+                    # (عادی + VIP) یعنی اگر چکِ کانالِ اول «نامشخص» یا
+                    # «در انتظار نوبت» می‌داد، عضویتِ تأییدشده در VIP هرگز
+                    # دیده نمی‌شد → رکورد بین «نیومدی» و «لفت معلق» گیر
+                    # می‌کرد و در صفِ Join میخکوب می‌ماند. مثل مسیرِ اصلی،
+                    # نتیجه در همان حلقه جمع می‌شود.
             except UserNotParticipantError:
                 saw_false = True
                 continue
@@ -9137,7 +9286,10 @@ async def connect_and_run(eng, creds):
                     eng.db.ex_get(rec["id"]) or rec))
 
         if x["auto_join"]:
+            # عقب‌نشینیِ Join از دورِ قبلی نباید جلوی این درخواستِ تازه را
+            # بگیرد: طرف همین الان آمده و منتظر است.
             eng.db.ex_set(rec["id"], status="approved", strikes=0,
+                          join_attempts=0, next_join_try=0,
                           note=f"عضو است ({src})")
             eng.log("info", "ex_approved", f"{sender_name} → {link} ({src})")
             # متن «جوین شدم» بعد از جوینِ واقعی ریپلای می‌شود
@@ -9193,7 +9345,8 @@ async def connect_and_run(eng, creds):
         if not manual:
             gate = scan_gate_reason(
                 getattr(ex_cd, "blocked_until", 0),
-                len(eng.db.ex_list("approved", 100)),
+                scan_backlog_count(eng.db.ex_list("approved", 100),
+                                   scan_now, max_age),
                 scan_now)
             if gate == "flood":
                 return 0, "صف تبادل به‌خاطر FloodWait بسته است"
@@ -9279,19 +9432,32 @@ async def connect_and_run(eng, creds):
                         # این یک نوبت تازه است؛ کارگر سن صف را از created_at
                         # می‌سنجد. نگه‌داشتن زمانِ رکورد قبلی باعث می‌شد حتی
                         # پیام تازه فوراً به‌عنوان لینک قدیمی رد شود.
+                        # سقفِ تلاش‌های دورِ قبل هم صفر می‌شود؛ وگرنه رکوردی
+                        # که سه بار بی‌نتیجه تلاش کرده با پیامِ تازه هم دیگر
+                        # هرگز Join نمی‌شود.
                         eng.db.ex_set(existing["id"], status="approved",
                                       created_at=int(scan_now),
                                       peer_id=sender.id, peer_name=sender_name,
                                       direction="out", src_chat=msg.chat_id,
                                       src_msg=msg.id, replied=0, claim_joined=0,
                                       reminders=0, next_reminder=0, next_check=0,
-                                      strikes=0, note="پیام جدید — دوباره در صف Join")
+                                      strikes=0, join_attempts=0, next_join_try=0,
+                                      note="پیام جدید — دوباره در صف Join")
                         found += 1
 
             except FloodWaitError as e:
                 w = getattr(e, "seconds", 60)
                 eng.log("warn", "scan_flood", f"{g}: {w}s")
                 x["_scan_flood_until"] = time.time() + w + 2
+                # پیش از خروج، نشانگر گروه‌های *رسیده* را ثبت کن. قبلاً
+                # بازگشتِ وسطِ حلقه آن را دور می‌ریخت (و اگر scan_last خالی
+                # بوده، کلِ آن دور گم می‌شد) → بعد از فلود همان پیام‌ها دوباره
+                # دیده و دوباره ثبت می‌شدند.
+                x["scan_last"] = last
+                try:
+                    eng.st.save()
+                except Exception:
+                    pass
                 return found, f"FloodWait {w}s"
             except Exception as e:
                 scan_error = True
@@ -9340,20 +9506,51 @@ async def connect_and_run(eng, creds):
         # یک پیام تجمیعی می‌رود تا Saved Messages طوفان نبیند.
         found_buf = [0]
         last_found_note = [0.0]
+        # «چرا اسکن نمی‌چرخد؟» — اگر دروازه پیوسته بسته باشد، یک بار (نه
+        # هر بار) به صاحب‌حساب گفته می‌شود. بی‌صدا خوابیدنِ اسکن همان
+        # چیزی است که مشتری «اسکن می‌میرد» گزارش می‌کند.
+        gate_since = [0.0]
+        gate_warn_at = [0.0]
 
         def _join_gate_now():
             try:
                 return scan_gate_reason(
                     getattr(ex_cd, "blocked_until", 0),
-                    len(eng.db.ex_list("approved", 100)), time.time())
+                    scan_backlog_count(eng.db.ex_list("approved", 100),
+                                       time.time(),
+                                       max(30, int(eng.ex_cfg().get(
+                                           "scan_max_age_sec", 300) or 300))),
+                    time.time())
             except Exception:
                 return ""
+
+        async def _report_gate(gate):
+            """اعلامِ راستگوی «اسکن فعلاً نمی‌چرخد» — حداکثر هر ۳۰ دقیقه."""
+            if not gate:
+                gate_since[0] = 0.0
+                return
+            if not gate_since[0]:
+                gate_since[0] = time.time()
+            if (time.time() - gate_since[0] < 900
+                    or time.time() - gate_warn_at[0] < 1800):
+                return
+            gate_warn_at[0] = time.time()
+            await note(
+                "⏸ اسکنِ تبادل موقتاً متوقف است — "
+                + ("صفِ جوین به‌خاطر محدودیتِ تلگرام (FloodWait) بسته است."
+                   if gate == "flood" else
+                   f"صفِ Join پر است ({fa(SCAN_JOIN_BACKLOG_LIMIT)} رکورد "
+                   "معلق).")
+                + f"\n{secs(int(time.time() - last_scan[0]))} است که اسکنِ "
+                  "تازه نداشته‌ام؛ رکوردهای معلق را با «تبادل لیست» ببین "
+                  "یا فاصله‌ی جوین را بلندتر بگذار.")
 
         # اسکن مستقل است تا بررسی‌های طولانی عضویت، فرصت هر ۳۰ ثانیه
         # برای پیدا کردن کانال جدید را عقب نیندازد.
         last_scan = [0.0]
         while True:
             try:
+                _loop_beat("scan")
                 x = eng.ex_cfg()
                 if not x["enabled"]:
                     await asyncio.sleep(2)
@@ -9370,7 +9567,19 @@ async def connect_and_run(eng, creds):
                 if manual or (x["initiate"] and
                               now_t - last_scan[0] >= scan_seconds):
                     last_scan[0] = now_t
-                    n, err = await scan_groups(manual)
+                    # سقفِ زمانی: یک درخواستِ گیرکرده‌ی تلگرام نباید حلقه‌ی
+                    # اسکن را برای همیشه بخوابد. قبلاً اینجا هیچ مهلتی نبود؛
+                    # اگر iter_messages روی شبکه معلق می‌ماند، اسکن بی‌صدا
+                    # می‌مرد و هیچ لاگی هم نمی‌ماند.
+                    try:
+                        n, err = await asyncio.wait_for(
+                            scan_groups(manual),
+                            timeout=SCAN_ROUND_TIMEOUT_SEC)
+                    except asyncio.TimeoutError:
+                        n = 0
+                        err = (f"اسکن بیش از {secs(SCAN_ROUND_TIMEOUT_SEC)} "
+                               "طول کشید و لغو شد (درخواست تلگرام گیر کرده)")
+                        eng.log("warn", "scan_timeout", err)
                     if manual:
                         if err:
                             await note(f"🔍 اسکن کامل نشد — {err}\n"
@@ -9413,6 +9622,10 @@ async def connect_and_run(eng, creds):
                         # اسکن خودکار عمداً رد شده (فلود/بک‌لاگ)؛ فقط لاگ،
                         # بدون نوتیف تا طوفان پیام تکراری ساخته نشود.
                         eng.log("info", "scan_gated", err)
+                    if not manual:
+                        # دروازه هنوز بسته است؟ بعد از ۱۵ دقیقه یک‌بار بگو
+                        # چرا (بازگشتِ gate خالی = شمارنده صفر می‌شود).
+                        await _report_gate(_join_gate_now())
 
                 # زمان‌بندی دقیق‌تر از حلقه‌ی اصلی تبادل.
                 await asyncio.sleep(1)
@@ -9483,6 +9696,9 @@ async def connect_and_run(eng, creds):
                                       else rec["status"],
                                       reminders=0, reminders_total=0,
                                       next_reminder=0,
+                                      # نوبتِ تازه: عقب‌نشینیِ تلاش‌های قبلی
+                                      # نباید جلوی Joinِ همین رکورد را بگیرد.
+                                      join_attempts=0, next_join_try=0,
                                       strikes=0, unk_streak=0, replied=0,
                                       note="عضو شد — آماده Join")
                     elif still is False:
@@ -10105,7 +10321,13 @@ async def connect_and_run(eng, creds):
                         await asyncio.sleep(min(hw, 20))
                         continue
                     rec = None
-                    for r in eng.db.ex_list("approved", 5):
+                    # FIFO + ردکردنِ رکوردهای ناآماده: قدیمی‌ترینِ «رسیده»
+                    # اول جوین می‌شود. قبلاً «تازه‌ترینِ approved» برداشته
+                    # می‌شد (ORDER BY id DESC)، پس هر لینکِ تازه نوبتِ بقیه
+                    # را می‌زد، رکوردهای ته صف تا پایانِ پنجره‌ی «سن لینک»
+                    # میخکوب می‌ماندند و دروازه‌ی ضد-انباشتِ اسکن روی همین
+                    # تعداد قفل می‌شد → «اسکن تبادل می‌میرد».
+                    for r in eng.db.ex_join_queue(int(time.time()), 5):
                         rec = r
                         break
                     if rec:
@@ -10167,12 +10389,30 @@ async def connect_and_run(eng, creds):
                             if eng.ex_cfg().get("report_mode", "live") == "live":
                                 await note(eng.ex_live_join_text(rec, title, sent_reply))
                         else:
+                            # «سقف ۵۰۰ عضویت» شکستِ خودِ لینک نیست؛ رکورد در
+                            # صف می‌ماند. این تشخیص پیش‌تر فقط در انتهای همین
+                            # شاخه حساب می‌شد؛ برای عقب‌نشینیِ صف لازم است
+                            # پیش از همه معلوم باشد.
+                            account_limit = any(
+                                h in msg for h in ("حداکثر تعداد کانال",
+                                                   "ChannelsTooMuch"))
                             if msg.startswith("FloodWait"):
                                 eng.db.ex_set(rec["id"], note=msg)
                                 try:
                                     _fw = int(re.search(r"FloodWait (\d+)s", msg).group(1))
                                 except Exception:
                                     _fw = 0
+                                # رکوردِ فلودخورده نباید سرِ صف بماند و هر
+                                # دورِ صف دوباره جلوی بقیه را بگیرد؛ ولی
+                                # «سقف تلاش» هم نمی‌سوزاند، چون جریمه‌ی
+                                # تلگرام تقصیرِ این لینک نیست.
+                                try:
+                                    eng.db.ex_set(
+                                        rec["id"],
+                                        next_join_try=int(time.time())
+                                        + max(60, min(_fw, JOIN_RETRY_BACKOFF_MAX_SEC)))
+                                except Exception:
+                                    pass
                                 if _fw >= 600:
                                     # جریمه‌ی سقف روزانه است — صادقانه توضیح بده
                                     _today = eng.db.ex_joins_today()
@@ -10188,7 +10428,11 @@ async def connect_and_run(eng, creds):
                                     await note(f"⏳ تبادل — {msg}\nصبر می‌کنم و ادامه می‌دهم.")
                             elif msg.startswith("درخواست عضویت"):
                                 # درخواست عضویت با تأیید مدیر تمام نشده؛ شکست قطعی نیست.
-                                eng.db.ex_set(rec["id"], status="pending", note=msg)
+                                # next_join_try=0: وقتی مدیر بعداً تأیید کرد،
+                                # رکورد بی‌درنگ آماده است و نوبتِ عقب‌نشینی
+                                #ِ دورِ قبلی را صبر نمی‌کند.
+                                eng.db.ex_set(rec["id"], status="pending",
+                                              note=msg, next_join_try=0)
                                 eng.log("info", "ex_join_pending", f"#{rec['id']} {msg}")
                                 await note(f"⏳ درخواست عضویت برای `{rec['link']}` فرستاده شد.\n"
                                            "بعد از تأیید مدیر، `تبادل تأیید شماره` را بفرست.")
@@ -10198,22 +10442,57 @@ async def connect_and_run(eng, creds):
                                     "OSError", "NetworkError", "ServerError"))
                                 if transient:
                                     eng.join_thr.penalize(15)
-                                    eng.db.ex_set(rec["id"], status="approved",
-                                                  note=f"تلاش دوباره بعد از خطای موقت: {msg}")
-                                    eng.log("warn", "ex_join_retry", f"#{rec['id']} {msg}")
-                                    await note(f"⏳ Join موقتاً نشد: `{rec['link']}` — {msg}؛ "
-                                               "۱۵ ثانیه دیگر دوباره امتحان می‌کنم.")
+                                    # رکورد در صف می‌ماند ولی از سرِ صف
+                                    # می‌رود پایین؛ وگرنه یک خطای شبکه که
+                                    # بیشترِ صف را گیر می‌اندازد، همان
+                                    # رکورد را تا ابد تکرار می‌کند و
+                                    # بقیه (و دروازه‌ی اسکن) قفل می‌مانند.
+                                    _gave_up = eng.db.ex_join_retry(
+                                        rec["id"], reason=msg)
+                                    if not _gave_up:
+                                        eng.db.ex_set(
+                                            rec["id"], status="approved",
+                                            note=f"تلاش دوباره بعد از خطای موقت: {msg}")
+                                    # راست‌گویی: عددِ پیام باید همان
+                                    # عقب‌نشینیِ واقعی باشد (پلکانی، ۶۰ث به
+                                    # بالا) — نه «۱۵ ثانیه»ی ثابتِ قدیمی.
+                                    _wait = 0
+                                    if not _gave_up:
+                                        try:
+                                            _fresh_t = eng.db.ex_get(rec["id"]) or {}
+                                            _wait = max(0, int(_fresh_t.get("next_join_try") or 0)
+                                                        - int(time.time()))
+                                        except Exception:
+                                            _wait = 0
+                                    # «Join ناموفق» در گزارش روی kindِ
+                                    # ex_join_fail شمرده می‌شود؛ اگر رکورد
+                                    # بعد از چند تلاش بسته شد هم باید همان‌جا
+                                    # شمرده شود، وگرنه گزارش صفر می‌دهد.
+                                    eng.log("warn",
+                                            "ex_join_fail" if _gave_up else "ex_join_retry",
+                                            f"#{rec['id']} {msg}")
+                                    await note(
+                                        f"⏳ Join موقتاً نشد: `{rec['link']}` — {msg}؛ "
+                                        + ("دیگر تلاش نمی‌کنم و رکورد را می‌بندم "
+                                           "(«تبادل تأیید» دوباره تو صفش می‌گذارد)."
+                                           if _gave_up else
+                                           f"{secs(_wait) if _wait else 'چند ثانیه'} "
+                                           "دیگر دوباره امتحان می‌کنم."))
                                 else:
-                                    # مهم: محدودیت ۵۰۰عضویت شکستِ خودِ لینک نیست.
-                                    # رکورد را در صف نگه دار تا بعد از آزادشدن جا دوباره امتحان شود.
-                                    account_limit = any(
-                                        h in msg for h in ("حداکثر تعداد کانال",
-                                                           "ChannelsTooMuch"))
-                                    eng.db.ex_set(
-                                        rec["id"],
-                                        status="approved" if account_limit else "failed",
-                                        note=msg,
-                                    )
+                                    if account_limit:
+                                        # سقفِ ۵۰۰ عضویت با آزادشدنِ جا درست
+                                        # می‌شود؛ صفِ Join هم با همان
+                                        # _capacity_join_blocked_until بسته
+                                        # است، پس این رکورد عملاً منتظر
+                                        # می‌ماند. عقب‌نشینیِ اضافه روی
+                                        # «next_join_try» نگذار: بعد از
+                                        # پاکسازی، جوینِ معلق باید بی‌درنگ
+                                        # دوباره امتحان شود.
+                                        eng.db.ex_set(rec["id"], status="approved",
+                                                      note=msg, next_join_try=0)
+                                    else:
+                                        eng.db.ex_set(rec["id"], status="failed",
+                                                      note=msg, next_join_try=0)
                                     kind = "ex_join_limit" if account_limit else "ex_join_fail"
                                     eng.log("warn", kind, f"#{rec['id']} {msg}")
                                     await note(f"❌ جوین نشد: `{rec['link']}` — {msg}")
@@ -10446,10 +10725,23 @@ async def connect_and_run(eng, creds):
         rec = eng.loop_state.setdefault(name, {"restarts": 0, "errors": 0})
         rec["state"] = state
         rec["ts"] = int(time.time())
+        # «beat» فقط وقتی ثبت می‌شود که حلقه داوطلبِ پایشِ گیرکردن باشد
+        # (stall_after>0)؛ وگرنه حلقه‌هایی که عملاً ساعت‌ها می‌خوابند
+        # (گزارش، ریسک) بی‌دلیل «گیر کرده» شمرده می‌شوند.
+        if state in ("running", "beat"):
+            rec["beat"] = int(time.time())
         if err:
             rec["errors"] = int(rec.get("errors", 0)) + 1
             rec["last_error"] = str(err)[:200]
         return rec
+
+    def _loop_beat(name):
+        """نشانه‌ی «زنده‌ام» — هر دورِ حلقه‌ی پایش‌شده باید صدا بزند."""
+        try:
+            rec = eng.loop_state.setdefault(name, {"restarts": 0, "errors": 0})
+            rec["beat"] = int(time.time())
+        except Exception:
+            pass
 
     async def _loop_restart_note(name, exc, n):
         now_t = time.time()
@@ -10463,20 +10755,88 @@ async def connect_and_run(eng, creds):
             f"`{type(exc).__name__}: {str(exc)[:120] or 'بدون پیام'}`\n"
             "اگر تکرار شد «🩺 عیب‌یابی» را بزن؛ علت و ساعتش همان‌جا هست.")
 
-    def _supervise(name, factory, first_delay=5.0, max_delay=300.0):
+    async def _loop_stall_note(name, stuck_sec, n):
+        now_t = time.time()
+        if now_t - _loop_note_at.get(name, 0.0) < 1800:
+            return
+        _loop_note_at[name] = now_t
+        label = LOOP_LABELS.get(name, name)
+        await note(
+            f"⏳ حلقه‌ی «{label}» {secs(int(stuck_sec))} است هیچ نشانه‌ای "
+            f"نداده (معمولاً یعنی یک درخواستِ تلگرام وسط کار گیر کرده).\n"
+            f"خودم قطعش کردم و دوباره راهش انداختم (دفعه‌ی {fa(n)}).\n"
+            "اگر زیاد تکرار می‌شود شبکه/میزبان را چک کن؛ «🩺 عیب‌یابی» "
+            "آخرین علت‌ها را نشان می‌دهد.")
+
+    def _supervise(name, factory, first_delay=5.0, max_delay=300.0,
+                   stall_after=0.0, stall_poll_sec=15.0):
+        """حلقه را زنده نگه می‌دارد؛ با ``stall_after`` «گیر کردن» را هم.
+
+        مرگِ حلقه (خطا) را نگهبانِ قبلی می‌گرفت، ولی «نیمه‌کاره موندن» را
+        نه: یک ``await`` که هرگز برنگردد (شبکه‌ی لرزان روی درخواستِ تلگرام)
+        هیچ استثنایی نمی‌دهد، هیچ لاگی نمی‌ماند و حالت حلقه تا ابد
+        «running» می‌ماند — یعنی دقیقاً همان «اسکن تبادل می‌میره» که
+        هیچ‌جا ثبت نمی‌شد. حالا اگر حلقه‌ای که beat می‌زند بیشتر از
+        ``stall_after`` ثانیه بی‌نشانه بماند، کاتل می‌شود و از نو شروع
+        می‌کند (و یک‌بار هم به صاحب‌حساب گفته می‌شود).
+        """
         async def _runner():
             delay = first_delay
+            stalled = [False]
+            child_ref = [None]
+            poll = max(1.0, float(stall_poll_sec or 15.0))
+
+            async def _watch():
+                # بی‌پایان می‌چرخد تا «گیرکردنِ» بعدی هم گرفته شود؛ فقط
+                # خودِ حلقه‌ی کار را می‌کشد، نه نگهبان را — وگرنه در
+                # زمانِ خاموشیِ عادی هم لغو بلعیده می‌شد و ری‌استارت
+                # کامل نمی‌شد.
+                while True:
+                    await asyncio.sleep(poll)
+                    rec = eng.loop_state.get(name) or {}
+                    if rec.get("state") != "running" or stalled[0]:
+                        continue
+                    ref = float(rec.get("beat") or rec.get("ts") or 0)
+                    if not ref:
+                        continue
+                    stuck = time.time() - ref
+                    if stuck <= stall_after:
+                        continue
+                    stalled[0] = True
+                    _loop_mark(name, "stalled", f"بدون نشانه {int(stuck)}s")
+                    eng.log("warn", "loop_stall",
+                            f"{name}: {int(stuck)}s بدون نشانه — ری‌استارت")
+                    try:
+                        await _loop_stall_note(name, stuck,
+                                               int(rec.get("restarts", 0)) + 1)
+                        eng.write_status()
+                    except Exception:
+                        pass
+                    if child_ref[0] is not None:
+                        child_ref[0].cancel()
+
+            watch = asyncio.create_task(_watch()) if stall_after > 0 else None
             try:
                 while True:
                     try:
                         _loop_mark(name, "running")
-                        await factory()
+                        child = asyncio.ensure_future(factory())
+                        child_ref[0] = child
+                        try:
+                            await child
+                        finally:
+                            child_ref[0] = None
                         # این حلقه‌ها بی‌پایان‌اند؛ رسیدن به اینجا یعنی
                         # تمام شده — پس باید دوباره راه بیفتد.
                         _loop_mark(name, "ended")
                         eng.log("warn", "loop_ended", name)
                     except asyncio.CancelledError:
-                        raise
+                        if not stalled[0]:
+                            raise
+                        # کاتلِ عمدیِ نگهبان (حلقه گیر کرده بود) «خاموشی»
+                        # نیست؛ بی‌صدا از نو شروع می‌کنیم.
+                        stalled[0] = False
+                        delay = first_delay
                     except BaseException as e:
                         rec = _loop_mark(name, "crashed",
                                          f"{type(e).__name__}: {e}")
@@ -10500,11 +10860,19 @@ async def connect_and_run(eng, creds):
                 # خاموشیِ عادی (ری‌استارت/بستنِ سلف) نباید «کرش» شمرده شود.
                 _loop_mark(name, "cancelled")
                 raise
+            finally:
+                if watch is not None:
+                    watch.cancel()
+                if child_ref[0] is not None:
+                    child_ref[0].cancel()
         return asyncio.create_task(_runner())
 
     task = _supervise("sender", sender_loop)
     ex_task = _supervise("exchange", exchange_worker)
-    scan_task = _supervise("scan", scan_loop)
+    # فقط حلقه‌ای که beat می‌زند زیر پایشِ «گیر کردن» می‌رود؛ حلقه‌هایی مثل
+    # گزارش/ریسک که ساعت‌ها می‌خوابند نشانه‌ای نمی‌فرستند و بی‌دلیل
+    # کشته می‌شدند.
+    scan_task = _supervise("scan", scan_loop, stall_after=SCAN_STALL_AFTER_SEC)
     member_task = _supervise("membership", membership_loop)
     report_task = _supervise("report", report_loop)
     risk_task = _supervise("risk", risk_loop)

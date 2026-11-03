@@ -94,7 +94,10 @@ print("DONE G3 stale batch")
 check("SCAN_FOUND_NOTE_GAP_SEC = 300" in src,
       "اعلام کانال تازه حداکثر هر ۵ دقیقه یک‌بار")
 loop_i = src.index("async def scan_loop()")
-loop_block = src[loop_i:loop_i + 5000]
+# پنجره را «تا ابتدای بخش بعدی» می‌بریم، نه با طولِ ثابت: اسکن‌لوپ رشد
+# می‌کند و با طولِ ثابت، متن‌های داخلش از پنجره بیرون می‌افتند.
+_loop_next = src.find("    # ---------- کارگر بررسی عضویت", loop_i)
+loop_block = src[loop_i:(_loop_next if _loop_next > loop_i else loop_i + 5000)]
 check("found_buf" in loop_block and "last_found_note" in loop_block,
       "شمارش کانال‌های تازه تجمیع می‌شود")
 check('state = ("صف تبادل به‌خاطر محدودیت تلگرام' in loop_block
