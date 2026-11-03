@@ -145,6 +145,8 @@ def make(client_fn, blocked_until=0.0, gate_wait=0.0, gate_blocked=False,
         "note": note, "secs": ns_mod["secs"],
         "membership_check_delay": lambda: 2,
         "_warn_check_flood": {"last": 0},
+        # مهلتِ خودِ درخواستِ تلگرام (ثابتِ سطح‌ماژول در 95.py)
+        "CHECK_CALL_TIMEOUT_SEC": ns_mod.get("CHECK_CALL_TIMEOUT_SEC", 45),
     }
     exec(fn_src, ns)
     return ns, calls

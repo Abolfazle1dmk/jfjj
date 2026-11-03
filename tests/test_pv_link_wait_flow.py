@@ -266,7 +266,9 @@ async def dup_scenario():
 
 first, second = asyncio.run(dup_scenario())
 print("P3 first", first, "second", second, "sent", len(fake3.sent))
-check(first is True and second is False and len(fake3.sent) == 1,
+# None = «تعویق، نه شکست»؛ حلقه‌ی یادآوری با این مقدار اخطار نمی‌سوزاند
+# و مسیر «سه بار نشد → لفت» را جلو نمی‌آورد. پیام هم که نرفته (sent==1).
+check(first is True and second is None and len(fake3.sent) == 1,
       "P3: «نیومدی» دوم درجا پشت اولی نمی‌رود (محافظ تکراری سالم ماند)")
 
 
@@ -281,7 +283,7 @@ time.sleep(GAP + 0.25)
 eng3.db.ex_set(r3["id"], reminders_total=0)
 after_join_res = asyncio.run(after_join())
 print("P3 after join", after_join_res, "sent", len(fake3.sent))
-check(after_join_res is False and len(fake3.sent) == 1,
+check(after_join_res is None and len(fake3.sent) == 1,
       "P3: «نیومدی» درجا بعد از جوین هم نمی‌رود (رفتار پین‌شده‌ی قبلی)")
 
 # ════ P4: تأیید دستی، پرچم replied نباید «جوین شدم» را خفه کند ════
