@@ -62,8 +62,9 @@ class FakeEngine:
 
 
 class FakeClient:
-    def __init__(self, entity=True):
+    def __init__(self, entity=True, participant_error=None):
         self.entity = SimpleNamespace(id=77, access_hash=88) if entity else None
+        self.participant_error = participant_error
         self.invite_calls = 0
         self.participant_calls = []
 
@@ -72,6 +73,8 @@ class FakeClient:
             self.invite_calls += 1
             return SimpleNamespace(chat=self.entity)
         self.participant_calls.append(request)
+        if self.participant_error:
+            raise self.participant_error
         return SimpleNamespace(participant=object())
 
 
@@ -118,4 +121,12 @@ assert asyncio.run(ns["peer_in_my_channel"](42)) is None
 assert client.invite_calls == 1
 assert not client.participant_calls
 assert reasons and "کانالِ من" in reasons[-1], reasons
-print("private own-channel membership resolution: PASS")
+
+# ValueError must retain Telethon's actionable detail instead of only saying
+# "ValueError on channel", which made repeated unknown-membership warnings look random.
+client = FakeClient(participant_error=ValueError(
+    "Could not find the input entity for PeerUser(user_id=42)"))
+eng, ns, notes, reasons = make_ns("https://t.me/+OWNPRIVATE123456", client)
+assert asyncio.run(ns["peer_in_my_channel"](42)) is None
+assert reasons and "Could not find the input entity" in reasons[-1], reasons
+print("private own-channel membership resolution and ValueError detail: PASS")
