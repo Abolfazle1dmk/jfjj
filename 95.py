@@ -290,10 +290,19 @@ def trim_entity_cache(client, limit=None):
         hm = getattr(cache, "hash_map", None)
         if not isinstance(hm, dict) or len(hm) <= lim:
             return 0
-        keep = dict(list(hm.items())[-lim:])     # dict ترتیبِ درج را می‌داند
+        # از انتهای dict فقط `lim` مورد بردار. ساختنِ `list(hm.items())`
+        # اول کلِ کش را کپی می‌کرد؛ اگر کش خیلی بزرگ شده باشد، همین پاک‌سازی
+        # در لحظه‌ی کمبود RAM یک جهشِ حافظه‌ی هم‌اندازه‌ی کلِ کش می‌سازد.
+        # `reversed(dict)` از Python 3.8 پشتیبانی می‌شود و این کپی را به سقف
+        # واقعیِ کش محدود می‌کند.
+        keep = []
+        for key in reversed(hm):
+            keep.append((key, hm[key]))
+            if len(keep) >= lim:
+                break
         removed = len(hm) - len(keep)
         hm.clear()
-        hm.update(keep)
+        hm.update(reversed(keep))       # ترتیبِ درجِ جدیدترین‌ها را نگه دار
         return removed
     except Exception:
         return 0
@@ -6814,19 +6823,30 @@ def _cgroup_dirs(root="/sys/fs/cgroup", proc_cgroup="/proc/self/cgroup"):
                 group = group.lstrip("/")
                 if not group:
                     continue
-                if not ctrl:                       # cgroup v2
-                    dirs.append(os.path.join(root, group))
-                elif "memory" in ctrl.split(","):  # cgroup v1
-                    dirs.append(os.path.join(root, "memory", group))
-                    dirs.append(os.path.join(root, group))
+                # محدودیت ممکن است روی cgroup والد اعمال شده باشد، درحالی‌که
+                # leaf نامحدود است. مسیر کاملِ والدها را هم بررسی کن تا سقفِ
+                # واقعی کانتینر در گزارش و انتخابِ حالت گم نشود.
+                parts = [p for p in group.split("/")
+                         if p and p not in (".", "..")]
+                bases = ([root] if not ctrl else
+                         ([os.path.join(root, "memory"), root]
+                          if "memory" in ctrl.split(",") else []))
+                for base in bases:
+                    for depth in range(1, len(parts) + 1):
+                        dirs.append(os.path.join(base, *parts[:depth]))
     except Exception:
         pass
     return dirs
 
 
 def cgroup_mem_mb(root="/sys/fs/cgroup", proc_cgroup="/proc/self/cgroup"):
-    """(سقف, مصرف) به مگابایت یا (None, None) اگر سقفی نبود."""
+    """(سقف, مصرف) از محدودکننده‌ترین cgroup یا (None, None).
+
+    اگر قیدِ والد و فرزند متفاوت باشند، اولین فایل لزوماً قیدِ مؤثر نیست؛
+    برای گزارشِ headroom، زوجی را برمی‌گردانیم که کمترین فضای آزاد را دارد.
+    """
     seen = set()
+    choices = []
     for d in _cgroup_dirs(root, proc_cgroup):
         if d in seen:
             continue
@@ -6838,8 +6858,11 @@ def cgroup_mem_mb(root="/sys/fs/cgroup", proc_cgroup="/proc/self/cgroup"):
             if not lim or lim <= 0 or lim > (1 << 60):
                 continue
             use = _read_mem_int(os.path.join(d, use_name)) or 0
-            return (round(lim / 1048576.0, 1), round(use / 1048576.0, 1))
-    return None, None
+            choices.append((lim, max(0, use)))
+    if not choices:
+        return None, None
+    lim, use = min(choices, key=lambda pair: max(0, pair[0] - pair[1]))
+    return round(lim / 1048576.0, 1), round(use / 1048576.0, 1)
 
 
 def mem_info():

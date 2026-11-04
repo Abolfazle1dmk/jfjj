@@ -66,6 +66,23 @@ try:
     lim2, use2 = m.cgroup_mem_mb(root, proc)
     check("cgroup: max (نامحدود) نادیده گرفته می‌شود", lim2 is None, (lim2, use2))
 
+    # اگر parent محدود باشد و leaf «max» داشته باشد، والد سقف واقعی است.
+    nested = tempfile.mkdtemp(prefix="jafj_cg_parent_")
+    try:
+        put(os.path.join(nested, "memory.max"), "max")
+        put(os.path.join(nested, "tenant", "memory.max"), str(512 * 1024 * 1024))
+        put(os.path.join(nested, "tenant", "memory.current"), str(450 * 1024 * 1024))
+        put(os.path.join(nested, "tenant", "worker", "memory.max"), "max")
+        put(os.path.join(nested, "tenant", "worker", "memory.current"), str(8 * 1024 * 1024))
+        nested_proc = os.path.join(nested, "proc-cgroup")
+        put(nested_proc, "0::/tenant/worker" + chr(10))
+        nested_pair = m.cgroup_mem_mb(nested, nested_proc)
+        check("cgroup nested: سقفِ والدِ محدود از leaf نامحدود تشخیص داده می‌شود",
+              nested_pair == (512.0, 450.0), nested_pair)
+    finally:
+        import shutil
+        shutil.rmtree(nested, ignore_errors=True)
+
     # mem_info باید از همین مسیر استفاده کند
     orig = m.cgroup_mem_mb
     m.cgroup_mem_mb = lambda *a, **k: (512.0, 480.0)
