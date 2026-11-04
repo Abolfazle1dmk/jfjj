@@ -38,6 +38,22 @@ INNER = textwrap.dedent("""
         import shutil
         shutil.rmtree(root, ignore_errors=True)
 
+    # A nested leaf may be unlimited while a parent carries the effective
+    # memory cap. The helper must walk all cgroup ancestors, not just the leaf.
+    root = tempfile.mkdtemp(prefix="cg-v2-parent-")
+    try:
+        put(os.path.join(root, "memory.max"), "max")
+        put(os.path.join(root, "memory.current"), str(0))
+        put(os.path.join(root, "tenant", "memory.max"), str(256 * 1024 * 1024))
+        put(os.path.join(root, "tenant", "memory.current"), str(176 * 1024 * 1024))
+        put(os.path.join(root, "tenant", "worker", "memory.max"), "max")
+        put(os.path.join(root, "tenant", "worker", "memory.current"), str(8 * 1024 * 1024))
+        proc = os.path.join(root, "proc-cgroup")
+        put(proc, "0::/tenant/worker" + chr(10))
+        assert M._cgroup_memory_available_mb(root, proc) == 80
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
     # cgroup v1 path and unlimited sentinel.
     root = tempfile.mkdtemp(prefix="cg-v1-")
     try:

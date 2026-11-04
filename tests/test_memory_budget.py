@@ -70,6 +70,22 @@ def main():
     # جدیدترین‌ها می‌مانند (dict ترتیبِ درج را نگه می‌دارد)
     check("جدیدترین موجودیت‌ها نگه داشته شدند",
           104999 in c._mb_entity_cache.hash_map and 100000 not in c._mb_entity_cache.hash_map)
+
+    # پاک‌سازیِ کشِ خیلی بزرگ نباید اول کلِ آن را با .items() در RAM کپی کند.
+    class NoFullItemsDict(dict):
+        def items(self):
+            raise AssertionError("must not materialize the whole entity cache")
+
+    c._mb_entity_cache.hash_map = NoFullItemsDict(
+        (i, (123456789, 1)) for i in range(10000))
+    removed_bounded = trim_entity(c, limit=1000)
+    check("کوتاه‌سازی بدون کپیِ کلِ کشِ موجودیت‌ها",
+          removed_bounded == 9000
+          and len(c._mb_entity_cache.hash_map) == 1000
+          and 9999 in c._mb_entity_cache.hash_map
+          and 9000 in c._mb_entity_cache.hash_map
+          and 8999 not in c._mb_entity_cache.hash_map,
+          removed_bounded)
     check("کشِ کوچک دست‌نخورده می‌ماند", trim_entity(c, limit=5000) == 0)
     check("بدونِ کلاینت → خطا نمی‌دهد", trim_entity(None) == 0)
     check("کلاینتِ بی‌کش → خطا نمی‌دهد", trim_entity(FakeClient()) == 0)

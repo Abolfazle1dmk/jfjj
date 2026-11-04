@@ -1872,11 +1872,18 @@ def _cgroup_memory_available_mb(cgroup_root="/sys/fs/cgroup",
                 group_path = group_path.lstrip("/")
                 if not group_path:
                     continue
-                if not controllers:  # cgroup v2
-                    candidates.append(os.path.join(cgroup_root, group_path))
-                elif "memory" in controllers.split(","):  # cgroup v1
-                    candidates.append(os.path.join(cgroup_root, "memory", group_path))
-                    candidates.append(os.path.join(cgroup_root, group_path))
+                # در cgroupهای تو در تو ممکن است محدودیت روی یکی از گروه‌های
+                # والد باشد و برای leaf مقدار memory.max برابر max باشد. همه‌ی
+                # اجدادِ مسیر را هم بررسی کن؛ فقط leaf می‌تواند سقف مؤثر را
+                # از دست بدهد و باعث انتخاب حالتِ پرمصرف یا OOM شود.
+                parts = [p for p in group_path.split("/")
+                         if p and p not in (".", "..")]
+                bases = ([cgroup_root] if not controllers else
+                         ([os.path.join(cgroup_root, "memory"), cgroup_root]
+                          if "memory" in controllers.split(",") else []))
+                for base in bases:
+                    for depth in range(1, len(parts) + 1):
+                        candidates.append(os.path.join(base, *parts[:depth]))
     except Exception:
         pass
 
