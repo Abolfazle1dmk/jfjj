@@ -72,7 +72,8 @@ class TelegramClient:
     async def get_me(self):
         class U:
             username = "fakebot"
-            id = 1
+            id = int(os.environ.get("FAKE_ME_ID", "1"))
+            bot = os.environ.get("FAKE_ME_BOT", "1") == "1"
         return U()
     def on(self, *a, **k):
         def deco(fn):
@@ -179,6 +180,8 @@ import os, sys, asyncio
 sys.path.insert(0, os.getcwd())
 os.environ["PORT"] = os.environ.get("FAKE_PORT", "8141")
 import manager_82 as M
+M.DEFAULTS["bot_token"] = "1:fake"
+M.BOT_TOKEN = "1:fake"
 
 async def main():
     sleeps = []
@@ -216,6 +219,8 @@ import os, sys, asyncio
 sys.path.insert(0, os.getcwd())
 os.environ["PORT"] = os.environ.get("FAKE_PORT", "8142")
 import manager_82 as M
+M.DEFAULTS["bot_token"] = "1:fake"
+M.BOT_TOKEN = "1:fake"
 
 async def main():
     sleeps = []
@@ -243,11 +248,36 @@ async def main():
 asyncio.run(main())
 ''')
 
+INNER_MISMATCH = textwrap.dedent('''
+import os, sys, asyncio
+sys.path.insert(0, os.getcwd())
+os.environ["PORT"] = os.environ.get("FAKE_PORT", "8144")
+import manager_82 as M
+M.DEFAULTS["bot_token"] = "1:fake"
+M.BOT_TOKEN = "1:fake"
+
+async def main():
+    try:
+        m = M.Manager()
+        client = await m.login_bot(tries=1)
+        import telethon
+        ok = len(telethon.START_CALLS) == 1
+        print("MISMATCH_RESULT", "PASS" if ok else "FAIL")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print("MISMATCH_RESULT FAIL", type(e).__name__, e)
+
+asyncio.run(main())
+''')
+
 INNER_CORRUPT = textwrap.dedent('''
 import os, sys, asyncio
 sys.path.insert(0, os.getcwd())
 os.environ["PORT"] = os.environ.get("FAKE_PORT", "8143")
 import manager_82 as M
+M.DEFAULTS["bot_token"] = "1:fake"
+M.BOT_TOKEN = "1:fake"
 
 async def main():
     orig_sleep = asyncio.sleep
@@ -290,13 +320,14 @@ def reset_app():
     open(os.path.join(tel, "sessions.py"), "w", encoding="utf-8").write(FAKE_SESSIONS)
     open(os.path.join(tel, "errors.py"), "w", encoding="utf-8").write(FAKE_ERRORS)
 
-def run_inner(inner, port, flood_first="1", flood_secs="7"):
+def run_inner(inner, port, flood_first="1", flood_secs="7", fake_me_id="1"):
     env = dict(os.environ)
     env["DATA_DIR"] = DATA
     env["PORT"] = str(port)
     env["FAKE_PORT"] = str(port)
     env["FAKE_FLOOD_FIRST"] = flood_first
     env["FAKE_FLOOD_SECONDS"] = flood_secs
+    env["FAKE_ME_ID"] = str(fake_me_id)
     env["FAKE_CALL_LOG"] = os.path.join(ROOT, f"calls_{port}.log")
     # clean backup/config env
     for k in ("BACKUP_CHAT", "BACKUP_EVERY", "BOT_TOKEN", "API_ID", "API_HASH"):
@@ -333,8 +364,18 @@ def test_boot2():
         print(out[-3000:])
     return good
 
+def test_mismatched_bot_session():
+    print("--- 3: authorized session for another bot is rejected ---")
+    out = run_inner(INNER_MISMATCH, 8144, "0", "7", fake_me_id="2")
+    print("\n".join([l for l in out.splitlines() if "MISMATCH" in l]) or out[-2000:])
+    good = "MISMATCH_RESULT PASS" in out
+    print("mismatched session:", "PASS" if good else "FAIL")
+    if not good:
+        print(out[-3000:])
+    return good
+
 def test_corrupt():
-    print("--- 3: corrupted saved session is cleared, token path used ---")
+    print("--- 4: corrupted saved session is cleared, token path used ---")
     out = run_inner(INNER_CORRUPT, 8143, "0", "7")
     print("\n".join([l for l in out.splitlines() if "CORRUPT" in l] ) or out[-2000:])
     good = "CORRUPT_RESULT PASS" in out
@@ -346,7 +387,8 @@ def test_corrupt():
 if __name__ == "__main__":
     ok1 = test_boot1()
     ok2 = test_boot2() if ok1 else False
-    ok3 = test_corrupt() if ok1 else False
-    ok = ok1 and ok2 and ok3
+    ok3 = test_mismatched_bot_session() if ok1 and ok2 else False
+    ok4 = test_corrupt() if ok1 else False
+    ok = ok1 and ok2 and ok3 and ok4
     print("ALL:", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
