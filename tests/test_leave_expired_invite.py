@@ -61,9 +61,29 @@ def _ns(d):
         d["CHECK_DEFERRED"] = getattr(_m, "CHECK_DEFERRED", None) or _CdStub()
     return d
 
-import asyncio, importlib.util, os, sys, time
+import asyncio, importlib.util, os, sys, time, types
 from types import SimpleNamespace
 sys.path.insert(0, os.getcwd())
+
+# Stub the lazily imported Telegram request used to resolve old private-invite
+# records that predate persisted chat_id/access_hash metadata.
+class CheckChatInviteRequest:
+    def __init__(self, invite_hash):
+        self.invite_hash = invite_hash
+
+_tl = types.ModuleType("telethon.tl")
+_functions = types.ModuleType("telethon.tl.functions")
+_messages = types.ModuleType("telethon.tl.functions.messages")
+_messages.CheckChatInviteRequest = CheckChatInviteRequest
+_telethon = sys.modules.setdefault("telethon", types.ModuleType("telethon"))
+if not hasattr(_telethon, "__path__"):
+    _telethon.__path__ = []
+_tl.functions = _functions
+_functions.messages = _messages
+_telethon.tl = _tl
+sys.modules["telethon.tl"] = _tl
+sys.modules["telethon.tl.functions"] = _functions
+sys.modules["telethon.tl.functions.messages"] = _messages
 
 spec = importlib.util.spec_from_file_location("m95", "95.py")
 m = importlib.util.module_from_spec(spec)
@@ -160,10 +180,13 @@ class Dial:
 
 
 class FakeClient:
-    def __init__(self, expired=False, dialogs=(), leave_error=None):
+    def __init__(self, expired=False, dialogs=(), leave_error=None,
+                 invite_entity=None):
         self.expired = expired
         self.dialogs = list(dialogs)
         self.leave_error = leave_error
+        self.invite_entity = invite_entity
+        self.invite_calls = []
         self.leaves = []
         self.entity_calls = []
 
@@ -174,6 +197,9 @@ class FakeClient:
         return SimpleNamespace(id=-100999, access_hash=7, title="t")
 
     async def __call__(self, req):
+        if isinstance(req, CheckChatInviteRequest):
+            self.invite_calls.append(req.invite_hash)
+            return SimpleNamespace(chat=self.invite_entity)
         if isinstance(req, LeaveChannelRequest):
             if self.leave_error:
                 raise self.leave_error
@@ -203,6 +229,8 @@ ns = {"m": m, "DRY_RUN": m.DRY_RUN, "eng": None, "client": None,
       "FloodWaitError": FloodWaitError,
       "LeaveChannelRequest": LeaveChannelRequest,
       "_input_channel": m._input_channel,
+      "is_invite": m.is_invite,
+      "invite_hash": m.invite_hash,
       # داخلِ connect_and_run تعریف می‌شود و در برشِ leave_link نیست؛
       # وظیفه‌اش فقط ذخیره‌ی هویتِ کانال است و در test_leave_scan جدا
       # آزموده می‌شود.
@@ -248,6 +276,23 @@ check(ok is False and "منقضی" in err,
 check(fake.leaves == [] and not err.startswith("InviteHashExpiredError"),
       "L3: خطای خام انگلیسی نمایش داده نمی‌شود")
 print("DONE L3 honest failure")
+
+
+# ═══════ L3b — رکورد قدیمیِ لینک خصوصی بدون chat_id/title ═══════
+# get_entity روی t.me/+… با ValueError/InviteHashExpired می‌افتد؛ اگر خودِ
+# اکانت هنوز عضو باشد، CheckChatInvite باید کانال را resolve کند تا ظرفیت آزاد شود.
+eng = fresh_engine()
+rec, _new = eng.db.ex_add(7006, "@peer6", "https://t.me/+legacyhash")
+eng.db.ex_set(rec["id"], status="joined")
+ent = SimpleNamespace(id=-1006666, access_hash=66, title="کانال قدیمی")
+fake = FakeClient(expired=True, invite_entity=ent)
+ns["eng"] = FakeEng(eng.db)
+ns["client"] = fake
+ok, err = asyncio.run(leave_link("https://t.me/+legacyhash", rec["id"]))
+check(ok is True and len(fake.leaves) == 1 and fake.invite_calls == ["legacyhash"],
+      "L3b: private invite بدون metadata با CheckChatInvite حل شد (%r, %r)"
+      % (ok, err))
+print("DONE L3b legacy invite resolution")
 
 
 # ═══════ L4 — خطاهای «عضو نیست»/«کانال خصوصی» = لفت لازم نیست، نه خطا ═══════

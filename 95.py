@@ -777,7 +777,9 @@ _LAST_CHECK_WHY = {"why": "", "at": 0}
 
 
 def _note_check_why(why):
-    _LAST_CHECK_WHY["why"] = str(why or "")[:120]
+    # نگه‌داشتن متنِ خطای واقعی مهم است: «ValueError» به‌تنهایی دلیلِ
+    # قابل‌عیب‌یابی نیست (مثلاً Telethon می‌تواند بگوید کدام entity کم است).
+    _LAST_CHECK_WHY["why"] = str(why or "")[:240]
     _LAST_CHECK_WHY["at"] = int(time.time())
 
 
@@ -8164,8 +8166,13 @@ async def connect_and_run(eng, creds):
                 saw_unknown = True
                 continue
             except Exception as e:
-                eng.log("warn", "ex_check", f"{ch}: {type(e).__name__}: {e}")
-                _note_check_why(f"{type(e).__name__} روی چکِ {ch}")
+                detail = str(e).replace("\n", " ").strip()
+                eng.log("warn", "ex_check",
+                        f"{ch}: {type(e).__name__}: {detail}")
+                # قبلاً فقط نامِ کلاسِ خطا در هشدار می‌آمد؛ «ValueError» بدونِ
+                # متنِ واقعی بی‌دلیل به‌نظر می‌رسید و عیب‌یابی‌اش ممکن نبود.
+                _note_check_why(
+                    f"{type(e).__name__}: {detail[:120]} روی چکِ {ch}")
                 saw_unknown = True
                 continue
 
@@ -8455,10 +8462,25 @@ async def connect_and_run(eng, creds):
                 except (InviteHashExpiredError, InviteHashInvalidError,
                         ChannelInvalidError, UsernameNotOccupiedError,
                         UsernameInvalidError, ValueError):
-                    # لینکِ طرف باطل/منقضی شده یا Telethon موجودیت را از روی
-                    # لینک پیدا نکرده (ValueError) — با آیدی/عنوانِ ذخیره‌شده
-                    # یا اسکنِ دیالوگ‌ها امتحان کن.
-                    ent = await resolve_by_title()
+                    # Telethon برای لینکِ خصوصی t.me/+… معمولاً get_entity را
+                    # با ValueError رد می‌کند. رکوردهای قدیمی ممکن است هنوز
+                    # chat_id/title نداشته باشند؛ پس اول خودِ invite را با
+                    # CheckChatInvite حل کن (اگر هنوز عضو باشیم chat برمی‌گردد)،
+                    # بعد سراغ تطبیقِ عنوان در دیالوگ‌ها برو.
+                    ent = None
+                    if is_invite(link):
+                        try:
+                            from telethon.tl.functions.messages import CheckChatInviteRequest
+                            info = await client(CheckChatInviteRequest(invite_hash(link)))
+                            ent = getattr(info, "chat", None)
+                            if ent is not None:
+                                remember_channel(rec_id, ent)
+                        except Exception as invite_error:
+                            eng.log("warn", "ex_leave_invite_resolve",
+                                    f"{link}: {type(invite_error).__name__}: "
+                                    f"{invite_error}")
+                    if ent is None:
+                        ent = await resolve_by_title()
                     if ent is None:
                         eng.log("warn", "ex_leave_expired", str(link))
                         return (False,

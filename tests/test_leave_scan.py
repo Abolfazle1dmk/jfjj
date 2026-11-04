@@ -172,6 +172,8 @@ def make_leave():
         "DRY_RUN": False, "eng": None, "client": None,
         "ex_cd": ExCd(), "remember_channel": remember_channel,
         "_input_channel": _input_channel,
+        "is_invite": ns_mod["is_invite"],
+        "invite_hash": ns_mod["invite_hash"],
         "LeaveChannelRequest": LeaveChannelRequest,
         "InviteHashExpiredError": InviteHashExpiredError,
         "InviteHashInvalidError": InviteHashInvalidError,
