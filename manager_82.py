@@ -14283,11 +14283,40 @@ class Manager:
                                 raise _RetryLoop()
                             raise
                         if ok:
-                            self.bot = install_outgoing_filter(client)
-                            print("  ✅ نشست ذخیره‌شده معتبر است (بدون ورود دوباره)", flush=True)
-                            return client
-                        # معتبر نیست → پاک و ورود با توکن در همین تلاش
-                        print("  ⚠️ نشست ذخیره‌شده معتبر نیست — پاک و ورود با توکن", flush=True)
+                            # is_user_authorized فقط می‌گوید نشست از نظر MTProto معتبر
+                            # است؛ تضمین نمی‌کند نشست متعلق به همین ربات باشد. اگر
+                            # توکن عوض شده باشد، نشستِ ربات قبلی می‌تواند همچنان
+                            # وصل شود و تمام callbackهای ربات فعلی به این پروسه نرسند.
+                            me = await client.get_me()
+                            expected_bot_id = None
+                            try:
+                                expected_bot_id = int(str(token).strip().split(":", 1)[0])
+                            except Exception:
+                                pass
+                            session_is_bot = getattr(me, "bot", None) is True
+                            try:
+                                session_matches_token = (
+                                    expected_bot_id is not None
+                                    and int(getattr(me, "id", 0)) == expected_bot_id
+                                )
+                            except Exception:
+                                session_matches_token = False
+                            if session_is_bot and session_matches_token:
+                                self.bot = install_outgoing_filter(client)
+                                print("  ✅ نشست ذخیره‌شده متعلق به همین ربات است "
+                                      "(بدون ورود دوباره)", flush=True)
+                                return client
+                            print("  ⚠️ نشست ذخیره‌شده متعلق به ربات/اکانت دیگری است "
+                                  "— پاک و ورود با توکن فعلی", flush=True)
+                            try:
+                                if os.path.exists(BOT_SESSION_FILE):
+                                    os.remove(BOT_SESSION_FILE)
+                            except Exception:
+                                pass
+                            use_token_path = True
+                        else:
+                            # معتبر نیست → پاک و ورود با توکن در همین تلاش
+                            print("  ⚠️ نشست ذخیره‌شده معتبر نیست — پاک و ورود با توکن", flush=True)
                         try:
                             await client.disconnect()
                         except Exception:
