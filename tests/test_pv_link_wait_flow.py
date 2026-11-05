@@ -142,7 +142,15 @@ harness_src = (
     + "\n".join("    " + ln for ln in ded.splitlines())
     + "\n"
 )
-hns = {"_REAL_SEND": real_send, "_CD": cd, "fa": m.fa}
+async def _warn_no_peer_stub(*a, **k):
+    return None
+
+
+hns = {"_REAL_SEND": real_send, "_CD": cd, "fa": m.fa,
+       # این بلوک از 95.py برش خورده و این دو نام را می‌خواند
+       # (سنتینلِ «طرف قابلِ شناسایی نیست» + هشدارِ راهنمای آن).
+       "CHECK_NO_PEER": m.CHECK_NO_PEER,
+       "warn_peer_unresolvable": _warn_no_peer_stub}
 exec(harness_src, hns)
 run_once = hns["_run"]
 

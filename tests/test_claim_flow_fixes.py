@@ -50,6 +50,16 @@ class _CdStub:
 
 
 def _ns(d):
+    # نام‌های تازه‌ی هویتِ طرف (رفعِ «Could not find the input entity»):
+    # برش‌های این درایور از بدنه‌ی peer_in_my_channel می‌آیند و این‌ها را
+    # می‌خوانند.
+    _mod = globals().get("m") or globals().get("ns_mod") or globals().get("_m")
+    for _nm in ("partner_input_peer", "peer_identity", "remember_peer",
+                "scan_dialogs_for_peer", "_input_user"):
+        if _mod is not None and hasattr(_mod, _nm):
+            d.setdefault(_nm, getattr(_mod, _nm))
+    if _mod is not None and hasattr(_mod, "CHECK_NO_PEER"):
+        d.setdefault("CHECK_NO_PEER", getattr(_mod, "CHECK_NO_PEER"))
     d.setdefault("_LAST_CHECK_WHY", {"why": "", "at": 0})
     d.setdefault("_note_check_why", (lambda w: None))
     for _nm in ("ChannelInvalidError", "UsernameInvalidError"):

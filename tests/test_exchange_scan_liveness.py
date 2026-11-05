@@ -278,6 +278,14 @@ def _run_peer_check(queue, answers, buggy=False, hang=False, timeout=45):
         "CHECK_DEFERRED": object(), "_note_check_why": lambda *a: None,
         "_warn_check_flood": {"last": 0}, "secs": lambda s: "%ss" % s,
         "membership_check_delay": lambda: 0, "note": _async_note,
+        # هویتِ طرف (رفعِ «Could not find the input entity»): بدنه‌ی برش‌خورده
+        # این نام‌ها را می‌خواند. کلاینتِ جعلیِ این تست __call__ دارد و نه
+        # get_input_entity، پس resolver همان آیدیِ خامِ قبلی را می‌دهد.
+        "partner_input_peer": m.partner_input_peer,
+        "peer_identity": m.peer_identity,
+        "remember_peer": m.remember_peer,
+        "scan_dialogs_for_peer": m.scan_dialogs_for_peer,
+        "CHECK_NO_PEER": m.CHECK_NO_PEER,
     }
     exec(_peer_check_source(buggy), ns)
 

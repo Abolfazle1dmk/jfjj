@@ -95,6 +95,14 @@ def make_ns(ref, client):
         "secs": m.secs,
         # مهلتِ خودِ درخواستِ تلگرام — از خودِ 95.py تا تست با عددِ واقعی برود
         "CHECK_CALL_TIMEOUT_SEC": getattr(m, "CHECK_CALL_TIMEOUT_SEC", 45),
+        # هویتِ طرف (رفعِ «Could not find the input entity»): بدنه‌ی
+        # برش‌خورده این نام‌ها را می‌خواند. FakeClient این‌جا get_input_entity
+        # ندارد، پس resolver همان آیدیِ خامِ قبلی را برمی‌گرداند.
+        "partner_input_peer": m.partner_input_peer,
+        "peer_identity": m.peer_identity,
+        "remember_peer": m.remember_peer,
+        "scan_dialogs_for_peer": m.scan_dialogs_for_peer,
+        "CHECK_NO_PEER": m.CHECK_NO_PEER,
     }
     exec(block, ns)
     return eng, ns, notes, reasons
