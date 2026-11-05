@@ -118,6 +118,18 @@ def _start_health_server():
                            "manager: %s\nstarted: %s\n"
                            % (ver, commit, g.get("CODE_ID") or "?",
                               g.get("MANAGER_PATH") or "?", boot))
+                    # «زنده‌بودنِ واقعی»: پروسه بودن با جواب‌دادنِ ربات یکی نیست.
+                    try:
+                        _s = live_snapshot()
+                        txt += ("live: ready=%d ping_age=%s loop_age=%s fails=%d"
+                                % (1 if _s.get("ready") else 0,
+                                   _s.get("ping_age"), _s.get("loop_age"),
+                                   int(_s.get("fails") or 0)))
+                        if _s.get("last_error"):
+                            txt += " err=" + str(_s["last_error"])[:120]
+                        txt += "\n"
+                    except Exception:
+                        pass
                     return txt.encode("utf-8")
                 return b"JAFJ OK\n"
 
@@ -126,8 +138,19 @@ def _start_health_server():
                     path = (self.path or "/").split("?", 1)[0]
                 except Exception:
                     path = "/"
-                payload = self._payload(path)
-                self.send_response(200)
+                code = 200
+                if path in ("/livez", "/readyz"):
+                    # برای مانیتوری که باید ری‌استارت بدهد: اگر حلقه گیر
+                    # کرده یا پینگ‌ها پشتِ‌سرهم شکست خورده‌اند، ۵۰۳.
+                    # مسیرهای / و /healthz عمداً همان ۲۰۰ می‌مانند.
+                    try:
+                        code, state = livez_verdict()
+                    except Exception:
+                        code, state = 200, "ok"
+                    payload = (state + "\n").encode("utf-8")
+                else:
+                    payload = self._payload(path)
+                self.send_response(code)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(payload)))
                 self.send_header("Cache-Control", "no-store")
@@ -4476,6 +4499,18 @@ def last_death_report(data_dir, now_ts=None):
     free = hb.get("free")
     clients = hb.get("clients")
     hardy = f"حافظه‌ی آزاد {free}MB، {clients} سلف روشن"
+    # دو حالتی که خودِ «نگهبانِ سکوت» پروسه را بست؛ از OOM/Stopِ پنل جدا
+    # گفته می‌شوند، وگرنه مدیر فکر می‌کند رم کم آورده و دنبالِ علتِ اشتباه
+    # می‌رود.
+    stage = str(hb.get("stage") or "")
+    if stage == "hang-exit":
+        return ("🧯 اجرای قبلی **گیر کرده بود** — حلقه‌ی اصلی "
+                f"{age} ثانیه هیچ ضربانی نزد و نگهبان پروسه را بست "
+                "(ردِ stack‌ها: hang.log).")
+    if stage == "silence-exit":
+        return ("🧯 اجرای قبلی بالا بود ولی **به تلگرام جواب نمی‌داد** — "
+                "نگهبانِ سکوت خودش پروسه را ری‌استارت کرد "
+                "(crash.log → silence).")
     if clean and ex_code not in HARD_EXIT_CODES:
         if age > 600:
             return (f"ℹ️ سرویس حدودِ {age // 60} دقیقه خاموش بود (خروجِ "
@@ -4487,6 +4522,212 @@ def last_death_report(data_dir, now_ts=None):
     return (f"🧯 اجرای قبلی **بدونِ خروجِ تمیز** تمام شد — آخرین ضربان "
             f"{age} ثانیه پیش ({hardy}). یعنی پروسه ناگهانی کشته شده؛ "
             "معمولاً کمبودِ حافظه (OOM) یا Stop از پنل.")
+
+
+# ═══════════════════════════════════════════════════
+#  نگهبانِ سکوت — «پروسه روشن است، پنل هم می‌گوید online، ولی ربات جواب نمی‌دهد»
+#
+#  تفاوتِ این حالت با کرش این است که هیچ‌چیز نمی‌میرد: پروسه زنده است،
+#  وب‌سرورِ سلامت ۲۰۰ می‌دهد و میزبان هم دلیلی برای ری‌استارت نمی‌بیند؛ فقط
+#  اتصالِ MTProto نیمه‌باز مانده یا حلقه‌ی اصلی گیر کرده. از بیرون دقیقاً
+#  «منیجر آفلاین شد» دیده می‌شود — و چون کدی اجرا نشده، crash.log هم خالی
+#  است. دو نگهبان جلوی این را می‌گیرند:
+#
+#    ۱) liveness_loop (async): هر JAFJ_PING_SECS یک درخواستِ **واقعی** به
+#       تلگرام. شکستِ پیاپی: اول اتصالِ نیمه‌باز بسته می‌شود (serve_forever
+#       خودش دوباره وصل می‌کند و هندلرها می‌مانند)، و اگر باز هم جواب نداد
+#       پروسه با کدِ ۷۵ می‌بندد تا ناظر نسخه‌ی تازه با اتصالِ تازه بالا بیاورد.
+#    ۲) silence_watch (thread): اگر حلقه‌ی اصلی کاملاً قفل شود، ضربان کهنه
+#       می‌ماند؛ این thread ردِ stackِ همه‌ی تردها را در hang.log می‌نویسد و
+#       پروسه را می‌بندد — وگرنه سرور تا ابد «روشن» می‌ماند.
+# ═══════════════════════════════════════════════════
+LIVE = {
+    "boot": time.time(), "ready": False, "stopping": False,
+    "loop": 0.0, "ping": 0.0, "update": 0.0,
+    "ping_fail": 0, "last_err": "",
+}
+
+
+def _live_env_num(name, default, lo=0.0, hi=86400.0):
+    try:
+        v = float((os.environ.get(name) or "").strip() or default)
+    except Exception:
+        v = float(default)
+    return max(lo, min(hi, v))
+
+
+def ping_seconds():
+    """فاصله‌ی پینگِ تلگرام (۰ = نگهبانِ پینگ خاموش)."""
+    return _live_env_num("JAFJ_PING_SECS", 120.0, 0.0, 3600.0)
+
+
+def ping_timeout():
+    """هر پینگ چند ثانیه حق دارد بی‌جواب بماند تا «مرده» حساب شود."""
+    return _live_env_num("JAFJ_PING_TIMEOUT", 45.0, 5.0, 300.0)
+
+
+def hang_seconds():
+    """اگر حلقه‌ی اصلی این‌قدر ثانیه ضربان نزند، «گیر کرده» حساب می‌شود."""
+    return _live_env_num("JAFJ_HANG_SECS", 900.0, 0.0, 86400.0)
+
+
+def ping_reconnect_after():
+    """چند پینگِ ناموفقِ پیاپی → اتصال از نو بسته شود."""
+    return int(_live_env_num("JAFJ_PING_RECONNECT", 2.0, 1.0, 100.0))
+
+
+def ping_restart_after():
+    """چند پینگِ ناموفقِ پیاپی → پروسه ری‌استارت شود (کدِ ۷۵)."""
+    return int(_live_env_num("JAFJ_PING_RESTART", 4.0, 1.0, 1000.0))
+
+
+def mark_live(kind="loop", extra=None):
+    """یک «نشانه‌ی زنده‌بودنِ واقعی» ثبت کن (ارزان، هر خطایی بلعیده می‌شود).
+
+    kind: loop = حلقه‌ی اصلی کار می‌کند · ping = تلگرام جواب داد ·
+          update = پیامی از تلگرام رسید · ping_fail = پینگ شکست خورد.
+    """
+    try:
+        LIVE[kind] = time.time()
+    except Exception:
+        return
+    if kind == "ping_fail":
+        try:
+            LIVE["ping_fail"] = int((extra or {}).get("fails") or 0)
+            LIVE["last_err"] = str((extra or {}).get("err") or "")[:300]
+        except Exception:
+            pass
+    elif kind == "ping":
+        try:
+            LIVE["ping_fail"] = 0
+            LIVE["last_err"] = ""
+        except Exception:
+            pass
+
+
+def live_age(kind="loop", now_ts=None):
+    """چند ثانیه از آخرین نشانه‌ی این نوع گذشته (None = هرگز)."""
+    try:
+        ts = float(LIVE.get(kind) or 0)
+    except Exception:
+        ts = 0.0
+    if ts <= 0:
+        return None
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    return max(0.0, now_ts - ts)
+
+
+def live_snapshot():
+    """عکسِ لحظه‌ای از «زنده‌بودنِ واقعی» — برای /version، /livez و /diag."""
+    out = {
+        "ready": bool(LIVE.get("ready")),
+        "stopping": bool(LIVE.get("stopping")),
+        "fails": int(LIVE.get("ping_fail") or 0),
+        "last_error": str(LIVE.get("last_err") or ""),
+        "ping_age": None, "loop_age": None, "update_age": None,
+    }
+    for k in ("ping", "loop", "update"):
+        a = live_age(k)
+        if a is not None:
+            out[k + "_age"] = int(a)
+    return out
+
+
+def livez_verdict(snap=None, hang=None):
+    """(کد, وضعیت) — ۲۰۰ سالم، ۵۰۳ «پروسه هست ولی ربات کار نمی‌کند».
+
+    عمداً `/` و `/healthz` دست‌نخورده می‌مانند (میزبان‌ها و مانیتورِ بیرونی
+    به همان ۲۰۰ «JAFJ OK» وابسته‌اند و همین است که سرویس را بیدار نگه
+    می‌دارد)؛ این مسیرِ تازه برای مانیتوری است که باید **ری‌استارت** بدهد.
+    """
+    snap = snap or live_snapshot()
+    limit = hang_seconds() if hang is None else float(hang)
+    if limit <= 0 or not snap.get("ready") or snap.get("stopping"):
+        return 200, "ok"
+    age = snap.get("loop_age")
+    if age is not None and age >= limit:
+        return 503, "stalled"
+    if snap.get("fails") and snap.get("fails") >= ping_restart_after():
+        return 503, "silent"
+    return 200, "ok"
+
+
+def ping_verdict(fails, reconnect_at=None, restart_at=None):
+    """تصمیمِ نگهبان از تعدادِ پینگِ ناموفقِ پیاپی: ok/retry/reconnect/restart."""
+    f = int(fails or 0)
+    if f <= 0:
+        return "ok"
+    r = int(reconnect_at if reconnect_at is not None else ping_reconnect_after())
+    s = int(restart_at if restart_at is not None else ping_restart_after())
+    if s and f >= s:
+        return "restart"
+    if r and f >= r:
+        return "reconnect"
+    return "retry"
+
+
+def _ping_request():
+    """یک درخواستِ سبکِ تلگرام برای پینگ (None = نسخه‌ی تلگرام اجازه نمی‌دهد)."""
+    try:
+        from telethon.tl.functions.help import GetConfigRequest
+        return GetConfigRequest()
+    except Exception:
+        return None
+
+
+def _silence_evidence(limit, age):
+    """شاهدِ «گیر کردن» را جایی بنویس که بوتِ بعدی و /diag ببینند."""
+    txt = (f"حلقه‌ی اصلی {int(age)} ثانیه هیچ ضربانی نزد (حدِ مجاز "
+           f"{int(limit)}s) — پروسه زنده بود ولی کار نمی‌کرد.")
+    try:
+        import faulthandler
+        with open(os.path.join(str(BASE_DIR), "hang.log"), "a",
+                  encoding="utf-8", errors="ignore") as f:
+            f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} "
+                    f"pid={os.getpid()} host={HOST_LABEL} — {txt}\n")
+            faulthandler.dump_traceback(all_threads=True, file=f)
+    except Exception as e:
+        txt += f"\n(ذخیره‌ی stack ناموفق: {type(e).__name__}: {e})"
+    try:
+        log_crash("hang", txt)
+    except Exception:
+        pass
+    return txt
+
+
+def silence_watch(data_dir=None, step=None):
+    """thread: اگر حلقه‌ی اصلی از کار افتاد، پروسه را می‌بندد تا ناظر بالا بیاورد.
+
+    چرا thread و نه asyncio: خودِ حلقه‌ی اصلی موضوعِ مشکوک است؛ اگر قفل شده
+    باشد هیچ coroutine‌ای اجرا نمی‌شود. این thread از GIL جدا سود می‌برد و
+    در خواب‌های I/O هم اجرا می‌شود.
+    """
+    limit = hang_seconds()
+    if limit <= 0:
+        return
+    try:
+        step = float(step) if step else max(5.0, min(30.0, limit / 4.0))
+    except Exception:
+        step = max(5.0, min(30.0, limit / 4.0))
+    while True:
+        time.sleep(step)
+        if LIVE.get("stopping") or not LIVE.get("ready"):
+            continue
+        age = live_age("loop")
+        if age is not None and age < limit:
+            continue
+        if age is None:
+            age = 0.0
+        txt = _silence_evidence(limit, age)
+        print(f"  ⛔ {txt}\n     → پروسه با کدِ ۷۵ بسته می‌شود تا ناظر یک "
+              f"نسخه‌ی تازه بالا بیاورد (stack: hang.log)", flush=True)
+        try:
+            write_heartbeat(data_dir or BASE_DIR,
+                            {"stage": "hang-exit", "loop_age": int(age)})
+        except Exception:
+            pass
+        LIVE["stopping"] = True
+        os._exit(75)
 
 
 class Supervisor:
@@ -15423,6 +15664,9 @@ class Manager:
         if getattr(self, "_stopping", False):
             return
         self._stopping = True
+        # به نگهبانِ سکوت بگو «این خاموشیِ عمدی است» — وگرنه ممکن است وسطِ
+        # پشتیبانِ پایانی پروسه را با کدِ ۷۵ ببندد.
+        LIVE["stopping"] = True
         print("  📦 خاموشی — پشتیبان پایانی…", flush=True)
         try:
             n = 0
@@ -15641,6 +15885,9 @@ class Manager:
         _last_log = 0.0
         while True:
             try:
+                # «حلقه زنده است» — همین نشانه است که نگهبانِ سکوت (thread)
+                # کهنه‌شدنش را «گیر کردن» حساب می‌کند.
+                mark_live("loop")
                 free = mem_available_mb()
                 try:
                     running = self.sup.running_count()
@@ -15677,6 +15924,116 @@ class Manager:
             except Exception as e:
                 print(f"  ⚠️ ضربان: {type(e).__name__}", flush=True)
             await asyncio.sleep(HEARTBEAT_EVERY)
+
+    async def liveness_loop(self):
+        """هر JAFJ_PING_SECS یک درخواستِ واقعی به تلگرام — «پروسه هست، ربات مرده» نه.
+
+        چرا لازم بود: heartbeat_loop فقط ثابت می‌کند **asyncio** زنده است، نه
+        اینکه تلگرام جواب می‌دهد. با اتصالِ نیمه‌باز (NAT/فایروالِ میزبان
+        مسیر را می‌بندد، یا قطعیِ سمتِ تلگرام که FIN نمی‌فرستد) پروسه سالم
+        به‌نظر می‌رسد، `/healthz` هم ۲۰۰ می‌دهد، ولی هیچ پیامی جواب نمی‌گیرد.
+        روی Wispbyte این دقیقاً همان «بعد از مدتی استفاده آفلاین می‌شود» بود.
+        """
+        every = ping_seconds()
+        if every <= 0:
+            print("  ℹ️ نگهبانِ پینگ خاموش است (JAFJ_PING_SECS=0)", flush=True)
+            return
+        # کمی صبر تا اتصالِ اولیه و بازیابیِ بوت تمام شود.
+        await asyncio.sleep(min(45.0, every))
+        fails = 0
+        while True:
+            mark_live("loop")
+            ok, err = await self._ping_telegram()
+            if ok:
+                if fails:
+                    print(f"  ✅ ربات دوباره جواب می‌دهد (بعد از {fails} "
+                          f"پینگِ ناموفق)", flush=True)
+                fails = 0
+                mark_live("ping")
+            else:
+                fails += 1
+                mark_live("ping_fail", {"fails": fails, "err": err})
+                verdict = ping_verdict(fails)
+                print(f"  ⚠️ پینگِ تلگرام ناموفق ({fails}): {err} — "
+                      f"تصمیم: {verdict}", flush=True)
+                if verdict == "reconnect":
+                    await self._drop_stale_connection(err)
+                elif verdict == "restart":
+                    self._die_on_silence(fails, err)
+                    return
+            try:
+                await asyncio.sleep(every)
+            except asyncio.CancelledError:
+                raise
+
+    async def _ping_telegram(self):
+        """(سالم؟, خطا) — یک رفت‌وبرگشتِ واقعی با تلگرام، با مهلت."""
+        bot = getattr(self, "bot", None)
+        if bot is None:
+            return False, "کلاینت ساخته نشده"
+        try:
+            if hasattr(bot, "is_connected") and not bot.is_connected():
+                return False, "اتصال بسته است"
+        except Exception:
+            pass
+        timeout = ping_timeout()
+        try:
+            req = _ping_request()
+            if req is not None:
+                await asyncio.wait_for(bot(req), timeout=timeout)
+            else:
+                await asyncio.wait_for(bot.get_me(), timeout=timeout)
+            return True, ""
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            return False, f"بی‌پاسخ بعد از {int(timeout)}s"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    async def _drop_stale_connection(self, why=""):
+        """اتصالِ نیمه‌باز را ببند؛ خودِ serve_forever دوباره وصل می‌کند.
+
+        عمداً اینجا connect() صدا زده نمی‌شود: run_until_disconnected با همین
+        بستن برمی‌گردد و serve_forever همان نمونهٔ کلاینت را (با هندلرهای
+        حفظ‌شده) دوباره وصل می‌کند — دو مسئولِ اتصال، همان چیزی است که
+        «🔄 اتصال قطع شد»ِ بی‌پایان می‌ساخت.
+        """
+        print(f"  🔌 اتصالِ نیمه‌باز بسته می‌شود تا از نو ساخته شود ({why})",
+              flush=True)
+        try:
+            await asyncio.wait_for(self.bot.disconnect(), timeout=20)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  ⚠️ بستنِ اتصال: {type(e).__name__}: {e}", flush=True)
+
+    def _die_on_silence(self, fails, err):
+        """پروسه را با کدِ ۷۵ ببند تا ناظر یک نسخه‌ی تازه بالا بیاورد.
+
+        چرا خروج و نه «فقط لاگ کردن»: تا وقتی پروسه «روشن» است هیچ میزبانی
+        ری‌استارت نمی‌کند؛ نتیجه همان «آفلاین ماند تا دستی ری‌استارت کنم» بود.
+        """
+        detail = (f"ربات {fails} بار پیاپی به تلگرام جواب نداد: {err}\n"
+                  f"host={HOST_LABEL} build={BUILD_VERSION} "
+                  f"ping_every={int(ping_seconds())}s")
+        print(f"  ⛔ {detail}\n     → خروج با کدِ ۷۵ تا ناظر نسخه‌ی تازه "
+              f"بالا بیاورد", flush=True)
+        try:
+            log_crash("silence", detail)
+        except Exception:
+            pass
+        try:
+            write_heartbeat(BASE_DIR, {"stage": "silence-exit",
+                                       "fails": fails, "err": err})
+        except Exception:
+            pass
+        LIVE["stopping"] = True
+        try:
+            self.sup.shutdown()
+        except Exception:
+            pass
+        os._exit(75)
 
     async def backup_loop(self):
         """حلقه پشتیبان خودکار — هر backup_interval() یکبار، بیدار و اثرانگشت را چک می‌کند.
@@ -16289,6 +16646,43 @@ class Manager:
         return ok, msg
 
 
+    def live_diag_lines(self):
+        """«ربات واقعاً جواب می‌دهد؟» — سنِ پینگ، ضربان و آخرین پیام.
+
+        /diag قبلاً فقط می‌گفت پروسه بالا است و رم چقدر آزاد است؛ حالا اگر
+        اتصال مرده باشد (همان «آفلاین»ی که پنل نشان نمی‌دهد) همین‌جا معلوم
+        است، نه با آزمونِ «یک پیام بفرست ببین جواب می‌دهد یا نه».
+        """
+        out = []
+        try:
+            s = live_snapshot()
+        except Exception:
+            return out
+
+        def _age(a):
+            if a is None:
+                return "—"
+            if a < 90:
+                return f"{_fa_digits(int(a))} ثانیه پیش"
+            return f"{_fa_digits(int(a // 60))} دقیقه پیش"
+
+        tail = ""
+        if s.get("fails"):
+            err = self._esc(str(s.get("last_error") or "")[:60])
+            tail = (f" · ⚠️ {_fa_digits(s['fails'])} پینگِ ناموفقِ پیاپی"
+                    + (f" ({err})" if err else ""))
+        out.append(f"💓 ضربانِ ربات: پینگ {_age(s.get('ping_age'))} · "
+                   f"حلقه {_age(s.get('loop_age'))} · "
+                   f"آخرین پیام {_age(s.get('update_age'))}{tail}")
+        try:
+            code, state = livez_verdict(s)
+        except Exception:
+            code, state = 200, "ok"
+        if code != 200:
+            out.append(f"🩺 وضعیت: <b>{state}</b> — نگهبان در حالِ ری‌استارتِ "
+                       "ربات است (سلامتِ ظاهری کافی نیست)")
+        return out
+
     def _alive_notes(self, uid):
         """نکته‌های مهم درباره‌ی سلفی که «روشن» است ولی ممکن است کار نکند.
 
@@ -16535,6 +16929,7 @@ class Manager:
              (f"🔑 نیاز به لاگین: {_fa_digits(n_login)}"
               f" (کد نمی‌رود؛ /needlogin)" if n_login else "🔑 نیاز به لاگین: ۰"),
              *self.mem_diag_lines(free),
+             *self.live_diag_lines(),
              f"⏱ بالا: {up // 60} دقیقه"]
         try:
             sb_lines = self.selfbot_diag_lines()
@@ -16805,10 +17200,15 @@ class Manager:
         self._spawn_boot(notify_admins=False, why="بوت", startup=True)
         # ارجاع را نگه دار؛ وگرنه حلقهٔ پشتیبان ممکن است وسط کار جمع شود و بک‌آپ نرود.
         self._bg_tasks = []
-        for _coro in (self.heartbeat_loop(), self.duplicate_watch_loop(),
+        for _coro in (self.heartbeat_loop(), self.liveness_loop(),
+                      self.duplicate_watch_loop(),
                       self.reminder_loop(), self.points_loop(),
                       self.trial_loop()):
             self._bg_tasks.append(asyncio.create_task(_coro))
+        # از این لحظه «سکوت» معنا دارد: بوتِ اولیه (اتصال، بازیابی، بالا
+        # آوردنِ سلف‌ها) می‌تواند دقیقه‌ها طول بکشد و نباید گیر کردن شمرده شود.
+        LIVE["ready"] = True
+        mark_live("loop")
         # پشتیبان خودکار روی تلگرام
         try:
             if backup_target_raw():
@@ -16825,6 +17225,8 @@ class Manager:
 
         @self.bot.on(events.NewMessage(incoming=True))
         async def handler(ev):
+            # پیامِ تازه = بهترین شاهدِ اینکه اتصال واقعاً کار می‌کند.
+            mark_live("update")
             if not ev.is_private:
                 return
             # پیامی که موقع خاموشی فرستاده شده، پردازش نشود
@@ -17784,6 +18186,14 @@ def main():
               flush=True)
     except Exception:
         pass
+    # نگهبانِ سکوت: thread جدا، چون اگر خودِ حلقه‌ی asyncio قفل شود هیچ
+    # coroutine‌ای برای تشخیصِ آن اجرا نمی‌شود. تا LIVE["ready"] نشود کاری
+    # نمی‌کند (بوتِ اولیه نباید «سکوت» شمرده شود).
+    try:
+        threading.Thread(target=silence_watch, args=(BASE_DIR,),
+                         name="jafj-silence-watch", daemon=True).start()
+    except Exception as e:
+        print(f"  ⚠️ نگهبانِ سکوت بالا نیامد: {type(e).__name__}", flush=True)
     m = Manager()
     try:
         return asyncio.run(m.run())

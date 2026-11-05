@@ -197,6 +197,32 @@ MAX_CRASHES="${JAFJ_MAX_CRASHES:-5}"      # پشت‌سرهم → تحویل ب�
 NAP_BASE="${JAFJ_NAP_BASE:-5}"            # ثانیه، هر کرش ۵ تا بیشتر
 CRASH_WINDOW="${JAFJ_CRASH_WINDOW:-20}"   # کمتر از این = کرش سریع
 
+# ── never give up: روی میزبانی که خودش ری‌استارت نمی‌کند ───────────────────
+# «تسلیم شدن» روی Railway/Render درست است (پلتفرم خودش ری‌استارت می‌دهد و
+# دیپلوی بد را برمی‌گرداند). روی Wispbyte/hostless/blitz معنی‌اش این است:
+# پروسه می‌میرد، پنل «Offline» می‌ماند و هیچ‌کس دوباره استارتش نمی‌کند —
+# همان «بعد از مدتی استفاده آفلاین شد». با JAFJ_NEVER_GIVE_UP=1 (پیش‌فرضِ
+# بوت‌استرپِ همین ریپو روی Wispbyte) به‌جای مردن، خوابِ کوتاه می‌کنیم و
+# دوباره از صفر شروع می‌کنیم.
+_num_or() { case "$1" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac; }
+NEVER_GIVE_UP="${JAFJ_NEVER_GIVE_UP:-0}"
+case "$(printf '%s' "$NEVER_GIVE_UP" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) NEVER_GIVE_UP=1 ;;
+    *)             NEVER_GIVE_UP=0 ;;
+esac
+COOL_DOWN="$(_num_or "${JAFJ_COOL_DOWN:-300}" 300)"
+
+# خوابِ تکه‌تکه: با SIGTERM فوراً برمی‌گردیم. `sleep 300` یک‌تکه، خاموشیِ
+# دیپلوی را تا آخرِ خواب عقب می‌انداخت و میزبان با SIGKILL می‌بست.
+nap_wait() {
+    _left="$(_num_or "${1:-0}" 0)"
+    while [ "$_left" -gt 0 ] && [ "$STOPPING" != 1 ]; do
+        sleep 1
+        _left=$((_left - 1))
+    done
+    return 0
+}
+
 # ── keep-alive: «خروجِ تمیز» هم نباید سرویس را بخواباند ────────────────────
 # روی میزبان، مردنِ پروسه = سرویسِ مرده. اگر مدیر با کد ۰ تمام شود (مثلاً
 # اتصالِ تلگرام قطع شود و نسخه‌ی قدیمیِ کد مستقیم return 0 کند)، میزبان پیامِ
@@ -212,6 +238,11 @@ if [ -z "$KEEP_ALIVE" ]; then
     esac
 fi
 while :; do
+    # اگر وسطِ خواب سیگنالِ خاموشی آمد، مدیر را دوباره بالا نیاور.
+    if [ "$STOPPING" = 1 ]; then
+        stop_sync
+        exit 0
+    fi
     cd "$DATA_DIR" 2>/dev/null || true
     "$PY" "$MANAGER" &
     CHILD=$!
@@ -293,6 +324,12 @@ while :; do
         crashes=0
     fi
     if [ "$crashes" -ge "$MAX_CRASHES" ]; then
+        if [ "$NEVER_GIVE_UP" = "1" ]; then
+            log "manager crashed $crashes times in a row — NOT giving up (JAFJ_NEVER_GIVE_UP=1): nobody on this host would start it again, so the panel would just say Offline; cooling down ${COOL_DOWN}s then starting fresh"
+            crashes=0
+            nap_wait "$COOL_DOWN"
+            continue
+        fi
         log "manager crashed $crashes times in a row — giving up so Railway reports it"
         stop_sync
         exit "$code"
@@ -302,7 +339,5 @@ while :; do
         nap=60
     fi
     log "manager exited with code $code after ${ran}s — restarting in ${nap}s"
-    if [ "$nap" -gt 0 ]; then
-        sleep "$nap"
-    fi
+    nap_wait "$nap"
 done
