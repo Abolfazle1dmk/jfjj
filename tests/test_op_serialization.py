@@ -428,7 +428,12 @@ class WStub:
         return 15
 
 
-ph = {"m": m, "asyncio": asyncio, "time": time, "fa": m.fa}
+async def _warn_no_peer(*a, **k):
+    return None
+
+
+ph = {"m": m, "asyncio": asyncio, "time": time, "fa": m.fa,
+      "_CHECK_NO_PEER": m.CHECK_NO_PEER, "_warn_no_peer": _warn_no_peer}
 pharness = (
     "import asyncio, time\n"
     "async def _run(eng, x, stub, ex_cd, next_action_after):\n"
@@ -442,6 +447,10 @@ pharness = (
     "    note = stub.note\n"
     "    check_gate = stub.gate\n"
     "    unk_fallback = stub.unk_fallback\n"
+    # سنتینلِ «طرف قابلِ شناسایی نیست» + هشدارِ راهنمایش؛ بلوک‌های
+    # استخراج‌شده از 95.py این دو نام را می‌خوانند.
+    "    CHECK_NO_PEER = _CHECK_NO_PEER\n"
+    "    warn_peer_unresolvable = _warn_no_peer\n"
     + "\n".join("    " + ln for ln in ded.splitlines())
     + "\n"
 )
@@ -498,7 +507,8 @@ while lines and (lines[0].lstrip().startswith("#") or not lines[0].strip()):
 while lines and not lines[-1].strip():
     lines.pop()
 ded = "\n".join(ln[IND:] if ln.startswith(" " * IND) else ln for ln in lines)
-rh = {"m": m, "asyncio": asyncio, "time": time, "fa": m.fa}
+rh = {"m": m, "asyncio": asyncio, "time": time, "fa": m.fa,
+      "_CHECK_NO_PEER": m.CHECK_NO_PEER, "_warn_no_peer": _warn_no_peer}
 rharness = (
     "import time\n"
     "async def _run(eng, x, stub, ex_cd, next_action_after):\n"
@@ -512,6 +522,8 @@ rharness = (
     "    warn_membership_check_broken = stub.warn\n"
     "    check_gate = stub.gate\n"
     "    unk_fallback = stub.unk_fallback\n"
+    "    CHECK_NO_PEER = _CHECK_NO_PEER\n"
+    "    warn_peer_unresolvable = _warn_no_peer\n"
     + "\n".join("    " + ln for ln in ded.splitlines())
     + "\n"
 )

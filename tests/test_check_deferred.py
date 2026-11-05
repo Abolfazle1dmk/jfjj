@@ -147,6 +147,14 @@ def make(client_fn, blocked_until=0.0, gate_wait=0.0, gate_blocked=False,
         "_warn_check_flood": {"last": 0},
         # مهلتِ خودِ درخواستِ تلگرام (ثابتِ سطح‌ماژول در 95.py)
         "CHECK_CALL_TIMEOUT_SEC": ns_mod.get("CHECK_CALL_TIMEOUT_SEC", 45),
+        # هویتِ طرف: این بدنه از 95.py برش خورده و این نام‌ها را می‌خواند.
+        # کلاینتِ جعلیِ این تست فقط __call__ دارد، پس resolver به همان
+        # آیدیِ خامِ قبلی برمی‌گردد (رفتارِ قدیمی حفظ می‌شود).
+        "partner_input_peer": ns_mod["partner_input_peer"],
+        "peer_identity": ns_mod["peer_identity"],
+        "remember_peer": ns_mod["remember_peer"],
+        "scan_dialogs_for_peer": ns_mod["scan_dialogs_for_peer"],
+        "CHECK_NO_PEER": ns_mod["CHECK_NO_PEER"],
     }
     exec(fn_src, ns)
     return ns, calls

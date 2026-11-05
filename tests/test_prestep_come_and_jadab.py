@@ -337,6 +337,11 @@ def make_guard():
         "    unk_fallback = stub.unk_fallback\n"
         "    watch_delay_seconds = stub.watch_delay\n"
         "    next_action_after = lambda rec, base=None: int(base)\n"
+        # سنتینلِ «طرف قابلِ شناسایی نیست» + هشدارش (بلوکِ استخراج‌شده
+        # از 95.py این دو را می‌خواند)
+        "    CHECK_NO_PEER = m.CHECK_NO_PEER\n"
+        "    async def warn_peer_unresolvable(*a, **k):\n"
+        "        return None\n"
         "    asyncio = stub.asyncio\n"
         "    now_rem = int(time.time())\n"
         + "\n".join("    " + ln for ln in guard_ded.splitlines()) + "\n")

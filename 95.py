@@ -768,12 +768,40 @@ class _CheckDeferred:
 
 CHECK_DEFERRED = _CheckDeferred()
 
+
+class _CheckNoPeer:
+    """نتیجه‌ی «طرف برای این اکانت قابلِ شناسایی نیست» (نه «عضو نیست»).
+
+    چرا لازم شد: `GetParticipantRequest(channel, user_id)` برای آیدیِ خام به
+    کشِ entity در سشنِ تلگرام تکیه می‌کند. اگر آن کش خالی باشد — بعد از
+    لاگینِ دوباره، بازسازیِ سشن، یا رکوردی که طرف دیگر هیچ پیامی نداده —
+    Telethon خطای زیر را می‌دهد و همیشه تکرار می‌کند:
+
+        ValueError: Could not find the input entity for PeerUser(user_id=…)
+
+    قبلاً این خطا «نامشخص» حساب می‌شد: رکورد بی‌نهایت هر ۱۰ دقیقه دوباره
+    چک می‌شد، شمارنده‌ی unk_streak می‌سوخت و پیامِ «بررسی عضویت نامشخص
+    می‌ماند» تکرار می‌شد، در حالی که مشکل اصلاً سمتِ کانال نبود. حالا این
+    حالت جدا است: رکورد با عقب‌نشینیِ بلند کنار می‌رود و یک‌بار علتش با
+    راهِ حل به صاحب‌حساب گفته می‌شود.
+    """
+    __slots__ = ()
+
+    def __repr__(self):
+        return "CHECK_NO_PEER"
+
+
+CHECK_NO_PEER = _CheckNoPeer()
+
 # آخرین علتِ «نامشخص» بودنِ چکِ عضویت — تا هشدار و پنل، علتِ واقعی را
 # بگویند نه یک متنِ کلیِ «FloodWait یا محدودیت API». مقادیر:
 #   ""             → علتی ثبت نشده (آخرین چک قطعی بوده)
 #   "deferred: …"  → درخواستی نرفت (نوبتِ صف/گیت) — «نامشخص» نیست
 #   متنِ دیگر      → خطای واقعیِ همان لحظه (FloodWait / نامِ کلاسِ خطا)
 _LAST_CHECK_WHY = {"why": "", "at": 0}
+
+# آخرین هشدارِ «طرف قابلِ شناسایی نیست» (حداکثر هر ۳۰ دقیقه).
+_warn_no_peer = {"last": 0}
 
 
 def _note_check_why(why):
@@ -907,8 +935,37 @@ def capacity_diag(records, own_channels=()):
     return d
 
 
+def summarize_failures(reasons, limit=3):
+    """گروه‌بندیِ کوتاهِ دلایلِ شکستِ لفت: ['۴× FloodWait 63s', …].
+
+    چرا: پیامِ «۶ لفت را امتحان کردم اما هیچ‌کدام موفق نشد» بدونِ علت،
+    کاربر را مجبور می‌کرد کلِ لاگ را بگردد و در عمل هم گمراه‌کننده بود —
+    بخشی از آن «۶ تلاش» می‌توانست timeoutِ صف یا توقفِ زمانیِ دور باشد، نه
+    ردشدنِ واقعیِ تلگرام.
+    """
+    counts, order = {}, []
+    for r in (reasons or []):
+        txt = str(r or "").replace("\n", " ").strip()
+        if not txt:
+            txt = "علت ثبت نشد"
+        key = re.sub(r"\d+", "#", txt)[:80]
+        if key not in counts:
+            counts[key] = [0, txt]
+            order.append(key)
+        counts[key][0] += 1
+    out = []
+    for key in sorted(order, key=lambda k: -counts[k][0])[:max(1, int(limit))]:
+        n, sample = counts[key]
+        out.append(f"{fa(n)}× {sample[:90]}")
+    rest = len(order) - len(out)
+    if rest > 0:
+        out.append(f"و {fa(rest)} علتِ دیگر — در لاگ")
+    return out
+
+
 def format_capacity_cleanup_note(left_links, target, stopped=None,
-                                 diag=None, relax=0, failed_count=0):
+                                 diag=None, relax=0, failed_count=0,
+                                 failed_reasons=None):
     """خلاصه‌ی یک‌پیامیِ فرایند پاکسازی سقف (به‌جای نوتیف per لفت).
 
     `diag` (خروجیِ ``capacity_diag``) و `relax` برای حالتی است که هیچ
@@ -920,8 +977,10 @@ def format_capacity_cleanup_note(left_links, target, stopped=None,
     if n == 0:
         if failed_count:
             out = [f"🧹 برای آزادکردنِ سقف، {fa(failed_count)} لفت را امتحان کردم "
-                   "اما هیچ‌کدام با موفقیت انجام نشد؛ این بار دیگر نمی‌گویم "
-                   "«کاندیدی نبود». علتِ هر شکست در گزارش/لاگ ثبت شده است."]
+                   "اما هیچ‌کدام با موفقیت انجام نشد. علت‌ها:"]
+            out += [f"  • {line}" for line in summarize_failures(failed_reasons)]
+            if stopped:
+                out.append(f"⏹ دورِ پاکسازی هم زودتر تمام شد: {stopped}")
         else:
             out = ["🧹 سقف عضویت تلگرام پر بود ولی هیچ تبادلِ کامل‌شده‌ی امنی "
                    "برای لفت پیدا نشد."]
@@ -1213,6 +1272,12 @@ CREATE TABLE IF NOT EXISTS exchange (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     peer_id INTEGER,
     peer_name TEXT,
+    -- هویتِ خودِ طرف (نه کانالش). GetParticipantRequest برای آیدیِ خام به
+    -- کشِ entity در سشن تکیه می‌کند؛ با ذخیره‌ی access_hash/یوزرنیم، چکِ
+    -- عضویت دیگر به آن کش وابسته نیست (خطای «Could not find the input
+    -- entity for PeerUser» دقیقاً همان‌جا ساخته می‌شد).
+    peer_hash INTEGER,
+    peer_username TEXT,
     link TEXT NOT NULL UNIQUE,
     channel_title TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
@@ -1275,6 +1340,10 @@ class DB:
                               ("claim_joined", "INTEGER NOT NULL DEFAULT 0"),
                               ("unk_streak", "INTEGER NOT NULL DEFAULT 0"),
                               ("chat_id", "INTEGER"), ("chat_hash", "INTEGER"),
+                              # هویتِ طرف: بدونِ این، چکِ عضویت بعد از هر
+                              # لاگینِ دوباره به ValueError می‌خورد.
+                              ("peer_hash", "INTEGER"),
+                              ("peer_username", "TEXT"),
                               ("leave_fail", "INTEGER NOT NULL DEFAULT 0"),
                               ("leave_blocked_until", "INTEGER NOT NULL DEFAULT 0"),
                               # «طرف برگشت و جوینِ کانال من شد» — فقط برای
@@ -1461,17 +1530,81 @@ class DB:
                        (ts,), "one")["c"]
 
     # ---------- تبادل ----------
-    def ex_add(self, peer_id, peer_name, link):
-        """برمی‌گرداند (رکورد, آیا_جدید_بود)"""
+    def ex_add(self, peer_id, peer_name, link, peer_hash=None, peer_username=None):
+        """برمی‌گرداند (رکورد, آیا_جدید_بود)
+
+        peer_hash/peer_username: هویتِ خودِ طرف (نه کانالش). اگر از اول ذخیره
+        شود، چکِ عضویت هیچ‌وقت به کشِ entity در سشن نیاز پیدا نمی‌کند.
+        """
         cur = self.ex_by_link(link)
         if cur:
+            upd = {}
             if peer_id and not cur.get("peer_id"):
-                self.ex_set(cur["id"], peer_id=peer_id, peer_name=peer_name)
+                upd.update(peer_id=peer_id, peer_name=peer_name)
+            if peer_hash and not cur.get("peer_hash"):
+                upd["peer_hash"] = int(peer_hash)
+            if peer_username and not cur.get("peer_username"):
+                upd["peer_username"] = str(peer_username).lstrip("@")[:64]
+            if upd:
+                self.ex_set(cur["id"], **upd)
                 cur = self.ex_get(cur["id"])
             return cur, False
-        self._x("INSERT INTO exchange (peer_id,peer_name,link,created_at)"
-                " VALUES (?,?,?,?)", (peer_id, peer_name, link, int(time.time())))
+        self._x("INSERT INTO exchange (peer_id,peer_name,peer_hash,peer_username,"
+                "link,created_at) VALUES (?,?,?,?,?,?)",
+                (peer_id, peer_name,
+                 int(peer_hash) if peer_hash else None,
+                 (str(peer_username).lstrip("@")[:64] if peer_username else None),
+                 link, int(time.time())))
         return self.ex_by_link(link), True
+
+    def ex_peer_missing_count(self):
+        """چند رکوردِ فعال هیچ هویتی از طرف ندارند (peer_hash خالی)؟
+
+        برای /diag: همین رکوردها هستند که چکِ عضویتشان با
+        «Could not find the input entity for PeerUser» می‌افتد.
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM exchange WHERE status<>'rejected' "
+                "AND COALESCE(peer_hash,0)=0").fetchone()
+            return int(row[0] or 0)
+        except Exception:
+            return 0
+
+    def ex_note_peer(self, peer_id, access_hash=None, username=None):
+        """هویتِ طرف را روی رکوردهایش ثبت کن (بدونِ بازنویسیِ مقدارِ موجود).
+
+        هر پیامی که طرف می‌فرستد، entityِ او (با access_hash) در دست است؛
+        همان‌جا ذخیره می‌شود تا چکِ عضویتِ بعدی — حتی بعد از لاگینِ دوباره
+        که کشِ سشن خالی است — بدونِ خطا کار کند.
+        برمی‌گرداند تعدادِ رکوردهایی که عوض شدند.
+        """
+        try:
+            pid = int(peer_id)
+        except (TypeError, ValueError):
+            return 0
+        if not pid:
+            return 0
+        sets, args = [], []
+        if access_hash:
+            sets.append("peer_hash=?")
+            args.append(int(access_hash))
+        if username:
+            sets.append("peer_username=?")
+            args.append(str(username).lstrip("@")[:64])
+        if not sets:
+            return 0
+        # فقط رکوردهایی که این اطلاعات را ندارند و هنوز «مرده» نشده‌اند.
+        sql = ("UPDATE exchange SET " + ",".join(sets) +
+               " WHERE peer_id=? AND status<>'rejected'"
+               " AND (peer_hash IS NULL OR peer_hash=0)")
+        try:
+            with self.lock:
+                c = self.conn.execute(sql, tuple(args) + (pid,))
+                self.conn.commit()
+                return int(c.rowcount or 0)
+        except Exception:
+            return 0
 
     def ex_by_link(self, link):
         if not link:
@@ -2602,6 +2735,167 @@ def _input_channel(cid, chash=None):
             return SimpleNamespace(id=raw_id, access_hash=int(chash or 0))
         except Exception:
             return None
+
+
+def _input_user(uid, uhash=None):
+    """InputPeerUser از آیدی/access_hashِ خودِ طرف.
+
+    چرا لازم است: `GetParticipantRequest(channel, user_id)` اگر پارامتر یک
+    عددِ خام باشد، Telethon برایش `get_input_entity` صدا می‌زند و آن هم فقط
+    از کشِ entity در سشن جواب می‌دهد؛ اگر کش خالی باشد (لاگینِ دوباره،
+    بازسازیِ سشن، رکوردِ قدیمی) این خطا بالا می‌آید:
+
+        ValueError: Could not find the input entity for PeerUser(user_id=…)
+
+    با InputPeerUser (و access_hashِ ذخیره‌شده) درخواست بدونِ کش ساخته
+    می‌شود. در محیطِ تست که telethon نیست، شیمِ سبک برمی‌گردد.
+    """
+    try:
+        raw_id = int(uid)
+    except (TypeError, ValueError):
+        return None
+    if not raw_id:
+        return None
+    if not uhash:
+        return None
+    try:
+        from telethon.tl.types import InputPeerUser
+        return InputPeerUser(raw_id, int(uhash))
+    except Exception:
+        try:
+            from types import SimpleNamespace
+            return SimpleNamespace(user_id=raw_id, access_hash=int(uhash))
+        except Exception:
+            return None
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  هویتِ طرفِ تبادل — چرا ماژول‌سطح است: چکِ عضویت با
+#  `GetParticipantRequest(channel, user_id)` برای آیدیِ خام به کشِ entity در
+#  سشنِ تلگرام تکیه می‌کند و بعد از لاگینِ دوباره/بازسازیِ سشن با این خطا
+#  می‌افتد: `ValueError: Could not find the input entity for PeerUser(…)`.
+#  این توابع هویت را از رکورد (access_hash/یوزرنیم) یا از خودِ اکانت
+#  می‌سازند تا درخواست هیچ‌وقت به آن کش وابسته نباشد.
+# ─────────────────────────────────────────────────────────────────────
+DIALOG_PEER_SCAN_LIMIT = 3000
+DIALOG_PEER_SCAN_CACHE_SEC = 600
+
+
+def peer_identity(rec):
+    """(uid, access_hash, username) از رکوردِ تبادل — هرچه موجود است."""
+    if not rec:
+        return None, 0, ""
+    try:
+        uid = int(rec.get("peer_id") or 0) or None
+    except (TypeError, ValueError):
+        uid = None
+    try:
+        uhash = int(rec.get("peer_hash") or 0)
+    except (TypeError, ValueError):
+        uhash = 0
+    uname = str(rec.get("peer_username") or "").strip().lstrip("@")
+    return uid, uhash, uname
+
+
+async def remember_peer(eng, uid, ent):
+    """هویتِ طرف را از یک entity تلگرام روی رکوردهایش ذخیره کن."""
+    if not uid or ent is None:
+        return 0
+    try:
+        return eng.db.ex_note_peer(uid,
+                                   getattr(ent, "access_hash", None),
+                                   getattr(ent, "username", None))
+    except Exception:
+        return 0
+
+
+async def scan_dialogs_for_peer(client, eng, uid, max_age=None):
+    """طرف را از میانِ دیالوگ‌های همین اکانت پیدا کن (با کش).
+
+    چرا: بدونِ access_hash، هیچ درخواستِ GetParticipant با آیدیِ خالص
+    ساخته نمی‌شود. کاربری که یک‌بار به ربات پیام داده در دیالوگ‌ها هست و
+    همان‌جا access_hash دارد؛ یک اسکن (حتی روی اکانتِ ۵۰۰ کانالی) از
+    چرخه‌ی بی‌پایانِ «بررسی عضویت نامشخص» بهتر است.
+    """
+    try:
+        uid = int(uid)
+    except (TypeError, ValueError):
+        return None
+    walker = getattr(client, "iter_dialogs", None)
+    if walker is None:
+        return None
+    max_age = DIALOG_PEER_SCAN_CACHE_SEC if max_age is None else float(max_age)
+    now_t = time.time()
+    cache = getattr(eng, "_dialog_peers", None)
+    at = float(getattr(eng, "_dialog_peers_at", 0) or 0)
+    if cache is None or (now_t - at) > max_age:
+        cache = {}
+        seen = 0
+        try:
+            async for d in walker(limit=DIALOG_PEER_SCAN_LIMIT):
+                seen += 1
+                e = getattr(d, "entity", None)
+                if e is None or not getattr(e, "id", None):
+                    continue
+                if getattr(e, "access_hash", None) is None:
+                    continue
+                cache[int(e.id)] = e
+        except Exception as e:
+            try:
+                eng.log("warn", "ex_peer_scan", f"{type(e).__name__}: {e}")
+            except Exception:
+                pass
+        try:
+            eng._dialog_peers = cache
+            eng._dialog_peers_at = now_t
+            eng.log("info", "ex_peer_scan_done",
+                    f"{len(cache)} طرف از {seen} دیالوگ")
+        except Exception:
+            pass
+    return cache.get(uid)
+
+
+async def partner_input_peer(client, eng, user_id, rec=None):
+    """(peer, دلیل) — InputPeerUser برای طرف، بدونِ تکیه بر کشِ سشن.
+
+    ترتیبِ حل: access_hashِ ذخیره‌شده → کشِ سشن → یوزرنیمِ ذخیره‌شده →
+    اسکنِ دیالوگ‌ها. اگر هیچ‌کدام جواب نداد، (None, دلیل) برمی‌گردد تا
+    فراخوان `CHECK_NO_PEER` بدهد (نه «نامشخص» و نه «عضو نیست»).
+    """
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return None, "آیدیِ طرف نامعتبر است"
+    if not uid:
+        return None, "آیدیِ طرف خالی است"
+    _uid, uhash, uname = peer_identity(rec)
+    p = _input_user(uid, uhash)
+    if p is not None:
+        return p, ""
+    getter = getattr(client, "get_input_entity", None)
+    if getter is None:
+        # کلاینتِ جعلی/testing: همان رفتارِ قبلی (آیدیِ خام) کافی است.
+        return uid, ""
+    try:
+        ent = await getter(uid)
+        if ent is not None:
+            return ent, ""
+    except Exception:
+        pass
+    if uname and hasattr(client, "get_entity"):
+        try:
+            ent = await client.get_entity("@" + uname)
+            await remember_peer(eng, uid, ent)
+            return ent, ""
+        except Exception:
+            pass
+    ent = await scan_dialogs_for_peer(client, eng, uid)
+    if ent is not None:
+        await remember_peer(eng, uid, ent)
+        return ent, ""
+    return None, (f"طرف (user_id={uid}) برای این اکانت قابلِ شناسایی نیست: "
+                  "نه access_hash ذخیره شده، نه یوزرنیم دارد، نه در "
+                  "دیالوگ‌ها پیدا شد")
 
 
 def is_invite(link):
@@ -6093,6 +6387,15 @@ class Engine:
                     _whyy = "در انتظار نوبت"
                 lines.append(f"🕵️ چکِ نامشخص: {fa(_unkn)}"
                              + (f" · {_whyy}" if _whyy else ""))
+            try:
+                _noid = self.db.ex_peer_missing_count()
+            except Exception:
+                _noid = 0
+            if _noid:
+                lines.append(
+                    f"🪪 طرف‌های بدونِ هویت: {fa(_noid)} — برایشان access_hash "
+                    "ذخیره نشده؛ یک پیام از طرف یا اسکنِ دیالوگ‌ها حلش "
+                    "می‌کند (وگرنه چکِ عضویت «قابلِ شناسایی نیست» می‌شود)")
         else:
             lines.append("🔁 تبادل: خاموش")
 
@@ -7342,6 +7645,29 @@ async def connect_and_run(eng, creds):
                        "نمی‌شود: نه «نیومدی» می‌رود نه لفت خودکار انجام "
                        "می‌شود.")
 
+    async def warn_peer_unresolvable(now, uid=None):
+        """یک‌بار در نیم‌ساعت: «طرف دیگر برای این اکانت قابلِ شناسایی نیست».
+
+        این با «بررسی عضویت نامشخص» یکی نیست و نباید با همان لحن تکرار شود:
+        مشکل سمتِ کانال نیست، هویتِ خودِ طرف (access_hash) برای این سشن در
+        دسترس نیست. راهِ حل هم عملی است، پس همان گفته می‌شود.
+        """
+        if int(now) - int(_warn_no_peer["last"] or 0) < 1800:
+            return
+        _warn_no_peer["last"] = int(now)
+        who = f" (آیدی {uid})" if uid else ""
+        await note(
+            "🪪 یکی از طرف‌های تبادل" + who + " برای این اکانت **قابلِ "
+            "شناسایی نیست** — تلگرام برای آیدیِ خامش به این سشن "
+            "access_hash نمی‌دهد (معمولاً بعد از لاگینِ دوباره یا وقتی طرف "
+            "هیچ پیامی به این اکانت نداده).\n"
+            "همین بود که چکِ عضویت با "
+            "`ValueError: Could not find the input entity` می‌افتاد؛ "
+            "«عضو نیست» نبود.\n"
+            "• رکوردش را ۱ ساعت کنار گذاشتم (امتیاز/استرایک کم نمی‌شود).\n"
+            "• اگر طرف یک پیامِ تازه به این اکانت بدهد، خودکار حل می‌شود.\n"
+            "• وگرنه دستی چک کن: `تبادل لیست` → همان رکورد.")
+
     # ---------- هوش مصنوعی ----------
     async def handle_ai(event, arg, reply_text=None):
         a = eng.ai
@@ -8028,6 +8354,28 @@ async def connect_and_run(eng, creds):
     # ══════════════════════════════════════════════════
     #  تبادل دوطرفه
     # ══════════════════════════════════════════════════
+    # طرف‌هایی که در همین اجرا هویتشان ذخیره شده — تا هر پیام یک UPDATE
+    # روی جدولِ تبادل نزند.
+    _peer_identity_saved = set()
+
+    async def save_peer_identity(sender):
+        """هویتِ فرستنده (access_hash/یوزرنیم) را برای چکِ عضویت ذخیره کن.
+
+        هر پیامی که طرف می‌فرستد، entityِ او در دست است؛ همان‌جا یک‌بار
+        ذخیره می‌شود تا اگر بعداً سشن عوض شد، چکِ عضویت به خطای
+        «Could not find the input entity» نخورد.
+        """
+        try:
+            uid = int(getattr(sender, "id", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        if not uid or uid in _peer_identity_saved:
+            return 0
+        if not getattr(sender, "access_hash", None):
+            return 0
+        _peer_identity_saved.add(uid)
+        return await remember_peer(eng, uid, sender)
+
     async def peer_in_my_channel(user_id, rec_id=None, queue=True):
         """عضو کانال عادی یا VIP هست؟ True / False / None(نامشخص)
         همه‌ی درخواست‌ها از CheckGate رد می‌شوند تا فلود «الکی» نسازد.
@@ -8052,6 +8400,16 @@ async def connect_and_run(eng, creds):
         saw_false = False
         saw_unknown = False
         saw_deferred = False
+        saw_no_peer = False
+        # رکوردِ همین طرف: منبعِ access_hash/یوزرنیم برای ساختنِ InputPeerUser.
+        rec_row = None
+        try:
+            if rec_id and hasattr(eng.db, "ex_get"):
+                rec_row = eng.db.ex_get(int(rec_id))
+            if not rec_row and hasattr(eng.db, "ex_by_peer"):
+                rec_row = eng.db.ex_by_peer(user_id)
+        except Exception:
+            rec_row = None
         for ch in chans:
             async def _one_req():
                 # درون قفل: درخواستِ منتظر صف باید FloodWait جدید را هم ببیند.
@@ -8094,9 +8452,19 @@ async def connect_and_run(eng, creds):
                             return None
                         channel_peer = ent
                         cache[ch] = ent
+                # طرف را قبل از درخواست حل کن: آیدیِ خام فقط از کشِ سشن
+                # جواب می‌دهد و همان چیزی بود که «ValueError: Could not find
+                # the input entity for PeerUser» را برای همیشه می‌ساخت.
+                upeer, why_no_peer = await partner_input_peer(client, eng,
+                                                            user_id, rec_row)
+                if upeer is None:
+                    _note_check_why(why_no_peer)
+                    eng.log("warn", "ex_check_no_peer",
+                            f"user={user_id} — {why_no_peer}")
+                    return CHECK_NO_PEER
                 try:
                     result = await asyncio.wait_for(
-                        client(GetParticipantRequest(channel_peer, user_id)),
+                        client(GetParticipantRequest(channel_peer, upeer)),
                         timeout=CHECK_CALL_TIMEOUT_SEC)
                 except asyncio.TimeoutError:
                     # «نامشخص» بهتر از «خوابِ ابدی» است: حلقه‌ی بالا این را
@@ -8183,6 +8551,8 @@ async def connect_and_run(eng, creds):
                 saw_false = True
             elif out is CHECK_DEFERRED:
                 saw_deferred = True
+            elif out is CHECK_NO_PEER:
+                saw_no_peer = True
             else:
                 saw_unknown = True
 
@@ -8193,6 +8563,11 @@ async def connect_and_run(eng, creds):
             return None
         if saw_deferred:
             return CHECK_DEFERRED
+        if saw_no_peer and not saw_false:
+            # هیچ درخواستی با آیدیِ خام ساخته نشد؛ «عضو نیست» نیست، «قابلِ
+            # بررسی نیست» است. حلقه‌ها این را جدا و با عقب‌نشینیِ بلند
+            # مدیریت می‌کنند (نه شمارنده‌ی «نامشخص»).
+            return CHECK_NO_PEER
         return False if saw_false else None
 
     async def confirm_peer_membership(user_id, fast=False, rec_id=None,
@@ -8490,8 +8865,45 @@ async def connect_and_run(eng, creds):
                                 "یک‌بار لینک/آیدیِ عمومیِ کانال را بفرست یا "
                                 "از خودِ تلگرام دستی خارج شو.")
                 remember_channel(rec_id, ent)
-            await client(LeaveChannelRequest(ent))
-            return True, ""
+
+            async def _leave_with(entity):
+                await client(LeaveChannelRequest(entity))
+
+            try:
+                await _leave_with(ent)
+                return True, ""
+            except Exception as first_err:
+                # access_hashِ ذخیره‌شده می‌تواند کهنه باشد (کانال مهاجرت
+                # کرده/لینک عوض شده) و آن‌وقت هر لفت با CHANNEL_INVALID رد
+                # می‌شود — در حالی که با لینک هنوز قابلِ حل است. یک‌بار با
+                # لینک حل کن و هویت را تازه کن؛ وگرنه رکورد تا ابد «لفت
+                # نشد» می‌مانَد و سقفِ کانال‌ها هم آزاد نمی‌شود.
+                if input_from_record() is None:
+                    raise
+                fresh = None
+                try:
+                    fresh = await client.get_entity(link)
+                except Exception:
+                    if is_invite(link):
+                        try:
+                            from telethon.tl.functions.messages import CheckChatInviteRequest
+                            info = await client(CheckChatInviteRequest(invite_hash(link)))
+                            fresh = getattr(info, "chat", None)
+                        except Exception:
+                            fresh = None
+                    if fresh is None:
+                        try:
+                            fresh = await resolve_by_title()
+                        except Exception:
+                            fresh = None
+                if fresh is None:
+                    raise first_err
+                remember_channel(rec_id, fresh)
+                eng.log("info", "ex_leave_refresh",
+                        f"{link}: هویتِ ذخیره‌شده کار نکرد "
+                        f"({type(first_err).__name__}) — با لینک دوباره")
+                await _leave_with(fresh)
+                return True, ""
 
         try:
             return await ex_cd.action("leave", rec_id, _do_leave)
@@ -8591,6 +9003,7 @@ async def connect_and_run(eng, creds):
         left_at = int(time.time())
         had_outbound = False
         attempted = 0
+        fail_reasons = []          # علتِ هر شکست، برای خلاصه‌ی پایانِ دور
         round_started = time.time()
         for cand in candidates:
             # سقفِ زمانی: دورِ طولانی صفِ تبادل را در انحصار می‌گیرد و پاسخ
@@ -8607,6 +9020,7 @@ async def connect_and_run(eng, creds):
             attempted += 1
             ok, err = await leave_link(cand.get("link"), cand.get("id"))
             if not ok:
+                fail_reasons.append(err)
                 eng.log("warn", "ex_capacity_leave_fail",
                         f"#{cand.get('id')} {cand.get('link')}: {err}")
                 if isinstance(err, str) and "FloodWait" in err:
@@ -8632,7 +9046,8 @@ async def connect_and_run(eng, creds):
         try:
             await note(format_capacity_cleanup_note(
                 left_links, target, stopped, relax=relax_used,
-                failed_count=max(0, attempted - len(left_links))))
+                failed_count=max(0, attempted - len(left_links)),
+                failed_reasons=fail_reasons))
         except Exception:
             pass
         if not left_links:
@@ -9137,6 +9552,9 @@ async def connect_and_run(eng, creds):
             return
         sender_name = (f"@{sender.username}" if getattr(sender, "username", None)
                        else (getattr(sender, "first_name", "") or str(sender.id)))
+        # یک‌بار هویتِ طرف را برای چکِ عضویت ذخیره کن؛ بدونِ این، هر چک بعد
+        # از لاگینِ دوباره با «Could not find the input entity» می‌افتاد.
+        await save_peer_identity(sender)
 
         # پیام‌های عادی PV فقط برای تحلیل/تشخیص هستند؛ AI هیچ پاسخ خودکاری نمی‌فرستد.
         if event.is_private and not extract_links(body_text) and not claim:
@@ -9811,6 +10229,18 @@ async def connect_and_run(eng, creds):
                                                           fast=True,
                                                           rec_id=rec["id"],
                                                           confirm=False)
+                    if still is CHECK_NO_PEER:
+                        # «قابلِ شناسایی نیست» ≠ «عضو نیست». نه استرایک، نه
+                        # شمارنده‌ی نامشخص؛ فقط عقب‌نشینیِ بلند + یک هشدارِ
+                        # راهنما. (این حلقه قبلاً تا ابد هر ۱۰ دقیقه همین
+                        # رکورد را دوباره چک می‌کرد.)
+                        eng.db.ex_set(rec["id"],
+                                      next_reminder=next_action_after(
+                                          rec, int(time.time()) + 3600),
+                                      note="طرف قابلِ شناسایی نیست — ۱ ساعت صبر")
+                        await warn_peer_unresolvable(int(time.time()),
+                                                     rec.get("peer_id"))
+                        continue
                     if still is None and unk_fallback(rec):
                         still = False
                     now2 = int(time.time())
@@ -9904,6 +10334,17 @@ async def connect_and_run(eng, creds):
                                 eng.db.ex_set(rec["id"], next_reminder=next_action_after(
                                     rec, int(time.time()) + membership_check_delay()),
                                     note="لفت معلق — عضویت نامشخص است")
+                                continue
+                            if _conf is CHECK_NO_PEER:
+                                # هویتِ طرف برای این سشن در دسترس نیست → «عضو
+                                # نیست» ثابت نشده. لفت نده (قبلاً همین حالت از
+                                # زنجیره‌ی if بیرون می‌افتاد و بی‌تأیید لفت
+                                # می‌داد)، فقط یک ساعت بعد دوباره.
+                                eng.db.ex_set(rec["id"], next_reminder=next_action_after(
+                                    rec, int(time.time()) + 3600),
+                                    note="لفت معلق — طرف قابلِ شناسایی نیست")
+                                await warn_peer_unresolvable(int(time.time()),
+                                                             rec.get("peer_id"))
                                 continue
                             # وضعیتِ تازه: اگر رکورد دیگر در حالت joined
                             # نیست (لفتِ مسیر دیگر/دستی)، دوباره لفت نزن.
@@ -10076,6 +10517,13 @@ async def connect_and_run(eng, creds):
                     still = await confirm_peer_membership(rec["peer_id"],
                                                           rec_id=rec["id"],
                                                           confirm=False)
+                    if still is CHECK_NO_PEER:
+                        eng.db.ex_set(rec["id"], last_check=int(time.time()),
+                                      next_check=int(time.time()) + 6 * 3600,
+                                      note="طرف قابلِ شناسایی نیست — بررسی ۶ ساعت دیگر")
+                        await warn_peer_unresolvable(int(time.time()),
+                                                     rec.get("peer_id"))
+                        continue
                     if still is None and unk_fallback(rec):
                         still = False
                     now = int(time.time())
@@ -10152,6 +10600,13 @@ async def connect_and_run(eng, creds):
                                 eng.db.ex_set(rec["id"], next_check=next_action_after(
                                     rec, int(time.time()) + membership_check_delay()),
                                     note="لفت معلق — عضویت نامشخص است")
+                                continue
+                            if _conf is CHECK_NO_PEER:
+                                eng.db.ex_set(rec["id"], next_check=next_action_after(
+                                    rec, int(time.time()) + 6 * 3600),
+                                    note="لفت معلق — طرف قابلِ شناسایی نیست")
+                                await warn_peer_unresolvable(int(time.time()),
+                                                             rec.get("peer_id"))
                                 continue
                             # وضعیتِ تازه را از دیتابیس بخوان: اگر بینِ این
                             # تصمیم و چکِ قبلی، رکورد از حالت joined خارج شده

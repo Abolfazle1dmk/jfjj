@@ -1,6 +1,6 @@
 # نقشهٔ کامل تست‌ها — چه چیزی واقعاً تست شده، چه چیزی فقط ادعا شده
 
-> جمع‌بندی: **۹۴ فایل تست / ۲۹٬۳۰۰ خط تست**.
+> جمع‌بندی: **۹۵ فایل تست / ۲۹٬۴۰۰ خط تست**.
 > وضعیت فعلی: **همه سبز** (`python3 tests/test_<name>.py`، تک‌تک اجرا شده؛
 > `test_tutorial_hub.py` که در نسخهٔ قبلی این جدول «قرمز» بود الان سبز است).
 > اجرا: `python3 tests/test_<name>.py` (هر فایل مستقل و self-contained است؛ نیازی به pytest نیست).
@@ -80,7 +80,8 @@
 | سشن/لاگین خودکار (**ممنوعیتِ اسپمِ کدِ ورود**) | `no_login_code_spam`، `login_bot`، `railway_selfbot_bootstrap` | عمیق (sqlite واقعی + fake telethon) |
 | احراز مالکیت فروشگاه | `claim_flow_fixes`، `claim_text` | عمیق |
 | پشتیبان‌گیری/بازیابی GitHub→تلگرام | `backup_restore`، `backup_single_message` | عمیق (حمل‌ونقل جعلی) |
-| موتور تعویض اکانت + سریال‌سازی عملیات | `op_serialization`، `exchange_group_gate`، `exchange_notjoined_flow`، `exchange_reply_timing`، `say_dedup`، `saved_panel` | عمیق |
+| موتور تعویض اکانت + سریال‌سازی عملیات | `op_serialization`، `exchange_group_gate`، `exchange_notjoined_flow`، `exchange_reply_timing`، `peer_entity_resolution`، `say_dedup`، `saved_panel` | عمیق |
+| هویتِ طرفِ تبادل (**«Could not find the input entity»**) | `peer_entity_resolution`، `check_deferred`، `check_gate_flood`، `capacity_cleanup` | عمیق (sqlite واقعی + رزولورِ واقعی) |
 | فلوت تطبیقی/مدارشکن/گپ | `spacing_algorithm`، `check_gate_flood`، `flood_circuit_breaker`، `round2_update` | عمیق |
 | پاسخ خودکار متن آزاد | `unknown_fallback` | عمیق |
 | پنل و سیستم آموزش | `menu_tutorials`، `tutorial`، `tutorial_presets`، `tutorial_sections`، `tutorial_hub` | عمیق |
@@ -117,6 +118,7 @@
 
 | تست | چه چیزی را اجرا و راستی‌آزمایی می‌کند | سبک |
 |---|---|---|
+| `test_peer_entity_resolution.py` | **«ValueError: Could not find the input entity for PeerUser(…)» / رکوردی که هر ۱۰ دقیقه «نامشخص» می‌شد**: `_input_user` (بدونِ access_hash هیچ peer ساخته نمی‌شود)؛ ستون‌های `peer_hash`/`peer_username` در ساخت و مهاجرتِ sqliteِ واقعی؛ `ex_add` هویت را از اول ذخیره می‌کند و `ex_note_peer` هویتِ رکوردهای قدیمی را پر می‌کند (بدونِ بازنویسی، بدونِ دست‌زدن به `rejected`)؛ `ex_peer_missing_count` برای خطِ `/diag`؛ رفتارِ **واقعیِ** `partner_input_peer` در هر چهار پله (access_hashِ رکورد → کشِ سشن → یوزرنیم → اسکنِ دیالوگ‌ها) و خروجیِ «قابلِ شناسایی نیست» وقتی هیچ‌کدام جواب ندهد؛ جدا بودنِ `CHECK_NO_PEER` از «نامشخص» و «نرفت»؛ سیم‌کشی (`GetParticipantRequest(channel_peer, upeer)`، ذخیره‌ی هویتِ هر پیام، عدمِ لفتِ بی‌تأیید)؛ گروه‌بندیِ علت‌های شکستِ لفت در پیامِ خلاصه؛ و تلاشِ دوباره‌ی لفت با هویتِ تازه وقتی `access_hash` کهنه است | رفتاری + تأیید متن |
 | `test_boot_smoke.py` | خودِ `95.py` در پوشه‌ی موقت با یک `telethon` بدلی اجرا می‌شود (بدونِ شبکه): تا «شروعِ اتصال» می‌رسد، سشنِ نامعتبر را می‌فهمد و با کدِ ۷۸ خارج می‌شود؛ بدونِ telethon با کدِ ۷۱ و `jafj_boot_error.txt` (نه مرگِ خاموش) | رفتاری (زیرفرایند واقعی) |
 | `test_boot_diagnostics.py` | `_boot_step` (ثبت و حذفِ تکرار)، `boot_last_step`، `record_boot_crash` (Traceback + pid + cwd + آخرین مرحله)، `main()` ⇒ کدِ ۷۰ و آزادشدنِ قفل؛ اجرای `tools/doctor_fa.py` روی پوشه‌ی خالی/خراب/سالم و `looks_like_selfbot_proc` | رفتاری |
 | `test_wispbyte_main.py` | `main.py`ِ میزبان در دو نسخه: `redact` (توکن گیت در لاگ نرود)، `sync_code` با شکستِ fetch (⛔ + `stale` + کامیت)، هشدارِ اختلافِ `95.py`ِ ریشه با `code/`، پاسخِ `/health` با `commit/stale/deps`، پوشه‌ی داده‌ی غیرقابلِ‌نوشتن، و مرگِ صریح بدونِ `telethon`؛ + اسکنِ AST که هیچ رشته‌ای موجودیتِ HTML نداشته باشد | رفتاری |
