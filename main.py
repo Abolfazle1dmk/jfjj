@@ -504,6 +504,11 @@ def build_env(py):
     env["JAFJ_SELFBOT_REF"] = str(CODE_DIR / SELF_NAME)
     env["JAFJ_SUPERVISE"] = env.get("JAFJ_SUPERVISE", "1")
     env["JAFJ_KEEP_ALIVE"] = env.get("JAFJ_KEEP_ALIVE", "1")
+    # روی Wispbyte هیچ‌کس پروسه‌ی مرده را دوباره استارت نمی‌کند: «تسلیم شدنِ»
+    # ناظر یعنی پنل تا ابد Offline می‌ماند. پس اینجا (بر خلافِ Railway که
+    # خودش ری‌استارت/rollback دارد) پیش‌فرض «هیچ‌وقت تسلیم نشو» است.
+    env["JAFJ_NEVER_GIVE_UP"] = env.get("JAFJ_NEVER_GIVE_UP", "1")
+    env["JAFJ_COOL_DOWN"] = env.get("JAFJ_COOL_DOWN", "300")
     env["PORT"] = env.get("PORT", "8080")
     env["PATH"] = str(Path(py).parent) + os.pathsep + env.get("PATH", "")
     # PATH مهم است: 95.py برای نصب خودکار telethon (اگر لازم شد) از همین
