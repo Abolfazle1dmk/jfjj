@@ -4171,7 +4171,7 @@ RESUME_AT_NAME = ".jafj_resume_at"
 LAST_EXIT_NAME = ".jafj_last_exit"
 HEARTBEAT_NAME = ".jafj_heartbeat"       # «اجرای قبلی چطور مرد؟»
 HEARTBEAT_EVERY = 60
-RAM_GATE_MB = 60                         # زیرِ این مقدار، سلفِ تازه بالا نمی‌آید
+RAM_GATE_MB = 150                        # حاشیه‌ی امن برای کانتینرهای کم‌حافظه؛ پیش از سلفِ تازه
 HARD_EXIT_CODES = (137, 143, -9, 9)      # SIGKILL/OOM، SIGTERM، kill
 RECENT_CONNECT_WINDOW = 180              # ثانیه
 MAX_GRACE = 900
@@ -4512,6 +4512,10 @@ class Supervisor:
         # قفلِ «بالا آوردنِ همه» — بوتِ خودکار و بازیابیِ دستی نباید هم‌زمان
         # یک سرویس را دو بار ری‌استارت کنند.
         self.boot_lock = threading.Lock()
+        # شروعِ دستیِ چند اکانت می‌تواند از event loop و thread بوت هم‌زمان
+        # برسد. چکِ RAM بدون این قفل race می‌شود و چند شارد می‌توانند هم‌زمان
+        # از همان فضای آزاد استفاده کنند.
+        self._start_lock = threading.RLock()
         os.makedirs(CLIENTS_DIR, exist_ok=True)
 
     # ---------- «باید روشن بماند» ----------
@@ -5130,6 +5134,43 @@ class Supervisor:
         return bool(p and p.poll() is None)
 
     def start(self, uid):
+        """شروعِ اتمیک؛ چکِ حافظه و ساختِ پروسه‌ها با هم race نکنند."""
+        with self._start_lock:
+            return self._start_one(uid)
+
+    def _ram_gate_failure(self, uid):
+        """اگر حاشیه‌ی RAM کم است، قبل از کارهای پرهزینه شروع را رد کن."""
+        _ok_ram, _free, _limit = ram_gate_check()
+        if _ok_ram:
+            return None
+        try:
+            self.db.log(uid, "ram_gate", f"free={_free} limit={_limit}")
+        except Exception:
+            pass
+        try:
+            _run = self.running_count()
+        except Exception:
+            _run = None
+        try:
+            _kids = self.children_rss()
+            _kid_tot = int(round(sum(k[2] for k in _kids))) if _kids else 0
+        except Exception:
+            _kid_tot = 0
+        _short = max(0, int(round(float(_limit) - float(_free))))
+        return self._why(
+            uid, "manager",
+            f"حافظه‌ی آزاد کافی نیست: {int(_free)} مگابایت "
+            f"(حدِ لازم {int(_limit)} — {_short} مگابایت کم است). "
+            + (f"الان {_run} سلف روشن است و روی‌هم {_kid_tot} مگابایت "
+               "می‌خورند. " if _run else "")
+            + "یا یکی-دو سلف را خاموش کن، یا پلن/سقفِ حافظه را بالا "
+            "ببر، یا `JAFJ_MIN_FREE_MB` را پایین‌تر بگذار (مثلاً ۳۰) — "
+            "ولی زیرِ ۳۰ خطرِ OOM و خوابیدنِ کلِ سرور هست؛ نگهبان برای "
+            "همین گذاشته شده. (خاموش‌کردنِ کاملِ نگهبان: "
+            "JAFJ_MIN_FREE_MB=0)",
+            hint="کمبودِ حافظه")
+
+    def _start_one(self, uid):
         self.last_failure.pop(uid, None)
         if self.is_running(uid):
             return True, "از قبل روشن بود"
@@ -5137,6 +5178,11 @@ class Supervisor:
             return self._why(uid, "manager",
                              "ظرفیت اجرای همزمان تکمیل است "
                              f"({self.running_count()}/{self.cfg['max_clients']})")
+        # اول حاشیه‌ی RAM را بررسی کن؛ حتی probe وابستگی‌ها، بازسازیِ فایلِ
+        # نشست و بالا آوردنِ شارد می‌توانند در میزبانِ ۶۱۲MB جهش کوتاه بسازند.
+        _ram_failure = self._ram_gate_failure(uid)
+        if _ram_failure is not None:
+            return _ram_failure
         folder = self.folder(uid)
         _sess_file = os.path.join(folder, "jafj.session")
         if not os.path.exists(_sess_file):
@@ -5209,36 +5255,6 @@ class Supervisor:
                 self.db.log(uid, "deps_missing", f"python={sys.executable}")
             except Exception:
                 pass
-        # ── نگهبانِ حافظه: با RAMِ ته‌کشیده سلفِ تازه بالا نیاید ──
-        # (وگرنه OOM کلِ کانتینر را می‌خوابانَد و همه‌ی سرویس‌ها می‌روند)
-        _ok_ram, _free, _limit = ram_gate_check()
-        if not _ok_ram:
-            try:
-                self.db.log(uid, "ram_gate", f"free={_free} limit={_limit}")
-            except Exception:
-                pass
-            try:
-                _run = self.running_count()
-            except Exception:
-                _run = None
-            try:
-                _kids = self.children_rss()
-                _kid_tot = int(round(sum(k[2] for k in _kids))) if _kids else 0
-            except Exception:
-                _kid_tot = 0
-            _short = max(0, int(round(float(_limit) - float(_free))))
-            return self._why(
-                uid, "manager",
-                f"حافظه‌ی آزاد کافی نیست: {int(_free)} مگابایت "
-                f"(حدِ لازم {int(_limit)} — {_short} مگابایت کم است). "
-                + (f"الان {_run} سلف روشن است و روی‌هم {_kid_tot} مگابایت "
-                   "می‌خورند. " if _run else "")
-                + "یا یکی-دو سلف را خاموش کن، یا پلن/سقفِ حافظه را بالا "
-                "ببر، یا `JAFJ_MIN_FREE_MB` را پایین‌تر بگذار (مثلاً ۳۰) — "
-                "ولی زیرِ ۳۰ خطرِ OOM و خوابیدنِ کلِ سرور هست؛ نگهبان برای "
-                "همین گذاشته شده. (خاموش‌کردنِ کاملِ نگهبان: "
-                "JAFJ_MIN_FREE_MB=0)",
-                hint="کمبودِ حافظه")
         logf = open(os.path.join(folder, "run.log"), "a", encoding="utf-8")
         # هدرِ کامل: بدونِ این، «چرا بالا نیامد» فقط با آزمون و خطا فهمیده
         # می‌شد. حالا خودِ لاگ می‌گوید با چه مفسر/مسیری اجرا شده.

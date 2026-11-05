@@ -14,6 +14,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -45,12 +46,12 @@ def main():
         import manager_82 as M
 
         # ── ۱) تنظیمِ حد ───────────────────────────────────────────────
-        check("ram_gate: پیش‌فرض ۶۰ مگابایت", M.ram_gate_mb({}) == 60.0,
+        check("ram_gate: پیش‌فرض ۱۵۰ مگابایت", M.ram_gate_mb({}) == 150.0,
               M.ram_gate_mb({}))
         check("ram_gate: مقدارِ دلخواه", M.ram_gate_mb({"JAFJ_MIN_FREE_MB": "120"}) == 120.0)
         check("ram_gate: صفر = بی‌نگهبان", M.ram_gate_mb({"JAFJ_MIN_FREE_MB": "0"}) == 0.0)
         check("ram_gate: مقدارِ خراب → پیش‌فرض",
-              M.ram_gate_mb({"JAFJ_MIN_FREE_MB": "abc"}) == 60.0)
+              M.ram_gate_mb({"JAFJ_MIN_FREE_MB": "abc"}) == 150.0)
         check("ram_gate: منفی → صفر", M.ram_gate_mb({"JAFJ_MIN_FREE_MB": "-5"}) == 0.0)
         check("ram_gate: سقف دارد", M.ram_gate_mb({"JAFJ_MIN_FREE_MB": "99999"}) == 8192.0)
 
@@ -60,7 +61,17 @@ def main():
         ok, free, limit = M.ram_gate_check({})
         check("ram_gate_check: با ۲۰MB آزاد اجازه نمی‌دهد", ok is False, (ok, free))
         check("ram_gate_check: حافظه و حد را برمی‌گرداند",
-              free == 20.0 and limit == 60.0, (free, limit))
+              free == 20.0 and limit == 150.0, (free, limit))
+        M.mem_available_mb = lambda: 100
+        ok100, free100, limit100 = M.ram_gate_check({})
+        check("ram_gate_check: با ۱۰۰MB آزاد زیرِ حاشیه‌ی امن است",
+              ok100 is False and free100 == 100 and limit100 == 150,
+              (ok100, free100, limit100))
+        M.mem_available_mb = lambda: 160
+        ok160, free160, limit160 = M.ram_gate_check({})
+        check("ram_gate_check: با ۱۶۰MB آزاد از حاشیه عبور می‌کند",
+              ok160 is True and free160 == 160 and limit160 == 150,
+              (ok160, free160, limit160))
         ok0, _, _ = M.ram_gate_check({"JAFJ_MIN_FREE_MB": "0"})
         check("ram_gate_check: با حدِ صفر همیشه اجازه می‌دهد", ok0 is True)
         M.mem_available_mb = lambda: 500
@@ -110,6 +121,30 @@ def main():
             sup.stop(uid)
         except Exception:
             pass
+
+        # شروع‌ها از بوت‌ترد و هندلرهای کاربر ممکن است هم‌زمان برسند؛
+        # چکِ RAM باید با خودِ ساختِ سلف سریال شود.
+        active = [0]
+        peak = [0]
+        active_lock = threading.Lock()
+        original_start_one = sup._start_one
+        def fake_start_one(_uid):
+            with active_lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.05)
+            with active_lock:
+                active[0] -= 1
+            return True, "fake"
+        sup._start_one = fake_start_one
+        threads = [threading.Thread(target=sup.start, args=(1000 + i,))
+                   for i in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        sup._start_one = original_start_one
+        check("start: شش درخواست هم‌زمان سریال می‌شوند", peak[0] == 1, peak[0])
 
         # ── ۴ب) اندازه‌گیریِ واقعیِ مصرفِ هر سلف ──────────────────────
         me = M.proc_rss_mb(os.getpid())
