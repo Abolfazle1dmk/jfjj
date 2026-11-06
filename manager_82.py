@@ -3947,6 +3947,8 @@ class ShardDaemon(ForkDaemon):
         self._probe_inflight = False
         self._probe_last = 0.0
         self._probe_seq = 0
+        self.last_spawn_uncertain = False
+        self._pending_uids = set()      # run sent but no reliable answer yet
 
     def forker_path(self):
         d = os.path.dirname(os.path.abspath(self.selfbot))
@@ -3992,25 +3994,38 @@ class ShardDaemon(ForkDaemon):
 
     def spawn(self, cwd, log, uid, timeout=90):
         with self._lock:
+            self.last_spawn_uncertain = False
             if not self.alive():
                 self.uids.clear()
                 with self._status_lock:
+                    self._pending_uids.clear()
                     self._account_status.clear()
                     self._status_verified_at.clear()
             if not self.start():
                 return None, self.last_error or "شارد بالا نیامد"
+            # Once a run may have been sent, neither a timeout nor a write
+            # error proves it did not start. Reserve the UID before sending;
+            # a later correlated ping can confirm absence without duplicates.
+            uid = str(uid)
+            self.uids[uid] = int(self.proc.pid)
+            self.uid_exits.pop(uid, None)
+            with self._status_lock:
+                self._pending_uids.add(uid)
+                self._account_status[uid] = True
+                self._status_verified_at.pop(uid, None)
+            self.last_spawn_uncertain = True
             try:
                 self._send({"cmd": "run", "cwd": str(cwd), "log": str(log),
-                            "uid": str(uid)})
+                            "uid": uid})
             except Exception as e:
                 return None, f"{type(e).__name__}: {e}"
             msg = self._read_ok(timeout=timeout, expected_uid=uid)
             if not msg or not msg.get("ok"):
                 return None, (msg or {}).get("error") or "پاسخِ شارد نیامد"
-            uid = str(uid)
             self.uids[uid] = int(msg.get("pid") or 0)
-            self.uid_exits.pop(uid, None)
+            self.last_spawn_uncertain = False
             with self._status_lock:
+                self._pending_uids.discard(uid)
                 self._account_status[uid] = True
                 self._status_verified_at[uid] = time.monotonic()
             return self.uids[uid], ""
@@ -4038,9 +4053,15 @@ class ShardDaemon(ForkDaemon):
                     accounts = {str(x) for x in msg["accounts"]}
                     with self._status_lock:
                         checked_at = time.monotonic()
-                        for uid in self.uids:
+                        for uid in list(self.uids):
                             self._account_status[uid] = uid in accounts
                             self._status_verified_at[uid] = checked_at
+                            if uid in self._pending_uids:
+                                # A ping is ordered after the run request. If
+                                # absent, release this provisional reservation.
+                                if uid not in accounts:
+                                    self.uids.pop(uid, None)
+                                self._pending_uids.discard(uid)
                     return accounts
         return None
 
@@ -4071,6 +4092,10 @@ class ShardDaemon(ForkDaemon):
         with self._status_lock:
             # هنگام جواب ندادن شارد، بی‌دلیل نسخهٔ دوم از سشن اجرا نکن.
             return self._account_status.get(uid, True)
+
+    def start_is_unconfirmed(self, uid):
+        with self._status_lock:
+            return str(uid) in self._pending_uids
 
     def recently_confirmed_alive(self, uid, max_age=120):
         """وضعیت نامطمئن برای اجرای نسخهٔ دوم کافی نیست؛ برای شارژ هم کافی نیست."""
@@ -4104,19 +4129,23 @@ class ShardDaemon(ForkDaemon):
                 msg = self._read_msg(max(0.1, end - time.time()))
                 if msg is None:
                     break
-                if msg.get("uid") == uid and "ok" in msg:
+                # A delayed run acknowledgement also has uid/ok, but its
+                # pid distinguishes it from a stop acknowledgement.
+                if msg.get("uid") == uid and "ok" in msg and "pid" not in msg:
                     ok = bool(msg.get("ok"))
                     if not ok:
-                        # رشته نمرد → کلِ شارد را ببند (بقیه ری‌استارت می‌شوند)
+                        # Until the shard actually exits, stopping is unconfirmed.
                         try:
                             self.proc.terminate()
                         except Exception:
                             pass
+                        return False
                     self.uids.pop(uid, None)
                     with self._status_lock:
+                        self._pending_uids.discard(uid)
                         self._account_status[uid] = False
                     return True
-        self.uids.pop(uid, None)
+        # Do not forget a potentially running account on a missing response.
         return False
 
 
@@ -5580,6 +5609,9 @@ class Supervisor:
     def _start_one(self, uid):
         self.last_failure.pop(uid, None)
         if self.is_running(uid):
+            proc = self.procs.get(uid)
+            if isinstance(proc, _ShardProc) and proc.daemon.start_is_unconfirmed(uid):
+                return self._why(uid, "manager", "وضعیت اجرای سلف هنوز تأیید نشده است.")
             return True, "از قبل روشن بود"
         if self.mgr and self.running_count() >= int(self.cfg["max_clients"]):
             return self._why(uid, "manager",
@@ -5686,6 +5718,22 @@ class Supervisor:
                     folder, os.path.join(folder, "run.log"), uid)
                 if _pid:
                     p = _ShardProc(_pid, _sd, uid)
+                elif _sd.last_spawn_uncertain and _sd.alive():
+                    # A run request may have succeeded: keep a handle so status
+                    # checks can resolve it, rather than starting a second copy.
+                    self.procs[uid] = _ShardProc(_sd.proc.pid, _sd, uid)
+                    self._write_pid(uid, _sd.proc.pid)
+                    # Do not later charge time from before this uncertain start.
+                    try:
+                        if self.mgr and self.mgr.shop and not self.mgr.has_sub(uid):
+                            self.mgr.shop.p_reset_charge(uid)
+                    except Exception:
+                        pass
+                    logf.close()
+                    return self._why(uid, "manager",
+                        "پاسخ شارد برای اجرای سلف نرسید؛ وضعیت نامشخص است "
+                        "و برای حفاظت از سشن نسخهٔ دیگری اجرا نشد.",
+                        hint="وضعیت شارد نامشخص")
                 else:
                     self._shard_broken = True
                     try:
@@ -5818,9 +5866,12 @@ class Supervisor:
             # اکانتِ داخلِ shard: کشتنِ گروهِ پروسه یعنی کشتنِ همه‌ی اکانت‌های
             # همان شارد. باید از خودِ شارد بخواهیم فقط همین یکی را ببندد.
             try:
-                p.remote_stop()
+                stopped = p.remote_stop()
             except Exception:
-                pass
+                stopped = False
+            if not stopped:
+                # Keep both the process handle and pid file until confirmed.
+                return False, "خاموش شدن سلف تأیید نشد؛ اطلاعات و سشن حفظ شد."
             self.procs.pop(uid, None)
             self._clear_pid(uid)
             self.db.log(uid, "stop")
@@ -5920,7 +5971,9 @@ class Supervisor:
     def wipe_jafj_settings(self, uid, max_accounts=1, recreate_defaults=True):
         """پاک کردن کامل تنظیمات جفج + تنظیمات تبادل + دیتابیس تبادل/صف (با حفظ سشن و اشتراک)."""
         was_running = self.is_running(uid)
-        self.stop(uid)
+        stopped, why = self.stop(uid)
+        if not stopped:
+            return {"removed_files": 0, "was_running": was_running, "error": why}
         self.last_failure.pop(uid, None)
         self._resume_fail.pop(uid, None)
         folder = os.path.join(CLIENTS_DIR, str(uid))
@@ -5959,7 +6012,9 @@ class Supervisor:
     def wipe_folder(self, uid):
         """توقف کامل سلف و حذف کل پوشه‌ی کاربر (سشن، تنظیمات جفج، تنظیمات و دیتابیس تبادل، بکاپ‌ها و لاگ‌ها)."""
         self.is_running(uid)
-        self.stop(uid)
+        stopped, _why = self.stop(uid)
+        if not stopped:
+            return None  # no files or database rows may be removed yet
         self.procs.pop(uid, None)
         self.last_failure.pop(uid, None)
         self._resume_fail.pop(uid, None)
@@ -5976,7 +6031,9 @@ class Supervisor:
         return removed
 
     def restart(self, uid):
-        self.stop(uid)
+        stopped, why = self.stop(uid)
+        if not stopped:
+            return False, why
         time.sleep(1)
         return self.start(uid)
 
@@ -6231,7 +6288,12 @@ class Supervisor:
                 if not force_restart and not self._code_changed_since_start(uid):
                     n += 1          # با همین کد اجرا می‌شود؛ دست نزن
                     continue
-                self.stop(uid)
+                stopped, stop_why = self.stop(uid)
+                if not stopped:
+                    skipped += 1
+                    skip_why.append((uid, stop_why))
+                    self.db.log(uid, "boot_skip", stop_why)
+                    continue
                 time.sleep(0.4)
             ok, why = self.allowed(uid)
             if not ok:
@@ -7587,7 +7649,10 @@ class Manager:
         was_running = self.sup.is_running(uid)
         was_started = bool((self.db.get(uid) or {}).get("started_at"))
         if was_running:
-            self.sup.stop(uid)
+            stopped, why = self.sup.stop(uid)
+            if not stopped:
+                return await self.say(chat, "❌ سلف قبلی هنوز متوقف نشده؛ "
+                                      "سشن قبلی تغییر نکرد. " + why)
 
         name = (me.first_name or "") + (f" @{me.username}" if me.username else "")
         if trial:
@@ -8457,9 +8522,14 @@ class Manager:
         """شروع استاندارد با تفکیک خطای مدیر از خطای خود سلف."""
         was_running = self.sup.is_running(uid)
         if restart:
-            self.sup.stop(uid)
+            stopped, why = self.sup.stop(uid)
+            if not stopped:
+                return False, why, ""
             time.sleep(0.2)
         elif was_running:
+            proc = self.sup.procs.get(uid)
+            if isinstance(proc, _ShardProc) and proc.daemon.start_is_unconfirmed(uid):
+                return False, "وضعیت اجرای سلف هنوز تأیید نشده است.", ""
             return True, "از قبل روشن بود", ""
 
         ok, msg = self.sup.start(uid)
@@ -8757,6 +8827,8 @@ class Manager:
             mx = 1
         res = await self._backup_run_blocking(
             self.sup.wipe_jafj_settings, tid, mx, bool(self.db.get(tid)))
+        if res.get("error"):
+            return False, "❌ پاک‌کردن انجام نشد؛ " + res["error"], res
         restarted = False
         if res["was_running"] and (self.db.get(tid) or {}).get("session"):
             allow, _why = self.can_run(tid)
@@ -8795,6 +8867,8 @@ class Manager:
             self._login_notified.pop(tid, None)
         js = self.sup.jafj_summary(tid)
         removed_files = await self._backup_run_blocking(self.sup.wipe_folder, tid)
+        if removed_files is None:
+            return False, "❌ سلف متوقف نشد؛ اطلاعات کاربر پاک نشد.", {}
         db_counts = self.db.delete_user(tid)
         shop_counts = self.shop.delete_user(tid) if self.shop else {
             "orders": 0, "wallet": 0, "points": 0, "tickets": 0, "referrals": 0}
