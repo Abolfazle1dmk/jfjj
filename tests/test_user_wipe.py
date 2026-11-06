@@ -241,8 +241,12 @@ INNER = textwrap.dedent('''
             json.dump(st, f, ensure_ascii=False)
         with open(os.path.join(folder, "jafj_creds.json"), "w", encoding="utf-8") as f:
             json.dump({"phone": "+989121112233"}, f)
-        with open(os.path.join(folder, "jafj.session"), "wb") as f:
-            f.write(b"SQLite format 3\\x00fake")
+        # یک سشن sqlite واقعی؛ هدر جعلی و دیتابیس خراب نباید بک‌آپ سالم را جایگزین کند.
+        sess = sqlite3.connect(os.path.join(folder, "jafj.session"))
+        sess.execute("CREATE TABLE IF NOT EXISTS session_data (value TEXT)")
+        sess.execute("INSERT INTO session_data VALUES ('synthetic')")
+        sess.commit()
+        sess.close()
         with open(os.path.join(folder, "jafj_status.json"), "w", encoding="utf-8") as f:
             json.dump({"ts": int(time.time()), "exchange": {"on": True, "joined": 5}}, f)
         with open(os.path.join(folder, "jafj.log"), "w", encoding="utf-8") as f:

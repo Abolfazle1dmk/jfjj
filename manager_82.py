@@ -4696,6 +4696,60 @@ def _silence_evidence(limit, age):
     return txt
 
 
+def _hanglog_text():
+    """آخرین شاهد، فقط نام فایل/تابع و شماره خط؛ بدون مسیر، کد یا محتویات لاگ."""
+    header = "🧩 <b>گزارش آخرین گیرکردن مدیر</b>\n"
+    try:
+        with open(os.path.join(str(BASE_DIR), "hang.log"), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 128 * 1024))
+            raw = f.read(128 * 1024).decode("utf-8", "replace")
+    except OSError:
+        return header + "گزارشی پیدا نشد؛ ممکن است هنوز ثبت نشده یا با پاک شدن دیسک از بین رفته باشد."
+    if not raw.strip():
+        return header + "گزارش خالی است."
+    marker = raw.rfind("\n===== ")
+    if marker >= 0:
+        raw = raw[marker + 1:]
+        partial = False
+    else:
+        partial = size > 128 * 1024
+    date = re.match(r"===== (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", raw)
+    lines = []
+    frame_re = re.compile(r'^\s*File "([^"\r\n]+)", line (\d{1,9}) in '
+                          r'([A-Za-z_][A-Za-z_0-9]{0,79}|<(?:module|lambda|listcomp|dictcomp|setcomp|genexpr)>)\s*$')
+    for line in raw.splitlines():
+        if re.match(r"^(?:Current thread|Thread) 0x[0-9a-fA-F]+ \(most recent call first\):$", line):
+            lines.append("— رشته —")
+            continue
+        match = frame_re.match(line)
+        if not match:
+            continue
+        name = os.path.basename(match.group(1).replace("\\", "/"))
+        func = match.group(3).strip("<>")
+        # نام‌های غیرعادی یا شامل شماره‌های طولانی ممکن است شناسه/راز باشند.
+        if (not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9.-]{0,79}\.py", name)
+                or re.search(r"\d{5,}", name) or re.search(r"\d{5,}", func)):
+            name, func = "unknown.py", "unknown"
+        lines.append(f"{name}:{match.group(2)} {func}")
+    if not lines:
+        return header + "گزارش پیدا شد، اما فریم قابل نمایش در آن نیست."
+    # انتهای dump معمولاً شامل رشتهٔ اصلی است. اندازه برای پیام تلگرام محدود است.
+    selected, used = [], 0
+    for line in reversed(lines):
+        if used + len(line) + 1 > 3000:
+            partial = True
+            break
+        selected.append(line)
+        used += len(line) + 1
+    selected.reverse()
+    when = ("زمان ثبت: " + date.group(1) + "\n") if date else ""
+    truncated = "بخشی از گزارش طولانی حذف شد.\n" if partial else ""
+    return (header + when + truncated + "<pre>" + _h("\n".join(selected), 0) + "</pre>\n"
+            + "این فقط شاهد لحظهٔ گیرکردن است، نه علت قطعی. بعد از بالا آمدن ربات قابل دریافت است.")
+
+
 def silence_watch(data_dir=None, step=None):
     """thread: اگر حلقه‌ی اصلی از کار افتاد، پروسه را می‌بندد تا ناظر بالا بیاورد.
 
@@ -6174,6 +6228,7 @@ ADMIN_HELP = """🛠 <b>پنل مدیر</b>
 /set trial_days 7 — تغییر تنظیمات
 /cfg — نمایش تنظیمات
 /mlog — رویدادهای اخیر
+/hanglog — گزارش آخرین گیرکردن مدیر
 
 <b>🛒 فروشگاه</b>
 /pending — سفارش‌های منتظر تأیید
@@ -7642,8 +7697,12 @@ class Manager:
         return "\n".join(lines), kb
 
     async def send_backup_to_admin(self, chat_id):
+        async with self._backup_operation_lock():
+            return await self._send_backup_to_admin_locked(chat_id)
+
+    async def _send_backup_to_admin_locked(self, chat_id):
         """بک‌آپ کامل می‌گیرد و فایل zip را مستقیماً در چت مدیر هم ارسال می‌کند."""
-        ok, msg = await self.backup_once(force=True)
+        ok, msg = await self._backup_once_locked(force=True)
         latest = os.path.join(BASE_DIR, "jafj_backup_latest.zip")
         if os.path.isfile(latest) and self.bot is not None:
             try:
@@ -8532,6 +8591,10 @@ class Manager:
                     pass
 
     async def wipe_user_jafj(self, tid, by_admin=0):
+        async with self._backup_operation_lock():
+            return await self._wipe_user_jafj_locked(tid, by_admin)
+
+    async def _wipe_user_jafj_locked(self, tid, by_admin=0):
         """پاک کردن کامل تنظیمات جفج + تنظیمات و دیتابیس تبادل یک کاربر (با حفظ حساب/سشن)."""
         tid = int(tid or 0)
         c = self._user_or_orphan(tid)
@@ -8544,17 +8607,17 @@ class Manager:
             mx = ov if ov > 0 else max(1, int((plan or {}).get("max_accounts", 1) or 1))
         except Exception:
             mx = 1
-        res = await asyncio.to_thread(
+        res = await self._backup_run_blocking(
             self.sup.wipe_jafj_settings, tid, mx, bool(self.db.get(tid)))
         restarted = False
         if res["was_running"] and (self.db.get(tid) or {}).get("session"):
             allow, _why = self.can_run(tid)
             if allow:
-                ok_st, _m = await asyncio.to_thread(self.sup.start, tid)
+                ok_st, _m = await self._backup_run_blocking(self.sup.start, tid)
                 restarted = bool(ok_st)
         if self.db.get(tid):
             self.db.log(tid, "jafj_wiped", f"by={by_admin} files={res['removed_files']}")
-        await asyncio.to_thread(self._refresh_local_backups_after_wipe)
+        await self._backup_run_blocking(self._refresh_local_backups_after_wipe)
         touch_data("wipe_jafj")
         msg = (
             f"🧹 <b>تنظیمات جفج و تبادل کاربر <code>{tid}</code> پاک شد.</b>\n"
@@ -8567,6 +8630,10 @@ class Manager:
         return True, msg, res
 
     async def wipe_user_data(self, tid, by_admin=0):
+        async with self._backup_operation_lock():
+            return await self._wipe_user_data_locked(tid, by_admin)
+
+    async def _wipe_user_data_locked(self, tid, by_admin=0):
         """پاک کردن کامل کل اطلاعات یک کاربر (حساب + سشن + تنظیمات جفج/تبادل + فروشگاه)."""
         tid = int(tid or 0)
         c = self._user_or_orphan(tid)
@@ -8579,13 +8646,13 @@ class Manager:
         if getattr(self, "_login_notified", None):
             self._login_notified.pop(tid, None)
         js = self.sup.jafj_summary(tid)
-        removed_files = await asyncio.to_thread(self.sup.wipe_folder, tid)
+        removed_files = await self._backup_run_blocking(self.sup.wipe_folder, tid)
         db_counts = self.db.delete_user(tid)
         shop_counts = self.shop.delete_user(tid) if self.shop else {
             "orders": 0, "wallet": 0, "points": 0, "tickets": 0, "referrals": 0}
         if by_admin and by_admin != tid:
             self.db.log(by_admin, "user_wiped", f"uid={tid}")
-        await asyncio.to_thread(self._refresh_local_backups_after_wipe)
+        await self._backup_run_blocking(self._refresh_local_backups_after_wipe)
         touch_data("wipe_user")
         stats = {
             "removed_files": removed_files,
@@ -13515,7 +13582,7 @@ class Manager:
                       "tk", "tr", "tclose", "packs", "addpack", "editpack",
                       "rmpack", "gp", "acct", "pstats", "pset", "lim", "admin", "panel",
                       "backup", "restore", "onall", "all_on",
-                      "diag", "why", "diagnose",
+                      "diag", "why", "diagnose", "hanglog",
                       "needlogin", "nlogin", "relogin"}
         if cmd in ADMIN_ONLY:
             return await self.say(chat,
@@ -13548,6 +13615,12 @@ class Manager:
             ok, msg = await self.restore_from_backup(
                 force=True, ref_chat=ref_chat, ref_msg_id=ref_mid)
             return await self.say(chat, ("✅ " if ok else "❌ ") + msg)
+        if cmd == "hanglog":
+            if not self.is_admin(uid):
+                return await self.say(chat, "🔒 این گزارش فقط برای مدیر است.")
+            # حتی اگر دستور در گروه باشد، گزارش فقط به پیوی مدیر می‌رود.
+            text = await asyncio.get_running_loop().run_in_executor(None, _hanglog_text)
+            return await self.say(uid, text)
         if cmd in ("diag", "why", "diagnose"):
             return await self.say(chat, self.diag_text())
         if cmd in ("needlogin", "nlogin", "relogin"):
@@ -15140,6 +15213,10 @@ class Manager:
                         if isinstance(d, dict):
                             d = {k: v for k, v in d.items()
                                  if not str(k).startswith(("_adaptive_", "_block_"))}
+                            # اشاره‌گرِ پیام را خودِ ارسال تغییر می‌دهد؛ دادهٔ مشتری نیست.
+                            if os.path.abspath(path) == os.path.abspath(CONFIG_FILE):
+                                d.pop("backup_msg_id", None)
+                                d.pop("backup_msg_chat", None)
                         raw = json.dumps(d, sort_keys=True, ensure_ascii=False).encode("utf-8")
                         return (key, len(raw), 0, hashlib.md5(raw).hexdigest()[:16])
                     except Exception:
@@ -15707,11 +15784,18 @@ class Manager:
     @staticmethod
     def _sqlite_snapshot(src, dst):
         """کپیِ سازگار حتی وقتی WAL باز است. کپیِ خامِ فایلِ db بدون -wal دادهٔ تازه را جا می‌اندازد."""
-        src_conn = sqlite3.connect(src)
+        from urllib.parse import quote
+        # mode=ro مانع ساخت دیتابیس خالی اگر فایل وسط کار حذف شود.
+        uri = "file:" + quote(os.path.abspath(src), safe="/") + "?mode=ro"
+        src_conn = sqlite3.connect(uri, uri=True, timeout=2)
+        deadline = time.monotonic() + 30
+        def progress(status, remaining, total):
+            if time.monotonic() > deadline:
+                raise TimeoutError("sqlite snapshot deadline")
         try:
             dst_conn = sqlite3.connect(dst)
             try:
-                src_conn.backup(dst_conn)
+                src_conn.backup(dst_conn, pages=256, progress=progress, sleep=0.05)
             finally:
                 dst_conn.close()
         finally:
@@ -15757,8 +15841,21 @@ class Manager:
                         if os.path.isfile(snap) and os.path.getsize(snap) > 0:
                             path = snap
                     except Exception as e:
-                        print(f"  ⚠️ اسنپ‌شات {arc}: {type(e).__name__}: {e}", flush=True)
+                        # بعضی فایل‌های قدیمی با پسوند session اصلاً sqlite نیستند.
+                        # آن‌ها را عیناً نگه دار؛ اما کپی خامِ sqlite ممکن است
+                        # WAL را جا بیندازد و نباید جای بک‌آپ سالم را بگیرد.
+                        try:
+                            with open(src, "rb") as check:
+                                header = check.read(16)
+                        except OSError:
+                            raise RuntimeError(f"خواندن فایل پشتیبان ناموفق: {arc}") from e
+                        if header == b"SQLite format 3\x00":
+                            raise RuntimeError(f"اسنپ‌شات sqlite ناموفق: {arc}") from e
+                        print(f"  ⚠️ فایل غیر sqlite با پسوند دیتابیس: {arc}", flush=True)
                         path = src
+                    else:
+                        if path == src:
+                            raise RuntimeError(f"اسنپ‌شات sqlite خالی: {arc}")
                 try:
                     sz = os.path.getsize(path)
                 except Exception:
@@ -15788,17 +15885,32 @@ class Manager:
                     os.remove(tmpzip)
                 except Exception:
                     pass
-            with zipfile.ZipFile(tmpzip, "w", zipfile.ZIP_DEFLATED) as z:
-                for path, arc, _, _ in chosen:
-                    try:
-                        z.write(path, arcname=arc)
-                    except Exception as e:
-                        print(f"  ⚠️ پشتیبان {arc}: {e}", flush=True)
-                        omitted.append(arc)
-            try:
+            def compress(level):
+                failed = []
+                with zipfile.ZipFile(tmpzip, "w", zipfile.ZIP_DEFLATED,
+                                     compresslevel=level) as z:
+                    for path, arc, essential, _ in chosen:
+                        try:
+                            z.write(path, arcname=arc)
+                        except Exception as e:
+                            # دادهٔ ضروری را هرگز بی‌صدا از یک بک‌آپ «موفق» حذف نکن.
+                            if essential:
+                                raise RuntimeError(f"فایل ضروری پشتیبان خوانده نشد: {arc}") from e
+                            print(f"  ⚠️ پشتیبان {arc}: {type(e).__name__}", flush=True)
+                            failed.append(arc)
+                return failed
+
+            # سطح ۱ مصرف CPU را معمولاً کاهش می‌دهد، با هزینهٔ فایل بزرگ‌تر.
+            omitted.extend(compress(1))
+            size = os.path.getsize(tmpzip)
+            # اگر فایل سبک از سقف امن عبور کرد، سطح قبلی را امتحان کن تا
+            # بک‌آپی که با فشرده‌سازی قوی‌تر قابل ارسال است از دست نرود.
+            if size > BOT_BACKUP_MAX_BYTES:
+                print("  📦 بک‌آپ بزرگ است — فشرده‌سازی مجدد برای سقف تلگرام", flush=True)
+                retry_failed = compress(6)
+                omitted = [arc for arc in omitted if arc not in {m[1] for m in chosen}]
+                omitted.extend(retry_failed)
                 size = os.path.getsize(tmpzip)
-            except Exception:
-                size = 0
             try:
                 with zipfile.ZipFile(tmpzip, "r") as z:
                     zcount = len(z.namelist())
@@ -15879,6 +15991,10 @@ class Manager:
                 pass
 
     async def accept_admin_backup_file(self, ev):
+        async with self._backup_operation_lock():
+            return await self._accept_admin_backup_file_locked(ev)
+
+    async def _accept_admin_backup_file_locked(self, ev):
         """اگر مدیر zip پشتیبان را در پیوی فرستاد، ذخیره کن تا `.restore` پیدایش کند.
 
         پیامِ خطای بازیابی همین را می‌گوید، ولی قبلاً فقط پیامِ خودِ ربات قبول
@@ -16027,7 +16143,41 @@ class Manager:
                 "<code>.restore</code> بفرست، یا آیدی‌اش را بده: "
                 "<code>.restore 12345</code>.")
 
+    def _backup_operation_lock(self):
+        # فقط در event loop ساخته می‌شود؛ backup و restore روی یک داده هم‌زمان نیستند.
+        lock = getattr(self, "_backup_async_lock", None)
+        if lock is None:
+            lock = self._backup_async_lock = asyncio.Lock()
+        return lock
+
+    async def _backup_run_blocking(self, fn, *args):
+        """کار سنگین بیرون حلقه؛ لغو، worker را پیش از پاک‌کردن فایل رها نمی‌کند."""
+        future = asyncio.get_running_loop().run_in_executor(None, fn, *args)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # asyncio نمی‌تواند کار thread را قطع کند. تا اتمام آن نگه می‌داریم
+            # تا فایل موقت و قفل قبل از پایان نوشتن پاک/آزاد نشوند.
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if future.done() and not future.cancelled():
+                try:
+                    future.result()
+                except Exception:
+                    pass
+            raise
+
     async def backup_once(self, force=False):
+        """پشتیبان و بازیابی هم‌زمان روی داده‌های مشترک انجام نمی‌شوند."""
+        async with self._backup_operation_lock():
+            return await self._backup_once_locked(force=force)
+
+    async def _backup_once_locked(self, force=False):
         """یک پشتیبان zip بساز و به تلگرام + دیسک بفرست.
         اگر اثرانگشت عوض نشده و force نباشد، کاری نمی‌کند."""
         target = self._backup_target()
@@ -16076,34 +16226,18 @@ class Manager:
                 # پیامِ متنیِ بی‌فایل «پشتیبان موجود» نیست — وگرنه بک‌آپ هرگز فرستاده نمی‌شود.
                 if (existing is not None and self._msg_has_media(existing)) or not getattr(self, "_last_iter_ok", True):
                     return False, "بدون تغییر"
-        # چک‌پوینت WAL تا کپی db کامل باشد
+        # SQLite backup API فایل WAL را در snapshot لحاظ می‌کند؛ checkpoint
+        # سنگین TRUNCATE اینجا لازم نیست و ممکن است حلقهٔ ربات را معطل کند.
+        for store in (getattr(self, "db", None), getattr(self, "shop", None)):
+            try:
+                if store is not None:
+                    store.c.commit()
+            except Exception:
+                pass
+        fd, tmpzip = tempfile.mkstemp(prefix="jafj_backup_", suffix=".zip")
+        os.close(fd)
         try:
-            if getattr(self, "db", None) is not None:
-                try:
-                    self.db.c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except Exception:
-                    pass
-                try:
-                    self.db.c.commit()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            if getattr(self, "shop", None) is not None:
-                try:
-                    self.shop.c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except Exception:
-                    pass
-                try:
-                    self.shop.c.commit()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        tmpzip = os.path.join(tempfile.gettempdir(), f"jafj_backup_{int(time.time())}_{os.getpid()}.zip")
-        try:
-            zcount, sz, omitted = self._write_backup_zip(tmpzip)
+            zcount, sz, omitted = await self._backup_run_blocking(self._write_backup_zip, tmpzip)
             if zcount <= 0 or not os.path.isfile(tmpzip) or sz <= 0:
                 return False, "فایل پشتیبان خالی ساخته شد"
             try:
@@ -16118,7 +16252,7 @@ class Manager:
                 if guard_msg:
                     return False, guard_msg
             try:
-                self._save_local_backup_copy(tmpzip)
+                await self._backup_run_blocking(self._save_local_backup_copy, tmpzip)
             except Exception as e:
                 print(f"  ⚠️ ذخیره محلی پشتیبان: {e}", flush=True)
             if sz > 50 * 1024 * 1024:
@@ -16163,23 +16297,22 @@ class Manager:
                                            f"\u00ab<code>clients/</code>\u00bb (سشن و تنظیمات هر اکانت) هم هست و بعد از ری‌استارت Render خودکار بازیابی می‌شود.")
             except Exception:
                 pass
-            self._save_backup_fp(self._backup_fingerprint())
+            # اثرانگشتِ قبل از شروع؛ تغییرِ حین ساخت یا ارسال نباید گم شود.
+            self._save_backup_fp(fp)
             print(f"  📦 پشتیبان فرستاده شد به {target} ({sz} بایت, {zcount} فایل, {n} مشتری)", flush=True)
-            try:
-                os.remove(tmpzip)
-            except Exception:
-                pass
             return True, f"پشتیبان فرستاده شد ({n} مشتری, {zcount} فایل, {sz//1024}KB) — تلگرام + دیسک"
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            try:
-                if os.path.exists(tmpzip):
-                    os.remove(tmpzip)
-            except Exception:
-                pass
             print(f"  ⚠️ پشتیبان: {type(e).__name__}: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return False, f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                os.remove(tmpzip)
+            except OSError:
+                pass
 
     async def heartbeat_loop(self):
         """هر دقیقه یک ضربان بنویس و هر ۵ دقیقه حافظه را در لاگ بگو."""
@@ -16385,6 +16518,10 @@ class Manager:
                 await asyncio.sleep(120)
 
     async def restore_from_backup(self, force=False, ref_chat=None, ref_msg_id=None):
+        async with self._backup_operation_lock():
+            return await self._restore_from_backup_locked(force, ref_chat, ref_msg_id)
+
+    async def _restore_from_backup_locked(self, force=False, ref_chat=None, ref_msg_id=None):
         """بازیابی از آخرین پشتیبان تلگرام (یا کپی محلی روی دیسک). (موفق, پیام)
 
         `ref_msg_id` (و اختیاری `ref_chat`): پیامِ دقیقِ پشتیبان — از ریپلایِ
