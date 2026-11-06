@@ -1698,6 +1698,14 @@ class DB:
         return self._x("SELECT * FROM exchange ORDER BY id DESC LIMIT ?",
                        (limit,), "all")
 
+    def ex_joined_count_capped(self):
+        """همان تعداد ex_list('joined', 500)، بدون خواندن محتوای رکوردها."""
+        row = self._x(
+            "SELECT COUNT(*) AS c FROM "
+            "(SELECT 1 FROM exchange WHERE status='joined' LIMIT 500)",
+            (), "one")
+        return int(row["c"])
+
     def ex_same_channel_left(self, rec):
         """رکوردِ دیگری که «همین کانال» را قبلاً لفت داده است.
 
@@ -10201,7 +10209,7 @@ async def connect_and_run(eng, creds):
                 # بین درخواست‌های بررسی خودکار تنظیم می‌شود و اگر مدتی
                 # Flood نخورده باشد، کم‌کم برمی‌گردد.
                 try:
-                    check_gate.set_load(len(eng.db.ex_list("joined", 500)))
+                    check_gate.set_load(eng.db.ex_joined_count_capped())
                     check_gate.maybe_decay()
                 except Exception:
                     pass
