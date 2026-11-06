@@ -29,6 +29,8 @@ for node in tree.body:
         '_h', '_hanglog_text', 'backup_file_skipped', 'backup_arc_essential', '_admin_upload_path'
     }:
         nodes.append(node)
+    elif isinstance(node, ast.ClassDef) and node.name == '_BackupCpuPacer':
+        nodes.append(node)
     elif isinstance(node, ast.ClassDef) and node.name == 'Manager':
         selected = [n for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in methods]
         nodes.append(ast.ClassDef(name='Manager', bases=[], keywords=[], body=selected, decorator_list=[]))
@@ -119,6 +121,154 @@ class SafetyTest(unittest.TestCase):
         self.assertEqual(a, self.manager._backup_fingerprint())
         path.write_text(json.dumps({'backup_msg_id': 2, 'backup_msg_chat': '456', 'foo': 'new'}))
         self.assertNotEqual(a, self.manager._backup_fingerprint())
+
+    def test_pacer_enforces_worker_share_and_bypasses_on_shutdown(self):
+        class Clock:
+            wall = 0.0
+            cpu = 0.0
+            sleeps = []
+            def monotonic(self): return self.wall
+            def thread_time(self): return self.cpu
+            def sleep(self, seconds):
+                self.sleeps.append(seconds)
+                self.wall += seconds
+        clock = Clock()
+        old_time = ns['time']
+        old_env = os.environ.get('JAFJ_BACKUP_CPU_PERCENT')
+        try:
+            ns['time'] = clock
+            os.environ['JAFJ_BACKUP_CPU_PERCENT'] = '8'
+            pacer = ns['_BackupCpuPacer'](self.manager)
+            clock.wall += .01
+            clock.cpu += .01
+            pacer.checkpoint()
+            self.assertAlmostEqual(clock.sleeps[-1], .115, places=5)
+            # Long I/O waits must not build unbounded credit for the next burst.
+            clock.wall += 5
+            clock.cpu += .01
+            pacer.checkpoint()
+            self.assertAlmostEqual(clock.sleeps[-1], .075, places=5)
+            before = len(clock.sleeps)
+            self.manager._stopping = True
+            clock.wall += .01
+            clock.cpu += .01
+            pacer.checkpoint()
+            self.assertEqual(len(clock.sleeps), before)
+        finally:
+            ns['time'] = old_time
+            if old_env is None:
+                os.environ.pop('JAFJ_BACKUP_CPU_PERCENT', None)
+            else:
+                os.environ['JAFJ_BACKUP_CPU_PERCENT'] = old_env
+
+    def test_fingerprint_in_worker_uses_own_connection_and_sees_wal_changes(self):
+        db = sqlite3.connect(ns['DB_FILE'])
+        db.execute('PRAGMA journal_mode=WAL')
+        db.execute('CREATE TABLE clients (name TEXT)')
+        db.executemany('INSERT INTO clients VALUES (?)', [('row-%d' % i,) for i in range(500)])
+        db.commit()
+        # check_same_thread=True proves the worker cannot use this live connection.
+        self.manager.db = SimpleNamespace(c=db)
+        expected = self.manager._backup_fingerprint()
+        async def exercise():
+            from_worker = await self.manager._backup_run_blocking(self.manager._backup_fingerprint, False, True)
+            self.assertEqual(expected, from_worker)
+            db.execute("INSERT INTO clients VALUES ('new data in WAL')")
+            db.commit()
+            changed = await self.manager._backup_run_blocking(self.manager._backup_fingerprint, False, True)
+            self.assertNotEqual(from_worker, changed)
+        asyncio.run(exercise())
+        db.close()
+        Path(ns['DB_FILE']).write_bytes(b'SQLite format 3\x00broken')
+        with self.assertRaisesRegex(RuntimeError, 'اثر'):
+            self.manager._backup_fingerprint(False, True)
+
+    def test_sqlite_snapshot_pacing_does_not_hold_source_write_lock(self):
+        db = sqlite3.connect(ns['DB_FILE'])
+        db.execute('CREATE TABLE stuff (value BLOB)')
+        db.executemany('INSERT INTO stuff VALUES (?)', [(b'x' * 4096,) for _ in range(600)])
+        db.commit()
+        entered, release = threading.Event(), threading.Event()
+        class BlockingPacer:
+            def checkpoint(self):
+                if not entered.is_set():
+                    entered.set()
+                    release.wait(3)
+        errors = []
+        def run():
+            try:
+                self.manager._sqlite_snapshot(ns['DB_FILE'], str(self.d / 'copy.db'), BlockingPacer())
+            except Exception as e:
+                errors.append(e)
+        worker = threading.Thread(target=run)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            db.execute("INSERT INTO stuff VALUES ('changed during snapshot')")
+            db.commit()
+        finally:
+            release.set()
+            worker.join(5)
+            db.close()
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        with sqlite3.connect(self.d / 'copy.db') as copied:
+            self.assertEqual(copied.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+
+    def test_failed_fingerprint_keeps_existing_backup(self):
+        m = self.manager
+        m.bot, m.cfg = object(), {'admin_ids': [77]}
+        m._backup_target = lambda: 77
+        async def public(target): return False, ''
+        m._backup_target_is_public = public
+        calls = []
+        m._save_local_backup_copy = lambda path: calls.append('local')
+        async def upload(*args):
+            calls.append('upload')
+            raise AssertionError('must not upload an incomplete backup')
+        m._upload_backup = upload
+        Path(ns['DB_FILE']).write_bytes(b'SQLite format 3\x00broken')
+        old = self.d / 'jafj_backup_latest.zip'
+        old.write_bytes(b'previous synthetic backup')
+        async def exercise():
+            ok, message = await m.backup_once(force=True)
+            self.assertFalse(ok)
+            self.assertIn('ناموفق', message)
+            self.assertEqual(calls, [])
+            self.assertEqual(old.read_bytes(), b'previous synthetic backup')
+        asyncio.run(exercise())
+
+    def test_fingerprint_does_not_block_loop_and_cancel_waits_for_worker(self):
+        m = self.manager
+        m.bot, m.cfg = object(), {'admin_ids': [77]}
+        m._backup_target = lambda: 77
+        async def public(target): return False, ''
+        m._backup_target_is_public = public
+        entered, release = threading.Event(), threading.Event()
+        def fingerprint(*args):
+            entered.set()
+            release.wait(3)
+            return ('synthetic',)
+        m._backup_fingerprint = fingerprint
+        async def exercise():
+            task = asyncio.create_task(m.backup_once(force=True))
+            try:
+                for _ in range(200):
+                    if entered.is_set(): break
+                    await asyncio.sleep(.005)
+                self.assertTrue(entered.is_set())
+                # The event loop is responsive; cancellation must not release
+                # the backup/restore lock before the worker actually stops.
+                task.cancel()
+                await asyncio.sleep(.02)
+                self.assertFalse(task.done())
+                self.assertTrue(m._backup_operation_lock().locked())
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertFalse(m._backup_operation_lock().locked())
+        asyncio.run(exercise())
 
     def test_hanglog_bounded_redacted_latest_event_and_admin_only(self):
         p = self.d / 'hang.log'
@@ -214,7 +364,7 @@ class SafetyTest(unittest.TestCase):
         m._backup_target = lambda: 77
         async def public(target): return False, ''
         m._backup_target_is_public = public
-        m._backup_fingerprint = lambda: m.fp
+        m._backup_fingerprint = lambda *args: m.fp
         m._load_backup_fp = lambda: None
         m._save_backup_fp = lambda fp: setattr(m, 'saved', fp)
         m._remember_backup_pointer = lambda *args: None

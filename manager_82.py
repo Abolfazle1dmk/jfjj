@@ -6422,6 +6422,41 @@ def admin_menu(pending=0, tickets=0, trial_on=True):
     ]
 
 
+class _BackupCpuPacer:
+    """سهم CPU تردِ بک‌آپ را در Wispbyte پخش می‌کند، نه CPU کل کانتینر را.
+
+    این محدودکننده تضمین سقف کل نمی‌دهد: سایر تردها و سلف‌ها مستقل‌اند.
+    برای پشتیبان پایانیِ SIGTERM عمداً مکث نمی‌کنیم تا فرصت ارسال از بین نرود.
+    """
+    def __init__(self, manager):
+        self.manager = manager
+        default = "8" if (os.environ.get("JAFJ_HOST_LABEL") or "").strip().lower() == "wispbyte" else "0"
+        try:
+            percent = float(os.environ.get("JAFJ_BACKUP_CPU_PERCENT", default))
+            if not (0 <= percent <= 100):
+                raise ValueError("invalid percentage")
+        except (TypeError, ValueError):
+            percent = float(default)
+        self.fraction = percent / 100.0
+        self.enabled = self.fraction > 0 and callable(getattr(time, "thread_time", None))
+        self.wall = time.monotonic()
+        self.cpu = time.thread_time() if self.enabled else 0.0
+
+    def checkpoint(self):
+        if not self.enabled:
+            return
+        wall = time.monotonic()
+        cpu = time.thread_time()
+        if not getattr(self.manager, "_stopping", False):
+            # انتظار طولانی I/O به اعتبار نامحدود برای جهش CPU تبدیل نشود.
+            wall_elapsed = min(0.05, max(0.0, wall - self.wall))
+            delay = max(0.0, (cpu - self.cpu) / self.fraction - wall_elapsed)
+            if delay:
+                time.sleep(delay)
+        self.wall = time.monotonic()
+        self.cpu = time.thread_time()
+
+
 # ── نمونه‌برداری سبک CPU؛ درصد = سهم از یک هسته، نه درصد سهمیه ──
 _CPU_ACTIVITY_LOCK = threading.Lock()
 _CPU_ACTIVITIES = []
@@ -15154,11 +15189,12 @@ class Manager:
             return False, str(target)
 
     @_cpu_mark_activity("بررسی تغییرات بک‌آپ")
-    def _backup_fingerprint(self):
+    def _backup_fingerprint(self, use_live=True, paced=False):
         """اثرانگشت پشتیبان — فقط بر اساس محتوای واقعی اطلاعات (مشتری‌ها، فروشگاه، تنظیمات).
         تغییراتِ لحظه‌ایِ زمان فایل (مثل wal_checkpoint، پینگ سشن تلگرام یا گزارش زنده‌ی سلف)
         باعث بک‌آپ تکراری و بی‌مورد نمی‌شوند؛ فقط ثبت یا تغییر اطلاعات واقعی اثرانگشت را عوض می‌کند."""
         import hashlib
+        pacer = _BackupCpuPacer(self) if paced else None
 
         def _sqlite_hash(path, live_conn=None):
             if not os.path.isfile(path):
@@ -15168,17 +15204,27 @@ class Manager:
             close_it = False
             try:
                 if c is None:
-                    c = sqlite3.connect(path, timeout=2)
+                    from urllib.parse import quote
+                    uri = "file:" + quote(os.path.abspath(path), safe="/") + "?mode=ro"
+                    c = sqlite3.connect(uri, uri=True, timeout=2)
                     close_it = True
                 tables = [r[0] for r in c.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
                 ).fetchall()]
                 for t in tables:
                     h.update(t.encode("utf-8", "ignore"))
-                    for row in c.execute(f'SELECT * FROM "{t}"'):
+                    for i, row in enumerate(c.execute(f'SELECT * FROM "{t}"')):
                         h.update(repr(tuple(row)).encode("utf-8", "ignore"))
+                        if pacer is not None and i % 128 == 127:
+                            pacer.checkpoint()
+                    if pacer is not None:
+                        pacer.checkpoint()
                 return h.hexdigest()[:16]
             except Exception:
+                if not use_live:
+                    # خواندن خامِ db ممکن است تغییرات WAL را جا بیندازد؛
+                    # در این حالت بک‌آپ را متوقف کن نه اینکه «بی‌تغییر» بدانی.
+                    raise RuntimeError("خواندن اثرانگشت دیتابیس ناموفق")
                 try:
                     # Fallback هم فایل را chunk به chunk می‌خواند؛ f.read()
                     # کاملِ دیتابیس را در RAM نگه می‌داشت و در حافظه‌ی کم خطرناک بود.
@@ -15234,8 +15280,9 @@ class Manager:
                 return (key, None, None, None)
 
         fps = []
-        db_conn = getattr(getattr(self, "db", None), "c", None)
-        shop_conn = getattr(getattr(self, "shop", None), "c", None)
+        # تردِ پشتیبان از اتصال‌های زندهٔ مدیر استفاده نمی‌کند.
+        db_conn = getattr(getattr(self, "db", None), "c", None) if use_live else None
+        shop_conn = getattr(getattr(self, "shop", None), "c", None) if use_live else None
         fps.append((DB_FILE, "sqlite", 0, _sqlite_hash(DB_FILE, db_conn)))
         fps.append((SHOP_DB, "sqlite", 0, _sqlite_hash(SHOP_DB, shop_conn)))
         for p in (CONFIG_FILE, BOT_SESSION_FILE):
@@ -15254,8 +15301,13 @@ class Manager:
                         fp = os.path.join(root, fn)
                         rel = os.path.relpath(fp, BASE_DIR)
                         fps.append(_fp_file(fp, rel))
+                        if pacer is not None:
+                            pacer.checkpoint()
             except Exception:
-                pass
+                if not use_live:
+                    raise
+        if pacer is not None:
+            pacer.checkpoint()
         return tuple(sorted(fps))
 
     # ── «یک پیامِ پشتیبان» — پیام پشتیبان همیشه همان یکی است و به‌روز می‌شود ──
@@ -15782,20 +15834,31 @@ class Manager:
         return base.endswith(".db") or base.endswith(".session")
 
     @staticmethod
-    def _sqlite_snapshot(src, dst):
+    def _sqlite_snapshot(src, dst, pacer=None):
         """کپیِ سازگار حتی وقتی WAL باز است. کپیِ خامِ فایلِ db بدون -wal دادهٔ تازه را جا می‌اندازد."""
         from urllib.parse import quote
         # mode=ro مانع ساخت دیتابیس خالی اگر فایل وسط کار حذف شود.
         uri = "file:" + quote(os.path.abspath(src), safe="/") + "?mode=ro"
         src_conn = sqlite3.connect(uri, uri=True, timeout=2)
-        deadline = time.monotonic() + 30
+        last_progress = time.monotonic()
+        deadline = last_progress + 120
+        last_remaining = None
         def progress(status, remaining, total):
-            if time.monotonic() > deadline:
+            nonlocal last_progress, last_remaining
+            current = time.monotonic()
+            if current > deadline:
                 raise TimeoutError("sqlite snapshot deadline")
+            if last_remaining is None or remaining < last_remaining:
+                last_progress = current
+            elif current - last_progress > 30:
+                raise TimeoutError("sqlite snapshot stalled")
+            last_remaining = remaining
+            if pacer is not None:
+                pacer.checkpoint()
         try:
             dst_conn = sqlite3.connect(dst)
             try:
-                src_conn.backup(dst_conn, pages=256, progress=progress, sleep=0.05)
+                src_conn.backup(dst_conn, pages=32, progress=progress, sleep=0.05)
             finally:
                 dst_conn.close()
         finally:
@@ -15830,6 +15893,7 @@ class Manager:
         اگر از سقف آپلود ربات بزرگ‌تر شد، فایل‌های غیرضروری حذف می‌شوند.
         خروجی: (تعداد فایل, بایت, فهرستِ حذف‌شده)."""
         work = tempfile.mkdtemp(prefix="jafj_bk_")
+        pacer = _BackupCpuPacer(self)
         try:
             members = []
             for src, arc in self._iter_backup_sources():
@@ -15837,7 +15901,7 @@ class Manager:
                 if self._looks_sqlite(src):
                     snap = os.path.join(work, f"{len(members)}.snap")
                     try:
-                        self._sqlite_snapshot(src, snap)
+                        self._sqlite_snapshot(src, snap, pacer)
                         if os.path.isfile(snap) and os.path.getsize(snap) > 0:
                             path = snap
                     except Exception as e:
@@ -15861,6 +15925,7 @@ class Manager:
                 except Exception:
                     sz = 0
                 members.append((path, arc, backup_arc_essential(arc), sz))
+                pacer.checkpoint()
             essential = [m for m in members if m[2]]
             optional = sorted((m for m in members if not m[2]), key=lambda m: m[3])
             chosen = list(essential)
@@ -15891,7 +15956,17 @@ class Manager:
                                      compresslevel=level) as z:
                     for path, arc, essential, _ in chosen:
                         try:
-                            z.write(path, arcname=arc)
+                            info = zipfile.ZipInfo.from_file(path, arc)
+                            info.compress_type = zipfile.ZIP_DEFLATED
+                            info._compresslevel = level
+                            with open(path, "rb") as source, z.open(info, "w") as dest:
+                                while True:
+                                    chunk = source.read(64 * 1024)
+                                    if not chunk:
+                                        break
+                                    dest.write(chunk)
+                                    pacer.checkpoint()
+                            pacer.checkpoint()
                         except Exception as e:
                             # دادهٔ ضروری را هرگز بی‌صدا از یک بک‌آپ «موفق» حذف نکن.
                             if essential:
@@ -16220,7 +16295,12 @@ class Manager:
                 return False, msg
         except Exception as e:
             print(f"  ⚠️ بررسی عمومی/خصوصی: {e}", flush=True)
-        fp = self._backup_fingerprint()
+        # ترد مستقل و اتصال‌های جداگانه: اثرانگشت هم حلقهٔ تلگرام را معطل نکند.
+        try:
+            fp = await self._backup_run_blocking(
+                self._backup_fingerprint, False, True)
+        except Exception as e:
+            return False, f"بررسی تغییرات پشتیبان ناموفق: {type(e).__name__}"
         if not force:
             if not bool(self.cfg.get("auto_backup_on", True)):
                 return False, "بدون تغییر"
