@@ -49,6 +49,7 @@ import tempfile
 import threading
 import traceback
 import zipfile
+import functools
 
 # --- فیکس آف شدن بعد 30 دقیقه بدون فعالیت (Railway) - وب سرور سالم ---
 def _health_port():
@@ -6366,6 +6367,160 @@ def admin_menu(pending=0, tickets=0, trial_on=True):
     ]
 
 
+# ── نمونه‌برداری سبک CPU؛ درصد = سهم از یک هسته، نه درصد سهمیه ──
+_CPU_ACTIVITY_LOCK = threading.Lock()
+_CPU_ACTIVITIES = []
+
+
+def _cpu_mark_activity(label):
+    """بازه‌های کوتاه بک‌آپ را برای تطبیق با نمونه CPU نگه دار، نه محتوای داده را."""
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            item = [label, time.monotonic(), None]
+            with _CPU_ACTIVITY_LOCK:
+                _CPU_ACTIVITIES.append(item)
+                del _CPU_ACTIVITIES[:-64]
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                with _CPU_ACTIVITY_LOCK:
+                    item[2] = time.monotonic()
+        return wrapped
+    return decorate
+
+
+def _cpu_activities_between(start, end):
+    with _CPU_ACTIVITY_LOCK:
+        return sorted({label for label, begin, finish in _CPU_ACTIVITIES
+                       if begin <= end and (finish is None or finish >= start)})
+
+
+def _cpu_cgroup_dir(root="/sys/fs/cgroup", proc_cgroup="/proc/self/cgroup"):
+    """مسیر خود کانتینر، نه مجموعِ CPU ماشین میزبان. cgroup v1/v2."""
+    candidates = []
+    nested_group = False
+    found_group = False
+    try:
+        with open(proc_cgroup, encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split(":", 2)
+                if len(parts) != 3:
+                    continue
+                _, controllers, group = parts
+                segments = [p for p in group.split("/") if p not in ("", ".", "..")]
+                if not controllers:
+                    found_group = True
+                    nested_group = nested_group or bool(segments)
+                    candidates.append((os.path.join(root, *segments), "v2"))
+                elif "cpuacct" in controllers.split(","):
+                    found_group = True
+                    nested_group = nested_group or bool(segments)
+                    for name in ("cpuacct", "cpu,cpuacct", "cpuacct,cpu", ""):
+                        candidates.append((os.path.join(root, name, *segments), "v1"))
+    except OSError:
+        pass
+    if not found_group:
+        return None, None
+    # در namespace کانتینر اغلب cgroup خودش به ریشه mount شده است.
+    fallbacks = [(root, "v2")] + [(os.path.join(root, name), "v1")
+                                   for name in ("cpuacct", "cpu,cpuacct", "cpuacct,cpu", "")]
+    # فقط اگر PID خودمان در ریشه باشد، ریشه را به‌جای گروه تو‌در‌تو بگیر؛
+    # وگرنه ممکن است مصرف تمام میزبان را اشتباه به برنامه نسبت دهیم.
+    for path, version in fallbacks:
+        if nested_group:
+            try:
+                with open(os.path.join(path, "cgroup.procs"), encoding="ascii") as f:
+                    if str(os.getpid()) not in f.read().split():
+                        continue
+            except OSError:
+                continue
+        candidates.append((path, version))
+    for path, version in candidates:
+        name = "cpu.stat" if version == "v2" else "cpuacct.usage"
+        if os.path.isfile(os.path.join(path, name)) and _cpu_group_seconds(path, version) is not None:
+            return path, version
+    return None, None
+
+
+def _cpu_group_seconds(path, version):
+    try:
+        if version == "v2":
+            with open(os.path.join(path, "cpu.stat"), encoding="ascii") as f:
+                for line in f:
+                    key, _, value = line.partition(" ")
+                    if key == "usage_usec":
+                        return int(value.strip()) / 1000000.0
+        elif version == "v1":
+            with open(os.path.join(path, "cpuacct.usage"), encoding="ascii") as f:
+                return int(f.read().strip()) / 1000000000.0
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _cpu_proc_sample(group_dir, proc_root="/proc", manager_pid=None):
+    """فقط PIDهای همین cgroup؛ مقدار هر پروسه و برچسب بدون مسیر/آیدی مشتری."""
+    manager_pid = manager_pid if manager_pid is not None else os.getpid()
+    try:
+        with open(os.path.join(group_dir, "cgroup.procs"), encoding="ascii") as f:
+            pids = [int(line) for line in f if line.strip().isdigit()]
+        ticks = os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    result = {}
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, str(pid), "stat"), encoding="ascii") as f:
+                stat = f.read()
+            # comm می‌تواند حاوی فاصله یا پرانتز باشد؛ از آخرین ) جدا کن.
+            fields = stat[stat.rfind(")") + 2:].split()
+            seconds = (int(fields[11]) + int(fields[12])) / float(ticks)
+            start = int(fields[19])
+            if pid == manager_pid:
+                label = "مدیر"
+            else:
+                with open(os.path.join(proc_root, str(pid), "cmdline"), "rb") as f:
+                    args = f.read(8192).replace(b"\0", b" ").lower()
+                label = ("سلف‌ها/شارد" if any(x in args for x in
+                         (b"95.py", b"jafj_shardd.py", b"jafj_forkd.py"))
+                         else "سایر پروسه‌ها")
+            result[pid] = (start, seconds, label)
+        except (OSError, ValueError, IndexError):
+            continue
+    return result
+
+
+def _cpu_proc_deltas(old, new, elapsed):
+    groups = {}
+    if elapsed <= 0:
+        return groups
+    for pid, (start, cpu, label) in new.items():
+        previous = old.get(pid)
+        if previous and previous[0] == start and cpu >= previous[1]:
+            groups[label] = groups.get(label, 0.0) + 100.0 * (cpu - previous[1]) / elapsed
+    return groups
+
+
+def _cpu_alert_text(sample):
+    parts = ["⚠️ گزارش مصرف CPU",
+             "زمان ثبت: " + sample.get("when", "نامشخص"),
+             f"مصرف کل: {sample['total']:.1f}٪ از یک هسته (میانگین {sample['seconds']:.1f} ثانیه)"]
+    groups = sample.get("groups") or {}
+    if groups:
+        parts.append("پروسه‌های قابل اندازه‌گیری: " + "، ".join(
+            f"{label}: {value:.1f}٪" for label, value in
+            sorted(groups.items(), key=lambda item: -item[1])))
+    else:
+        parts.append("تفکیک پروسه‌ها در این نمونه در دسترس نبود.")
+    activities = sample.get("activities") or []
+    parts.append("هم‌زمان با جهش: " + ("، ".join(activities) if activities
+                                       else "بک‌آپ در بخش‌های رصدشده دیده نشد"))
+    parts.append("هم‌زمانی به معنی اثبات علت نیست؛ علت دقیق ممکن است نامشخص باشد. "
+                 "پروسه‌های کوتاه‌عمر ممکن است در تفکیک دیده نشوند.")
+    return "\n".join(parts)
+
+
 # ═══════════════════════════════════════════════════
 #  ربات
 # ═══════════════════════════════════════════════════
@@ -6400,6 +6555,147 @@ class Manager:
         self._flushed_on_exit = False
         self._crash_hooks_done = False
         self._boot_notice = []           # خطوطِ هشدار برای پیامِ «بالا آمد»
+        self._cpu_report_lock = threading.Lock()
+        self._cpu_report_in_flight = False
+        self._cpu_monitor_started = False
+        self._cpu_monitor_stop = threading.Event()
+
+    # ---------- گزارش CPU به مدیر؛ بدون تغییر در زمان‌بندی سلف ----------
+    def _cpu_pending_path(self):
+        return os.path.join(BASE_DIR, ".jafj_cpu_alert.json")
+
+    def _cpu_save_report(self, text):
+        report = {"id": str(time.time_ns()), "text": text}
+        path = self._cpu_pending_path()
+        with self._cpu_report_lock:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(report, f, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+            except OSError as e:
+                print(f"  ⚠️ ذخیره گزارش CPU: {type(e).__name__}", flush=True)
+        return report
+
+    def _cpu_load_report(self):
+        with self._cpu_report_lock:
+            try:
+                with open(self._cpu_pending_path(), encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data.get("id") and isinstance(data.get("text"), str):
+                    return data
+            except (OSError, ValueError):
+                pass
+        return None
+
+    def _cpu_queue_report(self, report=None):
+        """ارسال async به مدیر؛ در صورت شکست فایل می‌ماند و بعداً retry می‌شود."""
+        if self.bot is None or self._loop is None or self._loop.is_closed():
+            return False
+        report = report or self._cpu_load_report()
+        if not report:
+            return False
+        with self._cpu_report_lock:
+            if self._cpu_report_in_flight:
+                return False
+            self._cpu_report_in_flight = True
+
+        async def send():
+            delivered = False
+            try:
+                for admin in list(self.cfg.get("admin_ids") or []):
+                    try:
+                        delivered = await self.say(admin, report["text"], key="cpu:" + report["id"]) or delivered
+                    except Exception:
+                        continue
+                if delivered:
+                    with self._cpu_report_lock:
+                        try:
+                            with open(self._cpu_pending_path(), encoding="utf-8") as f:
+                                current = json.load(f)
+                            if current.get("id") == report["id"]:
+                                os.remove(self._cpu_pending_path())
+                        except (OSError, ValueError, AttributeError):
+                            pass
+                else:
+                    print("  ⚠️ گزارش CPU ارسال نشد؛ برای تلاش بعدی نگه داشته شد.", flush=True)
+            finally:
+                with self._cpu_report_lock:
+                    self._cpu_report_in_flight = False
+
+        coro = send()
+        try:
+            asyncio.run_coroutine_threadsafe(coro, self._loop)
+            return True
+        except Exception:
+            coro.close()
+            with self._cpu_report_lock:
+                self._cpu_report_in_flight = False
+            return False
+
+    def _start_cpu_monitor(self):
+        """یک thread نمونه‌بردار مستقل از asyncio، پیش‌فرض فقط برای Wispbyte."""
+        flag = (os.environ.get("JAFJ_CPU_MONITOR") or "").strip().lower()
+        if not flag:
+            flag = "1" if (os.environ.get("JAFJ_HOST_LABEL") or "").strip().lower() == "wispbyte" else "0"
+        if flag not in ("1", "true", "yes", "on") or self._cpu_monitor_started:
+            return
+        self._cpu_queue_report()  # گزارش قبلی حتی اگر cgroup دیگر در دسترس نباشد
+        group, version = _cpu_cgroup_dir()
+        if not group or _cpu_group_seconds(group, version) is None:
+            print("  ⚠️ گزارش CPU فعال نشد: آمار cgroup در دسترس نیست.", flush=True)
+            return
+        def setting(name, default, minimum, maximum):
+            try:
+                value = float(os.environ.get(name, "") or default)
+                if not (minimum <= value <= maximum):
+                    return default
+                return value
+            except (TypeError, ValueError):
+                return default
+        threshold = setting("JAFJ_CPU_ALERT_PERCENT", 25.0, 1.0, 1000.0)
+        interval = setting("JAFJ_CPU_SAMPLE_SECONDS", 3.0, 1.0, 60.0)
+        cooldown = setting("JAFJ_CPU_ALERT_COOLDOWN", 300.0, 30.0, 86400.0)
+        self._cpu_monitor_started = True
+
+        def worker():
+            previous_cpu = _cpu_group_seconds(group, version)
+            previous_procs = _cpu_proc_sample(group)
+            previous_time = time.monotonic()
+            last_alert = -float("inf")
+            last_retry = -float("inf")
+            while not self._cpu_monitor_stop.wait(interval):
+                try:
+                    current_time = time.monotonic()
+                    current_cpu = _cpu_group_seconds(group, version)
+                    current_procs = _cpu_proc_sample(group)
+                    elapsed = current_time - previous_time
+                    if (current_cpu is not None and previous_cpu is not None
+                            and current_cpu >= previous_cpu and elapsed > 0):
+                        total = 100.0 * (current_cpu - previous_cpu) / elapsed
+                        if total >= threshold and current_time - last_alert >= cooldown:
+                            sample = {"total": total, "seconds": elapsed,
+                                      "when": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                                      "groups": _cpu_proc_deltas(previous_procs, current_procs, elapsed),
+                                      "activities": _cpu_activities_between(previous_time, current_time)}
+                            text = _cpu_alert_text(sample)
+                            print("  " + text.replace("\n", " | "), flush=True)
+                            report = self._cpu_save_report(text)
+                            self._cpu_queue_report(report)
+                            last_alert = current_time
+                            last_retry = current_time
+                    previous_time, previous_cpu, previous_procs = current_time, current_cpu, current_procs
+                    if current_time - last_retry >= 60:
+                        self._cpu_queue_report()
+                        last_retry = current_time
+                except Exception as e:
+                    print(f"  ⚠️ نمونه‌برداری CPU: {type(e).__name__}", flush=True)
+
+        threading.Thread(target=worker, name="jafj-cpu-monitor", daemon=True).start()
+        print(f"  📊 گزارش CPU روشن: آستانه {threshold:g}٪ از یک هسته، نمونه {interval:g} ثانیه", flush=True)
 
     # ---------- پایداریِ داده (کرش نباید اطلاعات را ببرد) ----------
     def _gh_sync_cmd(self):
@@ -14784,6 +15080,7 @@ class Manager:
             print(f"  ⚠️ بررسی کانال پشتیبان: {type(e).__name__}", flush=True)
             return False, str(target)
 
+    @_cpu_mark_activity("بررسی تغییرات بک‌آپ")
     def _backup_fingerprint(self):
         """اثرانگشت پشتیبان — فقط بر اساس محتوای واقعی اطلاعات (مشتری‌ها، فروشگاه، تنظیمات).
         تغییراتِ لحظه‌ایِ زمان فایل (مثل wal_checkpoint، پینگ سشن تلگرام یا گزارش زنده‌ی سلف)
@@ -15443,6 +15740,7 @@ class Manager:
                         arc = "clients/" + os.path.basename(fpath)
                     yield fpath, arc
 
+    @_cpu_mark_activity("ساخت و فشرده‌سازی بک‌آپ")
     def _write_backup_zip(self, tmpzip):
         """zip پشتیبان. لاگ و فایل موقت نمی‌آیند؛ sqlite با backup API کپی می‌شود.
         اگر از سقف آپلود ربات بزرگ‌تر شد، فایل‌های غیرضروری حذف می‌شوند.
@@ -15664,6 +15962,9 @@ class Manager:
         if getattr(self, "_stopping", False):
             return
         self._stopping = True
+        stop = getattr(self, "_cpu_monitor_stop", None)
+        if stop is not None:
+            stop.set()
         # به نگهبانِ سکوت بگو «این خاموشیِ عمدی است» — وگرنه ممکن است وسطِ
         # پشتیبانِ پایانی پروسه را با کدِ ۷۵ ببندد.
         LIVE["stopping"] = True
@@ -17155,6 +17456,11 @@ class Manager:
             self._loop = asyncio.get_running_loop()
         except Exception:
             self._loop = None
+
+        try:
+            self._start_cpu_monitor()
+        except Exception as e:
+            print(f"  ⚠️ شروع گزارش CPU: {type(e).__name__}", flush=True)
 
         # ── کرش‌گیری ──
         # از همین‌جا هر مرگِ غیرمنتظره ثبت می‌شود و یک «ذخیره‌ی نجات» می‌زند،
