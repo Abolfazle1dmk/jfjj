@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import tempfile
 import threading
+from types import SimpleNamespace
 import time
 import unittest
 import zipfile
@@ -20,11 +21,12 @@ tree = ast.parse((ROOT / 'manager_82.py').read_text(encoding='utf8'))
 methods = {'_looks_sqlite', '_sqlite_snapshot', '_iter_backup_sources',
            '_write_backup_zip', '_backup_fingerprint', '_backup_operation_lock',
            '_backup_run_blocking', 'backup_once', '_backup_once_locked',
-           'restore_from_backup', 'wipe_user_data', 'admin_cmd', 'user_cmd'}
+           'restore_from_backup', 'wipe_user_data', 'admin_cmd', 'user_cmd',
+           '_is_admin_backup_file', 'accept_admin_backup_file', '_accept_admin_backup_file_locked'}
 nodes = []
 for node in tree.body:
     if isinstance(node, ast.FunctionDef) and node.name in {
-        '_h', '_hanglog_text', 'backup_file_skipped', 'backup_arc_essential'
+        '_h', '_hanglog_text', 'backup_file_skipped', 'backup_arc_essential', '_admin_upload_path'
     }:
         nodes.append(node)
     elif isinstance(node, ast.ClassDef) and node.name == 'Manager':
@@ -38,7 +40,7 @@ ns = dict(os=os, re=re, json=json, asyncio=asyncio, datetime=datetime, sqlite3=s
           _BACKUP_SKIP_NAMES={'run.log', '95.py', 'jafj_self.py', 'jafj_status.json'},
           _BACKUP_ESSENTIAL={'manager.db', 'shop.db', 'manager_config.json',
                              'manager_bot.string', 'jafj.session', 'jafj_settings.json'},
-          BACKUP_TAG='BACKUP', BUILD_VERSION='test')
+          BACKUP_TAG='BACKUP', BUILD_VERSION='test', B=lambda *args: args)
 exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(ROOT / 'manager_82.py'), 'exec'), ns)
 Manager = ns['Manager']
 
@@ -156,11 +158,59 @@ class SafetyTest(unittest.TestCase):
             self.assertIn('فقط برای مدیر', seen[-1][1])
         asyncio.run(exercise())
 
+    def test_admin_messages_not_blocked_by_backup_lock(self):
+        m = self.manager
+        m.is_admin = lambda uid: uid == 77
+        m.fsm = {}
+        calls = []
+        async def download(msg, file):
+            calls.append('download')
+            with zipfile.ZipFile(file, 'w') as z:
+                z.writestr('manager_config.json', '{"synthetic": true}')
+            return file
+        async def say(*args): return True
+        m.bot = SimpleNamespace(download_media=download)
+        m.say = say
+        text = SimpleNamespace(sender_id=77, document=None, raw_text='/start')
+        unrelated = SimpleNamespace(sender_id=77, document=SimpleNamespace(mime_type='application/pdf'),
+                                    file=SimpleNamespace(name='receipt.pdf'), raw_text='receipt')
+        upload = SimpleNamespace(sender_id=77, document=SimpleNamespace(mime_type='application/zip'),
+                                 file=SimpleNamespace(name='backup.zip'), raw_text='')
+        outsider = SimpleNamespace(sender_id=88, document=upload.document,
+                                   file=upload.file, raw_text='')
+        async def exercise():
+            lock = m._backup_operation_lock()
+            await lock.acquire()
+            try:
+                # The event handler invokes this before dispatching /start, /diag, etc.
+                self.assertFalse(await asyncio.wait_for(m.accept_admin_backup_file(text), .2))
+                self.assertFalse(await asyncio.wait_for(m.accept_admin_backup_file(unrelated), .2))
+                self.assertFalse(await asyncio.wait_for(m.accept_admin_backup_file(outsider), .2))
+                task = asyncio.create_task(m.accept_admin_backup_file(upload))
+                await asyncio.sleep(.03)
+                self.assertFalse(task.done())
+                # Permissions/state must be checked again after waiting.
+                m.fsm[77] = {'step': 'sample_set'}
+            finally:
+                lock.release()
+            self.assertFalse(await asyncio.wait_for(task, .2))
+            self.assertEqual(calls, [])
+            m.fsm.clear()
+            self.assertTrue(await m.accept_admin_backup_file(upload))
+            self.assertEqual(calls, ['download'])
+            for filename in ('jafj_backup_latest.zip', 'jafj_admin_upload.zip'):
+                with zipfile.ZipFile(self.d / filename) as z:
+                    self.assertEqual(json.loads(z.read('manager_config.json')), {'synthetic': True})
+        asyncio.run(exercise())
+
     def test_worker_cancel_cleanup_serialization_and_dirty_fingerprint(self):
         started, release = threading.Event(), threading.Event()
         m = self.manager
         m.bot, m.cfg = object(), {'admin_ids': [77]}
         m.fp, m.saved, m.paths = ('before',), None, []
+        notices = []
+        async def say(chat, text, *args): notices.append(text)
+        m.say = say
         m._backup_target = lambda: 77
         async def public(target): return False, ''
         m._backup_target_is_public = public
@@ -214,6 +264,10 @@ class SafetyTest(unittest.TestCase):
             self.assertEqual(m.saved, ('before',))
             self.assertEqual(m.fp, ('changed during upload',))
             self.assertFalse(os.path.exists(m.paths[-1]))
+            m._stopping = True
+            ok, _ = await m.backup_once(force=True)
+            self.assertTrue(ok)
+            self.assertTrue(any('سیگنال خاموشی' in text for text in notices))
         asyncio.run(exercise())
 
 
