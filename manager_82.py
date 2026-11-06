@@ -15990,16 +15990,8 @@ class Manager:
             except Exception:
                 pass
 
-    async def accept_admin_backup_file(self, ev):
-        async with self._backup_operation_lock():
-            return await self._accept_admin_backup_file_locked(ev)
-
-    async def _accept_admin_backup_file_locked(self, ev):
-        """اگر مدیر zip پشتیبان را در پیوی فرستاد، ذخیره کن تا `.restore` پیدایش کند.
-
-        پیامِ خطای بازیابی همین را می‌گوید، ولی قبلاً فقط پیامِ خودِ ربات قبول
-        می‌شد و فایلِ مدیر دور ریخته می‌شد.
-        """
+    def _is_admin_backup_file(self, ev):
+        """تشخیص سریع: پیام‌های معمولی نباید منتظر قفلِ بک‌آپ بمانند."""
         uid = getattr(ev, "sender_id", None)
         if not self.is_admin(uid):
             return False
@@ -16024,8 +16016,23 @@ class Manager:
         mime = (getattr(doc, "mime_type", None) or "")
         looks = (str(name).lower().endswith(".zip") or "zip" in str(mime).lower()
                  or BACKUP_TAG in str(caption) or "پشتیبان" in str(caption))
-        if not looks:
+        return bool(looks)
+
+    async def accept_admin_backup_file(self, ev):
+        # هر پیام مدیر از اینجا می‌گذرد. فقط فایل پشتیبان باید منتظر قفل شود؛
+        # وگرنه یک upload طولانی حتی /start و /hanglog را هم متوقف می‌کند.
+        if not self._is_admin_backup_file(ev):
             return False
+        async with self._backup_operation_lock():
+            return await self._accept_admin_backup_file_locked(ev)
+
+    async def _accept_admin_backup_file_locked(self, ev):
+        """ذخیرهٔ فایل ارسالی مدیر، سریالی با بک‌آپ و بازیابی."""
+        # وضعیت و دسترسی ممکن است در زمان انتظار برای قفل تغییر کرده باشد.
+        if not self._is_admin_backup_file(ev):
+            return False
+        uid = getattr(ev, "sender_id", None)
+        msg = getattr(ev, "message", None) or ev
         tmp = os.path.join(tempfile.gettempdir(),
                            f"jafj_in_{int(time.time())}_{os.getpid()}.zip")
         try:
@@ -16294,7 +16301,9 @@ class Manager:
                                            f"👥 {n} مشتری · 📦 {zcount} فایل · {kb}KB\n"
                                            f"جای ذخیره: تلگرام (این چت) + <code>{os.path.join(BASE_DIR, 'jafj_backup_latest.zip')}</code>" + (f" + <code>{os.path.join(BASE_DIR, 'backups/')}</code>" if os.path.isdir(os.path.join(BASE_DIR, "backups")) else "") + "\n"
                                            f"این پشتیبان شامل همه "
-                                           f"\u00ab<code>clients/</code>\u00bb (سشن و تنظیمات هر اکانت) هم هست و بعد از ری‌استارت Render خودکار بازیابی می‌شود.")
+                                           f"\u00ab<code>clients/</code>\u00bb (سشن و تنظیمات هر اکانت) هم هست و بعد از ری‌استارت Render خودکار بازیابی می‌شود."
+                                           + ("\n\n⚠️ ربات سیگنال خاموشی دریافت کرده است؛ فرستندهٔ سیگنال مشخص نیست."
+                                              if getattr(self, "_stopping", False) else ""))
             except Exception:
                 pass
             # اثرانگشتِ قبل از شروع؛ تغییرِ حین ساخت یا ارسال نباید گم شود.
