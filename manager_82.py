@@ -3691,7 +3691,8 @@ class _AdoptedProc:
         """کدِ خروج را از دیمنِ fork بگیر (۷۶ تکراری، ۷۷ سوخته، ۷۸ لاگین)."""
         try:
             if self.daemon is not None:
-                self.daemon.drain()
+                if self.daemon.drain() is False:
+                    return None  # reader busy: don't lose a meaningful exit code
                 code = self.daemon.exits.get(self.pid)
                 if isinstance(code, int):
                     return code
@@ -3752,6 +3753,7 @@ class ForkDaemon:
         self._lock = threading.Lock()
         self.last_error = ""
         self.exits = {}                 # pid → کدِ خروج (از رویدادهای دیمن)
+        self.uid_exits = {}             # شارد: خروجِ هر اکانت مستقل است
 
     def forker_path(self):
         d = os.path.dirname(os.path.abspath(self.selfbot))
@@ -3779,6 +3781,12 @@ class ForkDaemon:
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, bufsize=0, env=_env,
                 start_new_session=True)
+            # Even if readiness changes between select() and read(), read must
+            # not park the event loop forever on an empty blocking pipe.
+            try:
+                os.set_blocking(self.proc.stdout.fileno(), False)
+            except (AttributeError, OSError):
+                pass  # Serialized reads still protect platforms without it.
         except Exception as e:
             self.last_error = f"{type(e).__name__}: {e}"
             return False
@@ -3807,6 +3815,8 @@ class ForkDaemon:
                     # ۷۶ = نسخه‌ی تکراری، ۷۷ = کلیدِ سوخته، ۷۸ = نیاز به لاگین
                     try:
                         self.exits[int(msg.get("pid"))] = msg.get("code")
+                        if msg.get("uid") is not None:
+                            self.uid_exits[str(msg["uid"])] = msg.get("code")
                     except Exception:
                         pass
                     continue
@@ -3820,18 +3830,30 @@ class ForkDaemon:
                 if not r:
                     return None
                 chunk = os.read(self.proc.stdout.fileno(), 65536)
+            except BlockingIOError:
+                continue
             except Exception:
                 return None
             if not chunk:
                 return None
             self._buf += chunk
 
-    def drain(self, timeout=0.02):
-        """رویدادهای معلق را بخوان (کدِ خروجِ فرزندها را ذخیره می‌کند)."""
+    def _drain_locked(self, timeout=0.02):
+        # Caller owns _lock; no other thread may consume protocol replies.
         while True:
             msg = self._read_msg(timeout)
             if msg is None:
                 return
+
+    def drain(self, timeout=0.02):
+        """خروجی را فقط اگر خوانندهٔ دیگری مشغول نیست بخوان."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            self._drain_locked(timeout)
+            return True
+        finally:
+            self._lock.release()
 
     def _read_until(self, want, timeout=30):
         end = time.time() + timeout
@@ -3843,13 +3865,19 @@ class ForkDaemon:
                 return msg
         return None
 
-    def _read_ok(self, timeout=30, skip_events=True):
+    def _read_ok(self, timeout=30, skip_events=True, expected_uid=None):
         end = time.time() + timeout
         while time.time() < end:
             msg = self._read_msg(max(0.1, end - time.time()))
             if msg is None:
                 return None
-            if "ok" in msg:
+            # A late ping/stop response is not a reply to a run request.
+            if "ok" in msg and "accounts" not in msg and "alive" not in msg:
+                invalid = ((msg.get("ok") and not msg.get("pid"))
+                           or (expected_uid is not None and msg.get("uid") is not None
+                               and str(msg["uid"]) != str(expected_uid)))
+                if invalid and skip_events:
+                    continue
                 return msg
             if not skip_events:
                 return msg
@@ -3865,7 +3893,7 @@ class ForkDaemon:
                             "uid": str(uid)})
             except Exception as e:
                 return None, f"{type(e).__name__}: {e}"
-            msg = self._read_ok(timeout=timeout)
+            msg = self._read_ok(timeout=timeout, expected_uid=uid)
             if not msg or not msg.get("ok"):
                 return None, (msg or {}).get("error") or "پاسخِ دیمن نیامد"
             try:
@@ -3913,6 +3941,12 @@ class ShardDaemon(ForkDaemon):
         ForkDaemon.__init__(self, selfbot, python)
         self.size = int(size or shard_size())
         self.uids = {}                  # uid → pid (همیشه pid این پروسه)
+        self._status_lock = threading.Lock()
+        self._account_status = {}       # آخرین وضعیت تأییدشده، نه حدسِ timeout
+        self._status_verified_at = {}   # زمان تأیید برای محافظت از هزینهٔ مشتری
+        self._probe_inflight = False
+        self._probe_last = 0.0
+        self._probe_seq = 0
 
     def forker_path(self):
         d = os.path.dirname(os.path.abspath(self.selfbot))
@@ -3938,6 +3972,12 @@ class ShardDaemon(ForkDaemon):
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, bufsize=0, env=_env,
                 start_new_session=True)
+            # Even if readiness changes between select() and read(), read must
+            # not park the event loop forever on an empty blocking pipe.
+            try:
+                os.set_blocking(self.proc.stdout.fileno(), False)
+            except (AttributeError, OSError):
+                pass  # Serialized reads still protect platforms without it.
         except Exception as e:
             self.last_error = f"{type(e).__name__}: {e}"
             return False
@@ -3951,9 +3991,12 @@ class ShardDaemon(ForkDaemon):
         return max(0, self.size - len(self.uids))
 
     def spawn(self, cwd, log, uid, timeout=90):
-        if not self.alive():
-            self.uids.clear()
         with self._lock:
+            if not self.alive():
+                self.uids.clear()
+                with self._status_lock:
+                    self._account_status.clear()
+                    self._status_verified_at.clear()
             if not self.start():
                 return None, self.last_error or "شارد بالا نیامد"
             try:
@@ -3961,31 +4004,90 @@ class ShardDaemon(ForkDaemon):
                             "uid": str(uid)})
             except Exception as e:
                 return None, f"{type(e).__name__}: {e}"
-            msg = self._read_ok(timeout=timeout)
+            msg = self._read_ok(timeout=timeout, expected_uid=uid)
             if not msg or not msg.get("ok"):
                 return None, (msg or {}).get("error") or "پاسخِ شارد نیامد"
-            self.uids[str(uid)] = int(msg.get("pid") or 0)
-            return self.uids[str(uid)], ""
+            uid = str(uid)
+            self.uids[uid] = int(msg.get("pid") or 0)
+            self.uid_exits.pop(uid, None)
+            with self._status_lock:
+                self._account_status[uid] = True
+                self._status_verified_at[uid] = time.monotonic()
+            return self.uids[uid], ""
 
-    def alive_uid(self, uid):
-        """آیا این اکانت داخلِ شارد زنده است؟ (کدِ خروج = returncode)"""
-        uid = str(uid)
-        self.drain()
-        if not self.alive():
-            return None if uid in self.exits else False
+    def _refresh_accounts(self):
+        """پینگ شارد فقط در thread؛ None یعنی نامشخص، نه اینکه اکانت مرده."""
         with self._lock:
+            if not self.alive():
+                return None
+            self._drain_locked()
+            self._probe_seq += 1
+            request_id = self._probe_seq
             try:
-                self._send({"cmd": "ping"})
+                self._send({"cmd": "ping", "request_id": request_id})
             except Exception:
-                return False
-            end = time.time() + 5
-            while time.time() < end:
-                msg = self._read_msg(max(0.1, end - time.time()))
+                return None
+            end = time.monotonic() + 5
+            while time.monotonic() < end:
+                msg = self._read_msg(max(0.01, end - time.monotonic()))
                 if msg is None:
                     break
-                if msg.get("ok") and "accounts" in msg:
-                    return uid in [str(x) for x in msg.get("accounts") or []]
-        return False
+                # پاسخ دیرهنگامِ پینگ قبلی نباید باعث ری‌استارت اشتباه شود.
+                if (msg.get("ok") and isinstance(msg.get("accounts"), list)
+                        and msg.get("request_id") == request_id):
+                    accounts = {str(x) for x in msg["accounts"]}
+                    with self._status_lock:
+                        checked_at = time.monotonic()
+                        for uid in self.uids:
+                            self._account_status[uid] = uid in accounts
+                            self._status_verified_at[uid] = checked_at
+                    return accounts
+        return None
+
+    def _schedule_status_probe(self):
+        with self._status_lock:
+            if self._probe_inflight or time.monotonic() - self._probe_last < 5:
+                return
+            self._probe_inflight = True
+        def worker():
+            try:
+                self._refresh_accounts()
+            finally:
+                with self._status_lock:
+                    self._probe_last = time.monotonic()
+                    self._probe_inflight = False
+        try:
+            threading.Thread(target=worker, name="shard-status", daemon=True).start()
+        except Exception:
+            with self._status_lock:
+                self._probe_inflight = False
+
+    def alive_uid(self, uid):
+        """وضعیت کش‌شده؛ هرگز منتظر قفل یا پاسخ IPC روی حلقهٔ مدیر نمی‌ماند."""
+        uid = str(uid)
+        if not self.alive():
+            return False
+        self._schedule_status_probe()
+        with self._status_lock:
+            # هنگام جواب ندادن شارد، بی‌دلیل نسخهٔ دوم از سشن اجرا نکن.
+            return self._account_status.get(uid, True)
+
+    def recently_confirmed_alive(self, uid, max_age=120):
+        """وضعیت نامطمئن برای اجرای نسخهٔ دوم کافی نیست؛ برای شارژ هم کافی نیست."""
+        uid = str(uid)
+        if not self.alive():
+            return False
+        with self._status_lock:
+            checked = self._status_verified_at.get(uid)
+            return bool(self._account_status.get(uid) is True and checked is not None
+                        and time.monotonic() - checked <= max_age)
+
+    def alive_uid_confirmed(self, uid):
+        """بررسی واقعی اولیه؛ ممکن است منتظر پاسخ شارد بماند."""
+        if not self.alive():
+            return False
+        accounts = self._refresh_accounts()
+        return str(uid) in accounts if accounts is not None else None
 
     def stop_uid(self, uid, timeout=40):
         uid = str(uid)
@@ -4011,6 +4113,8 @@ class ShardDaemon(ForkDaemon):
                         except Exception:
                             pass
                     self.uids.pop(uid, None)
+                    with self._status_lock:
+                        self._account_status[uid] = False
                     return True
         self.uids.pop(uid, None)
         return False
@@ -4028,10 +4132,17 @@ class _ShardProc:
     def poll(self):
         if self.returncode is not None:
             return self.returncode
-        a = self.daemon.alive_uid(self.uid)
-        if a is True:
+        return self._poll_result(self.daemon.alive_uid(self.uid))
+
+    def poll_confirmed(self):
+        if self.returncode is not None:
+            return self.returncode
+        return self._poll_result(self.daemon.alive_uid_confirmed(self.uid))
+
+    def _poll_result(self, alive):
+        if alive is not False:   # True or unknown: never duplicate a session
             return None
-        self.returncode = self.daemon.exits.get(int(self.pid))
+        self.returncode = self.daemon.uid_exits.get(self.uid)
         if not isinstance(self.returncode, int):
             self.returncode = 1
         return self.returncode
@@ -5622,7 +5733,9 @@ class Supervisor:
         # اجرای Popen به‌تنهایی نشانه سالم‌بودن سلف نیست؛ ممکن است فوراً با
         # Session خراب یا خطای ورود بسته شود. نتیجه اولیه را بررسی می‌کنیم.
         time.sleep(1.2)
-        if p.poll() is not None:
+        # Preserve the existing initial failure detection for a fresh shard.
+        initial_rc = p.poll_confirmed() if isinstance(p, _ShardProc) else p.poll()
+        if initial_rc is not None:
             self.procs.pop(uid, None)
             self._clear_pid(uid)
             rc = p.returncode
@@ -14581,6 +14694,13 @@ class Manager:
                         uid = c["uid"]
                         if not self.sup.is_running(uid):
                             continue
+                        proc = self.sup.procs.get(uid)
+                        if (isinstance(proc, _ShardProc)
+                                and not proc.daemon.recently_confirmed_alive(uid)):
+                            # هنگام قطع پاسخ شارد، بدون تأیید کارکرد از مشتری
+                            # هزینه نگیریم و بعداً هم زمان نامعلوم را تسویه نکنیم.
+                            self.shop.p_reset_charge(uid)
+                            continue
                         if self.has_sub(uid) or self.trial_active(uid):
                             self.shop.p_reset_charge(uid)   # اشتراکی‌ها و تست رایگان معافند
                             continue
@@ -17218,6 +17338,14 @@ class Manager:
         پروسه هست ولی حلقه‌ی اصلی گیر کرده. هر دو قبلاً بی‌صدا بودند.
         """
         notes = []
+        try:
+            proc = self.sup.procs.get(uid)
+            if (isinstance(proc, _ShardProc) and proc.daemon.alive()
+                    and proc.returncode is None
+                    and not proc.daemon.recently_confirmed_alive(uid)):
+                notes.append("⚠️ وضعیت شارد موقتاً نامشخص است؛ پاسخ تازه نرسیده")
+        except Exception:
+            pass
         try:
             stt = self.sup.read_status(uid) or {}
         except Exception:

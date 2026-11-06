@@ -17,7 +17,8 @@ namespace جدا `exec` می‌شود؛ بعد `main()` همان namespace در 
     {"cmd":"run","cwd":"/…/clients/123","log":"/…/run.log","uid":"123"}
       → {"ok":true,"pid":<shard pid>,"uid":"123"}
     {"cmd":"stop","uid":"123"}     → {"ok":true,"uid":"123"}
-    {"cmd":"ping"}                 → {"ok":true,"accounts":[…]}
+    {"cmd":"ping","request_id":N} → {"ok":true,"accounts":[…],"request_id":N}
+    {"cmd":"ping"}                 → {"ok":true,"accounts":[…]} (قدیمی)
     {"cmd":"quit"}                 → خروج
     رویداد: {"event":"exit","uid":"123","code":0}
 
@@ -357,8 +358,11 @@ def main():
             if not ok:
                 break
         elif cmd == "ping":
-            _reply({"ok": True, "accounts": sorted(
-                u for u, a in accounts.items() if a.alive())}, out_lock)
+            reply = {"ok": True, "accounts": sorted(
+                u for u, a in accounts.items() if a.alive())}
+            if "request_id" in msg:
+                reply["request_id"] = msg["request_id"]
+            _reply(reply, out_lock)
         elif cmd == "quit":
             break
         else:
