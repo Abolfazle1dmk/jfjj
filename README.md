@@ -89,6 +89,55 @@ Railway/Render/blitz که خاموش نشده). پیام «🔄 اتصال رب�
 Volume/دیسک روی `/data` وصل کن. بعد از بوت، `/diag` باید بگوید
 «داده: /data»؛ اگر «بوت سرد: بله» داد، یعنی داده ماندگار نیست.
 
+### اجرا روی Enzonic Deploy (بیلد از سورس، بدون Docker)
+
+Enzonic Deploy فعلاً **ایمیج داکر نمی‌سازد**؛ فقط از سورس بیلد می‌کند
+(Node.js، Bun، Python، Go). اگر پروژه روی حالت **Dockerfile** بماند، در بیلد
+دقیقاً همین را می‌گوید:
+
+> Dockerfile projects cannot be built yet: Enzonic Deploy builds Node.js, Bun,
+> Python and Go apps from source. Set the root directory to the app's folder or
+> pick a framework preset in the project settings
+
+یعنی مشکل از کد نیست، از **preset** است: همین ریپو یک اپِ پایتونی است و برای
+بیلدِ سورسی آماده است (`requirements.txt` + `start.sh` + `Procfile`). فقط در
+**Settings → Framework** گزینه‌ی `Dockerfile` را بردار و **Python** را انتخاب کن.
+
+| چیز | مقدار |
+| --- | --- |
+| Framework | **Python** (نه Dockerfile) |
+| Python | **3.11** (از `.python-version`؛ همان نسخهٔ `python:3.11-slim` در Dockerfile) |
+| Root directory | ریشهٔ ریپو — نه زیرپوشه |
+| Install command | `pip install -r requirements.txt` |
+| Start command | `sh start.sh` (یا `sh hostless-start.sh`؛ `Procfile` و `nixpacks.toml` هم همین را می‌گویند) |
+| Port | `PORT` را خودِ Enzonic می‌دهد — **دست نزن** |
+| Health check | `/healthz` (شناسهٔ سرویس = bot، نه worker) |
+| Env | `BOT_TOKEN`، `DATA_GITHUB_TOKEN` (اینجا عملاً اجباری)، اختیاری: `DATA_GITHUB_REPO`، `BACKUP_CHAT`، `BOT_TZ`، `DATA_DIR` |
+
+**تفاوتِ بیلدِ سورسی با ایمیج (بدان، وگرنه «همه‌چیز پرید»):**
+
+- در بیلدِ سورسی `Dockerfile` اجرا نمی‌شود، پس نه `/opt/jafj` هست و نه
+  `VOLUME ["/data"]`. کد از خودِ چک‌اوت اجرا می‌شود (`start.sh` →
+  `hostless-start.sh` → `JAFJ_IMAGE_DIR=$HERE`) و `DATA_DIR` اولین مسیرِ
+  قابل‌نوشتن است: `/data` → `$JAFJ_DATA_MOUNT` → `$HOME/jafj-data` → خودِ
+  پوشهٔ کد (که در لاگ هشدار می‌دهد، چون با هر دیپلوی پاک می‌شود).
+- اگر Enzonic دیسکِ ماندگار می‌دهد، آن را روی `/data` وصل کن (یا
+  `DATA_DIR=/data` بگذار) تا `manager.db`، `shop.db` و `clients/<uid>/`
+  بین دیپلوی‌ها بمانند.
+- اگر دیسکِ ماندگار نداری، `DATA_GITHUB_TOKEN` را ست کن: `tools/gh_data_sync.py`
+  قبل از بوت داده را برمی‌گرداند و دوره‌ای push می‌کند — همان چیزی که روی
+  blitz.cloud پلنِ رایگان هم اجباری است.
+- بعد از بوت `/diag` را بزن: باید «داده: …» بدهد و «بوت سرد: **نه**». اگر
+  «بوت سرد: بله» داد، داده ماندگار نیست و با هر دیپلوی صفر می‌شوی.
+
+**اگر روی Enzonic باز هم گفت «The process stopped soon after it started ·
+Exit code 0»:** این همان چیزی است که `start.sh`/`hostless-start.sh` برایش
+نوشته شده‌اند — `JAFJ_HOSTED=1` باعث می‌شود خروجِ ۰ هم کرش شمرده و پروسه
+درجا بالا بیاید. فقط مطمئن شو start command خالی نمانده و همان `sh start.sh`
+است؛ اگر خالی بماند، Enzonic سراغ `Procfile` می‌رود (که همین را می‌گوید).
+
+راهنمای گام‌به‌گام و جدولِ عیب‌یابی: [`ENZONIC_DEPLOY_FA.md`](ENZONIC_DEPLOY_FA.md).
+
 ### اجرا روی GitHub Codespaces
 
 Codespaces هم یک میزبانِ آماده است: ماشینِ ۲ هسته، ۱۲۰ core-hour رایگان در
