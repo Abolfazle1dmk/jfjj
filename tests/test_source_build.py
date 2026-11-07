@@ -152,10 +152,12 @@ def build_checkout(manager_body):
     (code / "manager_82.py").write_text(manager_body, encoding="utf-8")
     if (REPO / "tools").is_dir():
         shutil.copytree(REPO / "tools", code / "tools")
+    if (REPO / "enzonic").is_dir():
+        shutil.copytree(REPO / "enzonic", code / "enzonic")
     return code
 
 
-def run_start(code, extra_env, timeout=120):
+def run_start(code, extra_env, timeout=120, subdir=None):
     env = clean_env()
     env.update({"PORT": str(free_port()),
                 "HOME": str(ROOT / "home"),
@@ -167,7 +169,8 @@ def run_start(code, extra_env, timeout=120):
     env["JAFJ_IMAGE_DIR"] = str(code)
     env.pop("JAFJ_IMAGE_DIR")          # بگذار خودش تصمیم بگیرد
     env.update(extra_env)
-    p = subprocess.run(["sh", "start.sh"], cwd=str(code), env=env,
+    cwd = str(code / subdir) if subdir else str(code)
+    p = subprocess.run(["sh", "start.sh"], cwd=cwd, env=env,
                        capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout + p.stderr, env
 
@@ -237,11 +240,71 @@ def check_source_run():
     check(rc != 0, "کدِ خروج غیرصفر است تا پلتفرم خطا را ببیند (rc=%s)" % rc)
 
 
+# ── ۶) پوشهٔ اپ برای «Root directory = enzonic» ─────────────────────────────
+def check_app_folder():
+    print("--- 6: enzonic/ (راهِ «Set the root directory to the app's folder») ---")
+    d = REPO / "enzonic"
+    if not check(d.is_dir(), "پوشهٔ enzonic/ هست"):
+        return
+    check(not (d / "Dockerfile").exists(),
+          "این پوشه Dockerfile ندارد (تشخیصِ خودکار روی Docker نمی‌ماند)")
+    check((d / "start.sh").exists() and (d / "requirements.txt").exists()
+          and (d / ".python-version").exists() and (d / "Procfile").exists(),
+          "همان چیزهایی را دارد که بیلدِ سورسی لازم دارد")
+    req = (d / "requirements.txt").read_text(encoding="utf-8").strip()
+    check(req == "-r ../requirements.txt",
+          "requirements تکرار نشده، به فایلِ اصلی اشاره می‌کند (%s)" % req)
+    check((d / ".python-version").read_text(encoding="utf-8").strip()
+          == (REPO / ".python-version").read_text(encoding="utf-8").strip(),
+          "نسخهٔ پایتون با نسخهٔ ریشه یکی است")
+    t = (d / "start.sh").read_text(encoding="utf-8")
+    check('exec sh "$APP_ROOT/start.sh"' in t,
+          "به ورودیِ ریشه وصل است (کد همان چک‌اوت است، نه کپیِ دوم)")
+    sh = subprocess.run(["sh", "-n", str(d / "start.sh")], capture_output=True, text=True)
+    check(sh.returncode == 0, "سینتکس sh سالم است")
+
+
+def check_app_folder_run():
+    print("--- 7: اجرا با Root directory = enzonic ---")
+    data = ROOT / "data2"
+    data.mkdir(parents=True, exist_ok=True)
+    stub = ROOT / "stub3.txt"
+    code = build_checkout(NOOP_MANAGER)
+    rc, out, _ = run_start(code, {
+        "DATA_DIR": str(data),
+        "STUB_OUT": str(stub),
+        "JAFJ_SUPERVISE": "0",
+    }, subdir="enzonic")
+    print("\n".join(l for l in out.splitlines() if "code=" in l)[:600])
+    check(rc == 0, "start.sh داخلِ enzonic/ (بدون Dockerfile) اجرا شد (rc=%s)" % rc)
+    check(stub.exists(), "ربات از همان پوشهٔ اپ بالا آمد")
+    if stub.exists():
+        got = stub.read_text(encoding="utf-8")
+        check("code=%s" % code in got,
+              "کد از ریشهٔ چک‌اوت اجرا شد، نه از enzonic/")
+        check("data=%s" % data in got, "DATA_DIR رعایت شد")
+
+    print("--- 8: اگر enzonic/ تنها کپی شود، پیامِ روشن می‌دهد ---")
+    lone = ROOT / "lone"
+    shutil.rmtree(lone, ignore_errors=True)
+    lone.mkdir(parents=True)
+    shutil.copy2(REPO / "enzonic" / "start.sh", lone / "start.sh")
+    env = clean_env()
+    env.update({"PORT": str(free_port()), "PATH": os.environ.get("PATH", "")})
+    p = subprocess.run(["sh", "start.sh"], cwd=str(lone), env=env,
+                       capture_output=True, text=True, timeout=60)
+    check(p.returncode != 0, "با نبودِ ریشه، شکست می‌خورد (rc=%s)" % p.returncode)
+    check("repository root is not next to this folder" in (p.stdout + p.stderr),
+          "و می‌گوید کدام تنظیم غلط است (نه یک خطای گیج‌کننده)")
+
+
 def main():
     ok = check_build_files()
     check_start_script()
+    check_app_folder()
     if ok:
         check_source_run()
+        check_app_folder_run()
     else:
         print("SKIP  اجرای واقعی (فایل‌های ورودی ناقص‌اند)")
     print()

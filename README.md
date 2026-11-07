@@ -136,6 +136,13 @@ Exit code 0»:** این همان چیزی است که `start.sh`/`hostless-start
 درجا بالا بیاید. فقط مطمئن شو start command خالی نمانده و همان `sh start.sh`
 است؛ اگر خالی بماند، Enzonic سراغ `Procfile` می‌رود (که همین را می‌گوید).
 
+**اگر dropdown روی `Dockerfile` گیر کرده (یا گزینهٔ Python در لیست نیست):**
+Root directory را از `/` به **`enzonic`** عوض کن. آن پوشه هیچ `Dockerfile`ی
+ندارد و فقط `requirements.txt` (با `-r ../requirements.txt`)، `.python-version`،
+`Procfile` و `start.sh` را دارد — یعنی همان «app's folder» که خودِ پیامِ خطا
+پیشنهاد می‌دهد. Start command همان `sh start.sh` می‌ماند و کد همچنان از ریشهٔ
+چک‌اوت اجرا می‌شود (نه یک کپیِ دوم). جزئیات: [`enzonic/README.md`](enzonic/README.md).
+
 راهنمای گام‌به‌گام و جدولِ عیب‌یابی: [`ENZONIC_DEPLOY_FA.md`](ENZONIC_DEPLOY_FA.md).
 
 ### اجرا روی GitHub Codespaces
