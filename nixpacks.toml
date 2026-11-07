@@ -1,14 +1,6 @@
-# Source builds (no Docker image): Enzonic Deploy, Hostless "Python build",
-# Render native Python, Heroku/nixpacks, a plain VPS.
-#
-# Nixpacks detects Python from requirements.txt but cannot infer the app's
-# entrypoint, because this service is a long-running Telegram bot rather than a
-# conventional web module ("No start command could be found"). start.sh is the
-# portable entrypoint: it runs the code from the checkout, binds the health
-# server to $PORT/0.0.0.0 and supervises exits. `sh hostless-start.sh` works
-# too — start.sh only adds the host label before delegating to it.
-#
-# The Python version comes from .python-version (3.11), the same minor version
-# the Dockerfile pins (python:3.11-slim).
+# Nixpacks detects Python from requirements.txt, but cannot infer the app's
+# entrypoint because this service is a long-running Telegram bot rather than a
+# conventional web module. Use the same host-aware launcher as a Python build
+# on Hostless so it also binds the health server to $PORT and supervises exits.
 [start]
-cmd = "sh start.sh"
+cmd = "sh hostless-start.sh"
