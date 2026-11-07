@@ -1,4 +1,0 @@
-# Root directory = enzonic (no Dockerfile here): Nixpacks cannot infer the
-# entrypoint of a long-running Telegram bot.
-[start]
-cmd = "sh start.sh"

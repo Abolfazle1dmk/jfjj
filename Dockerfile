@@ -12,10 +12,10 @@ COPY 95.py ./
 RUN mkdir -p /opt/jafj \
     && cp /app/manager_82.py /opt/jafj/manager_82.py \
     && cp /app/95.py /opt/jafj/95.py
-COPY railway-start.sh render-start.sh blitz-start.sh hostless-start.sh start.sh /opt/jafj/
+COPY railway-start.sh render-start.sh blitz-start.sh hostless-start.sh /opt/jafj/
 COPY tools/ /opt/jafj/tools/
 RUN chmod 755 /opt/jafj/railway-start.sh /opt/jafj/render-start.sh /opt/jafj/blitz-start.sh \
-    && chmod 755 /opt/jafj/hostless-start.sh /opt/jafj/start.sh
+    && chmod 755 /opt/jafj/hostless-start.sh
 # ── persistent data on Docker PaaS (blitz.cloud, Render, Fly, a plain VPS) ────
 # A container's filesystem is thrown away when it restarts. blitz.cloud keeps
 # EXACTLY the folders the image declares with VOLUME (and reserves plan storage
