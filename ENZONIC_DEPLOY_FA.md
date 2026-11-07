@@ -60,6 +60,32 @@ cmd = "sh start.sh"
 
 پس در هر سه حالت یک مقصد اجرا می‌شود.
 
+### اگر preset عوض نشد: `Root directory = enzonic`
+
+خودِ پیامِ خطا دو راه می‌دهد؛ دومی («Set the root directory to the app's
+folder») وقتی به کار می‌آید که dropdown روی `Dockerfile` گیر کرده باشد یا
+گزینهٔ `Python` در لیست نباشد. چون ریشهٔ ریپو یک `Dockerfile` دارد (برای
+blitz/Render/Railway) و تشخیصِ خودکار همان را می‌بیند، پوشهٔ `enzonic/` ساخته
+شده که **هیچ Dockerfile‌ای ندارد** و فقط چیزهای بیلدِ سورسی را دارد:
+
+| فیلد | مقدار |
+| --- | --- |
+| Root directory | **`enzonic`** |
+| Framework | `Python` (یا هر چیزی که خودش تشخیص داد) |
+| Install command | `pip install -r requirements.txt` |
+| Start command | `sh start.sh` |
+
+داخلِ آن پوشه چیزی تکرار نشده: `requirements.txt` فقط
+`-r ../requirements.txt` است و `start.sh` به `../start.sh` می‌رسد:
+
+```
+enzonic/start.sh → ../start.sh → hostless-start.sh → railway-start.sh
+```
+
+یعنی کدِ ربات همان چک‌اوت است. اگر پلتفرم فقط محتوای `enzonic/` را کپی کند
+(ریشه در دسترس نباشد)، اسکریپت با پیامِ روشن «the repository root is not next
+to this folder» می‌ایستد تا معلوم باشد کدام تنظیم غلط است.
+
 ### متغیرهای محیطی
 
 | متغیر | لازم؟ | کار |
