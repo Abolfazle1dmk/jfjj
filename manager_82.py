@@ -1939,11 +1939,13 @@ def _cgroup_memory_available_mb(cgroup_root="/sys/fs/cgroup",
     return min(headroom) // (1024 * 1024) if headroom else None
 
 
-def _extract_zip_member_streaming(zf, arc, dest, chunk_size=64 * 1024):
+def _extract_zip_member_streaming(zf, arc, dest, chunk_size=64 * 1024, pacer=None):
     """یک عضو ZIP را تکه‌تکه و اتمیک استخراج کن، بدون zf.read() در RAM.
 
     فایل‌های دیتابیس/سشن ممکن است از RAM پلن رایگان بزرگ‌تر باشند. zf.read()
     کلِ عضوِ فشرده‌نشده را یکجا می‌سازد و می‌تواند کانتینر را با کد ۱۳۷ بکشد.
+    pacer: بودجهٔ CPU اختیاری؛ هر تکه یک checkpoint می‌خورد تا استخراجِ یک
+    فایلِ چندمگابایتی (فشرده‌گشایی) یک جهشِ طولانی در مصرف نسازد.
     """
     directory = os.path.dirname(dest)
     if directory:
@@ -1951,7 +1953,13 @@ def _extract_zip_member_streaming(zf, arc, dest, chunk_size=64 * 1024):
     tmp = dest + ".restore_tmp"
     try:
         with zf.open(arc, "r") as src, open(tmp, "wb") as out:
-            shutil.copyfileobj(src, out, length=max(4096, int(chunk_size or 0)))
+            while True:
+                chunk = src.read(max(4096, int(chunk_size or 0)))
+                if not chunk:
+                    break
+                out.write(chunk)
+                if pacer is not None:
+                    pacer.checkpoint()
         size = os.path.getsize(tmp)
         os.replace(tmp, dest)
         try:
@@ -6598,16 +6606,32 @@ def admin_menu(pending=0, tickets=0, trial_on=True):
 
 
 class _BackupCpuPacer:
-    """سهم CPU تردِ بک‌آپ را در Wispbyte پخش می‌کند، نه CPU کل کانتینر را.
+    """بودجهٔ CPU کارهای سنگینِ بک‌آپ/بازیابی را در Wispbyte پخش می‌کند.
 
-    این محدودکننده تضمین سقف کل نمی‌دهد: سایر تردها و سلف‌ها مستقل‌اند.
-    برای پشتیبان پایانیِ SIGTERM عمداً مکث نمی‌کنیم تا فرصت ارسال از بین نرود.
+    «درصدِ یک هسته» است، نه «درصدِ سهمیه/سقفِ کانتینر»؛ با عددِ پنلِ هاست
+    یکی نیست. این کنترلر فقط رشتهٔ خودش را آهسته می‌کند و سقفِ مصرفِ کلِ
+    برنامه (مدیر + سلف‌ها + ارسال تلگرام) را تضمین نمی‌کند. برای پشتیبانِ
+    پایانیِ SIGTERM عمداً مکث نمی‌کنیم تا فرصت ارسال از بین نرود.
+
+    دو متغیر جدا دارد چون این دو کار اوجِ خیلی متفاوتی دارند:
+      JAFJ_BACKUP_CPU_PERCENT     → اثرانگشت و اسنپ‌شات و ZIP (پیش‌فرض ۸)
+      JAFJ_RESTORE_CPU_PERCENT    → استخراجِ پشتیبان موقع بازیابی (پیش‌فرض ۵۰)
     """
-    def __init__(self, manager):
+    DEFAULT_BACKUP_PERCENT = 8.0
+    DEFAULT_RESTORE_PERCENT = 50.0
+
+    def __init__(self, manager, purpose="backup"):
         self.manager = manager
-        default = "8" if (os.environ.get("JAFJ_HOST_LABEL") or "").strip().lower() == "wispbyte" else "0"
+        self.purpose = "restore" if purpose == "restore" else "backup"
+        host = (os.environ.get("JAFJ_HOST_LABEL") or "").strip().lower()
+        default_cap = (self.DEFAULT_RESTORE_PERCENT if self.purpose == "restore"
+                       else self.DEFAULT_BACKUP_PERCENT)
+        env_name = ("JAFJ_RESTORE_CPU_PERCENT" if self.purpose == "restore"
+                    else "JAFJ_BACKUP_CPU_PERCENT")
+        # روی میزبان دیگر پیش‌فرض «بدون محدودیت» است تا رفتارِ قبلی عوض نشود.
+        default = default_cap if host == "wispbyte" else 0.0
         try:
-            percent = float(os.environ.get("JAFJ_BACKUP_CPU_PERCENT", default))
+            percent = float(os.environ.get(env_name, default))
             if not (0 <= percent <= 100):
                 raise ValueError("invalid percentage")
         except (TypeError, ValueError):
@@ -6630,6 +6654,24 @@ class _BackupCpuPacer:
                 time.sleep(delay)
         self.wall = time.monotonic()
         self.cpu = time.thread_time()
+
+    def over_deadline(self, deadline, now=None):
+        """مهلتِ کار را با «زمانِ CPU مصرف‌شده» بسنج، نه با ساعتِ دیوار.
+
+        بدون این، روی Wispbyte که همین رشته عمداً آهسته می‌شود، مهلتِ
+        ثابتِ ۱۲۰ ثانیه‌ای قبل از پایانِ کار تمام می‌شد و پشتیبان شکست
+        می‌خورد. ساعتِ دیوار فقط وقتی ملاک است که این محدودکننده خاموش باشد.
+        """
+        if not self.enabled:
+            return (now if now is not None else time.monotonic()) > deadline
+        return (time.thread_time() - self.cpu) > max(0.0, float(deadline))
+
+    def deadline_hint(self, cpu_seconds):
+        """«این مهلت با بودجهٔ فعلی حدوداً چقدر طول می‌کشد» برای متنِ خطا."""
+        if not self.enabled or self.fraction <= 0:
+            return ""
+        return (f" — با بودجهٔ CPU {self.fraction * 100:.0f}٪ این معادلِ حدودِ "
+                f"{int(float(cpu_seconds) / self.fraction)} ثانیه کار است")
 
 
 # ── نمونه‌برداری سبک CPU؛ درصد = سهم از یک هسته، نه درصد سهمیه ──
@@ -6719,6 +6761,41 @@ def _cpu_group_seconds(path, version):
         elif version == "v1":
             with open(os.path.join(path, "cpuacct.usage"), encoding="ascii") as f:
                 return int(f.read().strip()) / 1000000000.0
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _cpu_quota_cores(path, version):
+    """سهمیهٔ CPU همین cgroup بر حسب «هسته» یا None اگر نامحدود است.
+
+    «۳۵٪» فقط وقتی معنا دارد که بدانیم ۳۵٪ از چه چیزی. اگر سقفِ کانتینر
+    مثلاً ۰٫۵ هسته باشد، ۳۵٪ از یک هسته یعنی ۷۰٪ از سهمیه. پس این عدد را
+    برای گزارش کنارِ درصد می‌گذاریم؛ خودش هیچ‌چیز را محدود نمی‌کند.
+    """
+    try:
+        v2 = os.path.join(path, "cpu.max")
+        if version == "v2" and os.path.isfile(v2):
+            with open(v2, encoding="ascii") as f:
+                quota, _, period = f.read().strip().partition(" ")
+            if quota.strip() == "max":
+                return None
+            return int(quota) / float(period or 100000)
+        if version == "v1":
+            quota_path = os.path.join(path, "cpu.cfs_quota_us")
+            period_path = os.path.join(path, "cpu.cfs_period_us")
+            if os.path.isfile(quota_path):
+                with open(quota_path, encoding="ascii") as f:
+                    quota = int(f.read().strip())
+                if quota <= 0:
+                    return None
+                period = 100000
+                try:
+                    with open(period_path, encoding="ascii") as f:
+                        period = int(f.read().strip()) or 100000
+                except (OSError, ValueError):
+                    pass
+                return quota / float(period)
     except (OSError, ValueError):
         pass
     return None
@@ -6824,6 +6901,7 @@ class Manager:
         self._cpu_report_in_flight = False
         self._cpu_monitor_started = False
         self._cpu_monitor_stop = threading.Event()
+        self._cpu_avg = None             # (درصد از یک هسته, طول نمونه) — فقط گزارش
 
     # ---------- گزارش CPU به مدیر؛ بدون تغییر در زمان‌بندی سلف ----------
     def _cpu_pending_path(self):
@@ -6902,12 +6980,18 @@ class Manager:
             return False
 
     def _start_cpu_monitor(self):
-        """یک thread نمونه‌بردار مستقل از asyncio، پیش‌فرض فقط برای Wispbyte."""
+        """thread نمونه‌بردارِ مستقل از asyncio — هم هشدار، هم میانگین برای /diag.
+
+        پیش‌فرض فقط روی Wispbyte. دو کار می‌کند: هر نمونه را در
+        `self._cpu_avg` نگه می‌دارد (برای دیدنِ «الان چقدر است؟» در /diag) و
+        اگر میانگین از آستانه بگذرد یک گزارش به مدیر می‌فرستد.
+        """
         flag = (os.environ.get("JAFJ_CPU_MONITOR") or "").strip().lower()
         if not flag:
             flag = "1" if (os.environ.get("JAFJ_HOST_LABEL") or "").strip().lower() == "wispbyte" else "0"
         if flag not in ("1", "true", "yes", "on") or self._cpu_monitor_started:
             return
+        self._cpu_monitor_started = True
         self._cpu_queue_report()  # گزارش قبلی حتی اگر cgroup دیگر در دسترس نباشد
         group, version = _cpu_cgroup_dir()
         if not group or _cpu_group_seconds(group, version) is None:
@@ -6924,7 +7008,7 @@ class Manager:
         threshold = setting("JAFJ_CPU_ALERT_PERCENT", 25.0, 1.0, 1000.0)
         interval = setting("JAFJ_CPU_SAMPLE_SECONDS", 3.0, 1.0, 60.0)
         cooldown = setting("JAFJ_CPU_ALERT_COOLDOWN", 300.0, 30.0, 86400.0)
-        self._cpu_monitor_started = True
+        quota = _cpu_quota_cores(group, version)
 
         def worker():
             previous_cpu = _cpu_group_seconds(group, version)
@@ -6941,6 +7025,8 @@ class Manager:
                     if (current_cpu is not None and previous_cpu is not None
                             and current_cpu >= previous_cpu and elapsed > 0):
                         total = 100.0 * (current_cpu - previous_cpu) / elapsed
+                        # آخرین میانگینِ نمونه برای /diag (فقط گزارش، هیچ تصمیمی)
+                        self._cpu_avg = (total, elapsed)
                         if total >= threshold and current_time - last_alert >= cooldown:
                             sample = {"total": total, "seconds": elapsed,
                                       "when": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
@@ -6960,7 +7046,8 @@ class Manager:
                     print(f"  ⚠️ نمونه‌برداری CPU: {type(e).__name__}", flush=True)
 
         threading.Thread(target=worker, name="jafj-cpu-monitor", daemon=True).start()
-        print(f"  📊 گزارش CPU روشن: آستانه {threshold:g}٪ از یک هسته، نمونه {interval:g} ثانیه", flush=True)
+        where = f" از سهمیهٔ {quota:.2f} هسته" if quota else " از یک هسته"
+        print(f"  📊 گزارش CPU روشن: آستانه {threshold:g}٪{where}، نمونه {interval:g} ثانیه", flush=True)
 
     # ---------- پایداریِ داده (کرش نباید اطلاعات را ببرد) ----------
     def _gh_sync_cmd(self):
@@ -16035,17 +16122,32 @@ class Manager:
         uri = "file:" + quote(os.path.abspath(src), safe="/") + "?mode=ro"
         src_conn = sqlite3.connect(uri, uri=True, timeout=2)
         last_progress = time.monotonic()
-        deadline = last_progress + 120
+        # مهلت بر حسب «زمانِ کار» سنجیده می‌شود. وقتی بودجهٔ CPU روشن است
+        # (Wispbyte) همین کار عمداً کشیده می‌شود و مهلتِ دیواریِ ثابت پیش از
+        # پایانِ کپی تمام می‌شد.
+        paced = bool(getattr(pacer, "enabled", False))
+        deadline = (120.0 if paced else last_progress + 120)
+        stall_limit = (45.0 if paced else 30.0)
         last_remaining = None
+        last_cpu = time.thread_time() if paced else 0.0
         def progress(status, remaining, total):
-            nonlocal last_progress, last_remaining
+            nonlocal last_progress, last_remaining, last_cpu
             current = time.monotonic()
-            if current > deadline:
-                raise TimeoutError("sqlite snapshot deadline")
-            if last_remaining is None or remaining < last_remaining:
-                last_progress = current
-            elif current - last_progress > 30:
-                raise TimeoutError("sqlite snapshot stalled")
+            if getattr(pacer, "over_deadline", None):
+                expired = pacer.over_deadline(deadline, current)
+            else:
+                expired = current > deadline
+            if expired:
+                hint = pacer.deadline_hint(120.0) if paced else ""
+                raise TimeoutError("sqlite snapshot deadline" + hint)
+            cpu = time.thread_time() if paced else 0.0
+            if not paced or (cpu - last_cpu) >= 1.0:
+                # ساعتِ «گیرکردن» فقط با کارِ واقعی جلو می‌رود؛ نه با مکثِ عمدی.
+                last_cpu = cpu
+                if last_remaining is None or remaining < last_remaining:
+                    last_progress = current
+                elif current - last_progress > stall_limit:
+                    raise TimeoutError("sqlite snapshot stalled")
             last_remaining = remaining
             if pacer is not None:
                 pacer.checkpoint()
@@ -16942,6 +17044,7 @@ class Manager:
                                     pass
                         try:
                             with zipfile.ZipFile(zip_path, "r") as z:
+                                _rp = _BackupCpuPacer(self, "restore")
                                 names = z.namelist()
                                 for arc in names:
                                     arc_norm = arc.replace("\\", "/")
@@ -16957,7 +17060,7 @@ class Manager:
                                     else:
                                         continue
                                     try:
-                                        _extract_zip_member_streaming(z, arc, dest)
+                                        _extract_zip_member_streaming(z, arc, dest, pacer=_rp)
                                     except Exception:
                                         continue
                         except Exception as e:
@@ -17133,6 +17236,7 @@ class Manager:
             # ── استخراج ──
             try:
                 with zipfile.ZipFile(zip_path, "r") as z:
+                    _rp = _BackupCpuPacer(self, "restore")
                     names = z.namelist()
                     # ایمن‌سازی: هیچ arc نباید از BASE_DIR بیرون برود
                     for arc in names:
@@ -17173,7 +17277,7 @@ class Manager:
                         try:
                             # جریانِ ZIP را مستقیم به دیسک می‌ریزیم؛ z.read عضوِ
                             # کامل را در RAM می‌ساخت و روی پلن‌های 256MB باعث OOM می‌شد.
-                            size = _extract_zip_member_streaming(z, arc, dest)
+                            size = _extract_zip_member_streaming(z, arc, dest, pacer=_rp)
                             print(f"  ♻️ بازیابی {arc_norm} ({size} بایت)", flush=True)
                         except Exception as e:
                             print(f"  ⚠️ استخراج/نوشتن {bn}: {e}", flush=True)
@@ -17526,6 +17630,48 @@ class Manager:
             shown += 1
         return out
 
+    def cpu_diag_lines(self):
+        """«۳۵٪» را با شرایطِ واقعیِ همین کانتینر مقایسه کن (فقط گزارش)."""
+        out = []
+        try:
+            group, version = _cpu_cgroup_dir()
+        except Exception:
+            group, version = None, None
+        quota = _cpu_quota_cores(group, version) if group else None
+        if quota:
+            out.append(f"🖥 سهمیهٔ CPU کانتینر: {quota:.2f} هسته "
+                       f"(۳۵٪ از یک هسته ≈ {min(100.0, 35.0 / quota):.0f}٪ از سهمیه)")
+        elif group:
+            out.append("🖥 سهمیهٔ CPU کانتینر: نامحدود (کلِ هسته‌ها در دسترس است)")
+        else:
+            out.append("🖥 سهمیهٔ CPU: خوانده نشد (cgroup در دسترس نیست)")
+        busy = getattr(self, "_cpu_avg", None)
+        if busy:
+            pct, secs = busy
+            extra = (f" = {min(100.0, pct / quota):.0f}٪ از سهمیه" if quota else "")
+            out.append(f"📊 مصرفِ میانگینِ اخیر: {pct:.1f}٪ از یک هسته{extra} "
+                       f"(میانگینِ {secs:.0f} ثانیه)")
+        else:
+            out.append("📊 مصرفِ میانگینِ اخیر: هنوز نمونه‌ای نیست — چند دقیقه‌ای "
+                       "بعد از بالا آمدن دوباره ببین")
+        try:
+            bk = _BackupCpuPacer(self)
+            rs = _BackupCpuPacer(self, "restore")
+        except Exception:
+            bk = rs = None
+        def _p(pacer, env_name):
+            if pacer is None:
+                return env_name + ": نامشخص"
+            if not pacer.enabled:
+                return env_name + ": خاموش"
+            return (f"{env_name}: {pacer.fraction * 100:.0f}٪ از یک هسته"
+                    + (f" = {pacer.fraction / quota * 100:.0f}٪ از سهمیه" if quota else ""))
+        out.append("🧢 بودجهٔ CPU بک‌آپ → " + _p(bk, "JAFJ_BACKUP_CPU_PERCENT"))
+        out.append("🧢 بودجهٔ CPU بازیابی → " + _p(rs, "JAFJ_RESTORE_CPU_PERCENT"))
+        out.append("  <i>این بودجه فقط کارِ سنگینِ همان thread را آهسته می‌کند؛ "
+                   "سقفِ مصرفِ کلِ ربات (مدیر + سلف‌ها + ارسالِ تلگرام) نیست.</i>")
+        return out
+
     def mem_diag_lines(self, free=None):
         """«حافظه» با اعدادِ واقعی — تا «کم‌آوردنِ رم» قابلِ اثبات باشد.
 
@@ -17658,6 +17804,7 @@ class Manager:
              (f"🔑 نیاز به لاگین: {_fa_digits(n_login)}"
               f" (کد نمی‌رود؛ /needlogin)" if n_login else "🔑 نیاز به لاگین: ۰"),
              *self.mem_diag_lines(free),
+             *self.cpu_diag_lines(),
              *self.live_diag_lines(),
              f"⏱ بالا: {up // 60} دقیقه"]
         try:
