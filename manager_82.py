@@ -2411,7 +2411,7 @@ SELFBOT = find_selfbot()
 # ── تنظیمات مستقیم داخل همین فایل Python ──
 # توکن تازه در BotFather صادر شده (توکن قبلی Revoke شد تا سرویس زامبیِ
 # حساب Railway قدیمی که دسترسی‌اش از دست رفته، کور شود).
-BOT_TOKEN = "8832561144:AAFSRpyaD4M9GWWsiltBMXs6acbbo6W0J-M"
+BOT_TOKEN = "9216878638:AAGVwb3pFJ_oONnMqSNLusAIpS9FfkMR5dY"
 API_ID = 28039994
 API_HASH = "00877cdcd706564a4de6abf7f7d64349"
 ADMIN_IDS = [8287266200]
