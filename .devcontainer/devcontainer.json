@@ -9,7 +9,7 @@
 
   "secrets": {
     "BOT_TOKEN": {
-      "description": "توکن ربات مدیر از @BotFather (اگر خالی بماند، توکنِ داخلِ کد استفاده می‌شود)"
+      "description": "توکن ربات مدیر از @BotFather (الزامی؛ توکنِ داخلِ کد وجود ندارد)"
     },
     "API_ID": {
       "description": "api_id از my.telegram.org — برای سلفِ مشتری‌ها لازم است"

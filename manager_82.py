@@ -2409,9 +2409,10 @@ def ensure_fresh_code():
 SELFBOT = find_selfbot()
 
 # ── تنظیمات مستقیم داخل همین فایل Python ──
-# توکن تازه در BotFather صادر شده (توکن قبلی Revoke شد تا سرویس زامبیِ
-# حساب Railway قدیمی که دسترسی‌اش از دست رفته، کور شود).
-BOT_TOKEN = "9216878638:AAGVwb3pFJ_oONnMqSNLusAIpS9FfkMR5dY"
+# توکن ربات دیگر داخل کد نگهداری نمی‌شود. مقدار را فقط از متغیر محیطی
+# BOT_TOKEN یا manager_config.json بدهید. اگر هیچ توکنی تنظیم نشده باشد،
+# ربات نمی‌تواند به تلگرام لاگین کند.
+BOT_TOKEN = ""
 API_ID = 28039994
 API_HASH = "00877cdcd706564a4de6abf7f7d64349"
 ADMIN_IDS = [8287266200]
@@ -2737,7 +2738,7 @@ def reconnect_limit():
 
 
 # خطاهایی که یعنی «توکن مرده/باطل‌شده» است، نه مشکل شبکه. در این حالت به‌جای
-# حلقه‌ی انتظار روی همان توکن، سراغ توکن بعدی (هاردکد داخل ایمیج) می‌رویم — این
+# حلقه‌ی انتظار روی همان توکن، سراغ توکن جایگزینِ تنظیم‌شده می‌رویم — این
 # همان شفای خودکار بعد از Revoke در BotFather است.
 _DEAD_TOKEN_MARKS = (
     "unauthorized", "auth key", "authkey", "revoked", "invalid",
@@ -3173,7 +3174,8 @@ class Config:
                     self.d["restart_fee"] = 20
             except Exception as e:
                 print(f"⚠️ خواندن تنظیمات: {e}")
-        # اولویت اتصال: متغیر محیطی → manager_config.json → هاردکد.
+        # اولویت اتصال: متغیر محیطی → manager_config.json → پیش‌فرضِ خالی.
+        # توکن دیگر هاردکد نیست؛ اگر env/file توکن ندهند، ربات لاگین نمی‌کند.
         # قبلاً هاردکد همیشه روی فایل می‌نشست و api_id شخصی کاربر هیچ‌وقت
         # اعمال نمی‌شد؛ api_id مشترک دلیل اصلی FloodWait روی ورود بود.
         _env_token = (os.environ.get("BOT_TOKEN") or "").strip()
@@ -15319,10 +15321,9 @@ class Manager:
                 continue
 
             # ── 2) ورود با توکن ──
-            # لیست توکن‌ها: اول توکن تنظیمات/متغیر محیطی، بعد توکن هاردکد داخل
-            # همین فایل (ایمیج). اگر توکن قبلی در BotFather باطل (Revoke) شده و
-            # توکن جدید در کد آمده ولی توکن کهنه توی manager_config.json یا
-            # متغیر BOT_TOKEN گیر کرده باشد، خودکار سراغ هاردکد می‌رویم.
+            # لیست توکن‌ها: اول توکن تنظیمات/متغیر محیطی، بعد BOT_TOKENِ ماژول
+            # اگر غیرخالی باشد. توکن هاردکدی در کد نیست؛ اگر هیچ توکنی تنظیم
+            # نشده باشد، تلاش ورود انجام نمی‌شود.
             candidates = []
             for t in (token, BOT_TOKEN):
                 t = (t or "").strip()
@@ -15334,7 +15335,7 @@ class Manager:
                     client2 = TelegramClient(StringSession(), api_id, api_hash)
                     await client2.start(bot_token=cand)
                     if cand != token:
-                        print("  🔑 توکن تنظیمات معتبر نبود؛ با توکن داخل کد وارد "
+                        print("  🔑 توکن تنظیمات معتبر نبود؛ با توکن جایگزین وارد "
                               "شدم و تنظیمات را به‌روز می‌کنم", flush=True)
                         try:
                             self.cfg["bot_token"] = cand
