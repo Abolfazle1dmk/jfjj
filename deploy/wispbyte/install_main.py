@@ -8,7 +8,7 @@ import os
 import sys
 import urllib.request
 
-REPO = (os.environ.get("JAFJ_REPO") or "abolfazleoy/jfjj").strip()
+REPO = (os.environ.get("JAFJ_REPO") or "Abolfazle1dmk/jfjj").strip()
 TOK = (os.environ.get("JAFJ_GIT_TOKEN") or "").strip()
 HERE = os.path.dirname(os.path.abspath(__file__))
 DST = os.path.join(HERE, "main.py")

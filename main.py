@@ -44,7 +44,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 os.chdir(HERE)
 
-DEFAULT_REPO = "abolfazleoy/jfjj"
+DEFAULT_REPO = "Abolfazle1dmk/jfjj"
 DEFAULT_BRANCH = "main"
 
 CODE_DIR = HERE / "code"
@@ -376,6 +376,8 @@ def sync_code():
                     "(یا میزبان دسترسی به گیت‌هاب ندارد).")
     else:
         log("code موجود است — به‌روزرسانی…")
+        run(["git", "-C", str(CODE_DIR), "remote", "set-url", "origin", url],
+            quiet=True)
         r = run(["git", "-C", str(CODE_DIR), "fetch", "--depth", "1",
                  "origin", branch()])
         if r is not None and r.returncode == 0:

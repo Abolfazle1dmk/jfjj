@@ -47,7 +47,7 @@ HERE = Path(__file__).resolve().parent
 os.chdir(HERE)
 
 BOOT_VERSION = "2026-11-02-slim3"
-DEFAULT_REPO = "abolfazleoy/jfjj"
+DEFAULT_REPO = "Abolfazle1dmk/jfjj"
 DEFAULT_BRANCH = "main"
 
 CODE_DIR = HERE / "code"
@@ -595,6 +595,8 @@ def sync_code():
                     "چک کن (یا میزبان به github.com دسترسی ندارد).")
     else:
         log("code موجود است — به‌روزرسانی…")
+        run(["git", "-C", str(CODE_DIR), "remote", "set-url", "origin", url],
+            quiet=True)
         if run(["git", "-C", str(CODE_DIR), "fetch", "--depth", "1", "origin",
                 branch()]).returncode == 0:
             run(["git", "-C", str(CODE_DIR), "reset", "--hard", "FETCH_HEAD"])
