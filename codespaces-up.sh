@@ -19,7 +19,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 set -eu
 
-REPO="${JAFJ_REPO:-abolfazleoy/jfjj}"
+REPO="${JAFJ_REPO:-Abolfazle1dmk/jfjj}"
 BRANCH="${JAFJ_BRANCH:-main}"
 DISPLAY="${JAFJ_CODESPACE_NAME:-jafj}"
 MACHINE="${JAFJ_CODESPACE_MACHINE:-standardLinux}"
