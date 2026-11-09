@@ -2215,6 +2215,42 @@ def selfbot_version(path):
     return (m.group(1) if m else "").strip()
 
 
+def selfbot_file_problem(path):
+    """(مشکل دارد؟, دلیلِ فارسی) — فایلِ سلف هست ولی قابل اجرا نیست.
+
+    «۹۲ اجرا نمی‌شود» در عمل همیشه یکی از این‌هاست: فایل نیست، خالی است،
+    نصفه دانلود شده، یا متنش پایتونِ سالم نیست. قبلاً همه‌ی این حالت‌ها
+    فقط یک خط در لاگ می‌گذاشتند و مشتری می‌دید «روشن شد» ولی هیچ پیامی
+    نمی‌آمد.
+
+    عمداً سخت‌گیر نیست: فقط چیزی را رد می‌کند که **قطعاً** اجرا نمی‌شود
+    (خالی، یا خطای سینتکس). نسخه‌های دیگرِ سلف که ساختارِ متفاوتی دارند
+    نباید بلاک شوند.
+    """
+    p = str(path or "")
+    if not p or not os.path.isfile(p):
+        return True, f"فایلِ سلف پیدا نشد ({p or 'مسیر نامعلوم'})"
+    try:
+        size = os.path.getsize(p)
+    except Exception:
+        size = 0
+    if size <= 0:
+        return True, f"فایلِ سلف خالی است ({p})"
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            src = f.read()
+    except Exception as e:
+        return True, f"فایلِ سلف خوانده نشد ({type(e).__name__}: {e})"
+    try:
+        compile(src, p, "exec")
+    except SyntaxError as e:
+        return True, (f"فایلِ سلف خطای سینتکس دارد (خط {e.lineno}) — دانلود/"
+                      f"کپی نیمه‌کاره یا HTML-escape شده: {p}")
+    except Exception:
+        pass
+    return False, ""
+
+
 def purge_old_selfbots(root="."):
     """هر فایل جفج‌سلف / jafj_self / self.py را پاک می‌کند."""
     gone = []
@@ -4263,6 +4299,113 @@ DUP_FAIL_RE = re.compile(
     r"two (?:clients|processes|instances)", re.I)
 
 
+# نشانه‌ی «پنل واقعاً بالا آمد» در لاگ/فایل‌های خودِ سلف. وجودِ پروسه هیچ
+# چیزی را ثابت نمی‌کند: سلف می‌تواند زنده باشد و سشنش به اکانتِ **دیگری**
+# وصل شود (Session جابه‌جا/تکراری) یا هنوز به پنل نرسیده باشد. نتیجه‌اش
+# دقیقاً همان گزارشِ «ربات می‌گوید روشن شد، ولی در Saved Messages هیچ
+# پیامی نمی‌آید و پنل جواب نمی‌دهد» است.
+PANEL_READY_RE = re.compile(
+    r"آنلاین شد|آماده — در Saved Messages|آنلاین شد — پنل فعال", re.I)
+# خطِ ورودِ موفق در `jafj.log` سلف: `... login ... me | id=123`
+LOGIN_ID_RE = re.compile(r"(?:login|ورود)[^\n]*?\bid=(-?\d+)", re.I)
+STALE_READY_SEC = 300              # ضربانِ قدیمی‌تر از این = «گیر کرده»
+
+
+def account_mismatch(expected, actual):
+    """اکانتِ لاگین‌شده با اکانتِ ثبت‌شده فرق دارد؟ (None = نمی‌دانیم)
+
+    چرا: اگر سشن عوض شود یا فایلِ سشن از پوشه‌ی دیگری بیاید، سلف با
+    موفقیت بالا می‌آید ولی روی اکانتِ دیگری؛ مدیر پیام «روشن شد» می‌دهد و
+    مشتری در Saved Messages **هیچ** پیامی نمی‌بیند چون پیام‌ها به اکانتِ
+    دیگری می‌رود. این تابع همان حالت را از عددها تشخیص می‌دهد.
+    """
+    try:
+        exp = int(expected or 0)
+    except Exception:
+        exp = 0
+    try:
+        act = int(actual or 0)
+    except Exception:
+        act = 0
+    if not exp or not act:
+        return None
+    return exp != act
+
+
+def selfbot_readiness(folder, expected_uid=None, proc_alive=None, now_ts=None):
+    """آیا سلفِ این پوشه واقعاً به پنل رسیده؟ → dict
+
+    خروجی: {"ready": bool|None, "state": "ready|starting|stale|wrong_account|
+    crashed|no_status", "why": متنِ فارسی, "uid": اکانتِ لاگین‌شده یا None}
+
+    `ready=None` یعنی «هنوز معلوم نیست» (سلف تازه شروع کرده) — همان چیزی
+    که نباید به‌عنوان موفقیت یا شکست گزارش شود.
+    """
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    out = {"ready": None, "state": "no_status", "why": "", "uid": None}
+    folder = str(folder or "")
+    # ۱) آخرین وضعیتِ خودِ سلف (jafj_status.json) — عددِ اکانت را هم دارد.
+    stt = _read_json_soft(os.path.join(folder, "jafj_status.json"))
+    if stt:
+        try:
+            out["uid"] = int(stt.get("user_id") or 0) or None
+        except Exception:
+            out["uid"] = None
+        try:
+            age = now_ts - float(stt.get("ts") or 0)
+        except Exception:
+            age = None
+        mm = account_mismatch(expected_uid, out["uid"])
+        if mm:
+            out.update(ready=False, state="wrong_account",
+                       why=(f"سلف با اکانتِ {out['uid']} وصل شده، نه اکانتِ "
+                            f"ثبت‌شده ({expected_uid}) — سشنِ این پوشه به "
+                            "اکانتِ دیگری تعلق دارد؛ پیام‌های پنل به همان "
+                            "اکانتِ دیگر می‌رود."))
+            return out
+        if age is not None and age <= STALE_READY_SEC:
+            out.update(ready=True, state="ready", why="")
+            return out
+        if age is not None:
+            out.update(ready=False, state="stale",
+                       why=f"ضربانِ سلف {int(age // 60)} دقیقه است تازه نشده "
+                           "(پروسه هست ولی حلقه‌ی اصلی گیر کرده).")
+            return out
+    # ۲) آخرین خطوطِ لاگ: «آنلاین شد» یعنی پنل بالا آمده.
+    tail = ""
+    try:
+        with open(os.path.join(folder, "run.log"), encoding="utf-8",
+                  errors="ignore") as f:
+            tail = f.read()[-6000:]
+    except Exception:
+        tail = ""
+    if tail:
+        try:
+            ids = LOGIN_ID_RE.findall(tail)
+            if ids:
+                out["uid"] = int(ids[-1])
+        except Exception:
+            pass
+        mm = account_mismatch(expected_uid, out["uid"])
+        if mm:
+            out.update(ready=False, state="wrong_account",
+                       why=(f"سلف با اکانتِ {out['uid']} وصل شده، نه اکانتِ "
+                            f"ثبت‌شده ({expected_uid})."))
+            return out
+        if PANEL_READY_RE.search(tail):
+            out.update(ready=True, state="ready", why="")
+            return out
+    # ۳) هیچ نشانه‌ای نیست: یا تازه شروع کرده یا اصلاً بالا نیامده.
+    if proc_alive is False:
+        out.update(ready=False, state="crashed",
+                   why="پروسه‌ی سلف زنده نیست و هیچ نشانه‌ای از پنل در لاگ نیست.")
+        return out
+    out.update(ready=None, state="starting" if proc_alive else "no_status",
+               why=("هنوز نشانه‌ای از «آنلاین شد» در لاگِ سلف نیست "
+                    "(در حال اتصال است)."))
+    return out
+
+
 def classify_selfbot_log(tail, rc=None):
     """علتِ توقفِ سلف از آخرین خطوطِ run.log → (نوع, توضیحِ فارسی)."""
     t = tail or ""
@@ -4313,6 +4456,17 @@ def selfbot_failure_notice(nm, uid, kind, hint, tail=""):
     if kind == "dup":
         body += ("\n💡 دو نسخه هم‌زمان روی همین اکانت اجرا شده بود؛ "
                  "نسخه‌ی اضافه بسته شد و سشن سالم است.\n")
+    if kind == "account":
+        body += ("\n💡 سلف بالا آمد ولی با **اکانتِ دیگری** وصل شد؛ برای همین "
+                 "پنل در Saved Messages همین اکانت نمی‌آید. سشنِ این پوشه "
+                 "به اکانتِ دیگری تعلق دارد — یک‌بار از «🚀 راه‌اندازی سلف "
+                 "روی اکانتم» با همین شماره دوباره لاگین کن.\n")
+    if kind == "unconfirmed":
+        body += ("\n💡 پروسه بالا است ولی تا دو دقیقه هیچ نشانه‌ای از رسیدنِ "
+                 "پنل نیامد (نه «آنلاین شد» و نه ضربانِ وضعیت). یعنی سلف "
+                 "در اتصال به تلگرام گیر کرده یا در حلقه‌ی تلاش است. "
+                 "«📜 گزارش» را ببین؛ اگر «اتصال قطع شد» تکراری بود، "
+                 "شبکه/فیلترِ میزبان یا دو نسخه روی یک سشن را چک کن.\n")
     if kind == "keydup":
         body += ("\n💡 تلگرام این سشن را **سوزانده** (AuthKeyDuplicated): "
                  "یک سشن هم‌زمان از دو IPِ مختلف استفاده شده — معمولاً دو "
@@ -4958,6 +5112,8 @@ class Supervisor:
         # uid -> توضیحِ فارسیِ علت (برای پیامِ مشتری و /diag)
         self.last_detail = {}
         self._fail_notified = {} # uid -> زمانِ آخرین اطلاع‌رسانیِ شکست
+        # uid -> زمانی که سلف واقعاً «آنلاین شد» را دیدیم (نه فقط Popen).
+        self.last_ready = {}
         self._deps_ok = None     # آیا sys.executable می‌تواند telethon را import کند؟
         self.mgr = None          # به Manager وصل می‌شود
         # uid -> {"n": تعداد تلاش‌های ناموفق، "next": زمانِ تلاشِ بعدی}
@@ -5127,6 +5283,32 @@ class Supervisor:
             return d
         except Exception:
             return None
+
+    def readiness(self, uid, proc_alive=None):
+        """آیا سلفِ این اکانت واقعاً پنل را بالا آورده؟ (ready/starting/stale/…)
+
+        «پروسه زنده است» فقط یعنی پایتون اجرا شده؛ نه اینکه سشن به همین
+        اکانت وصل شده و نه اینکه پنل جواب می‌دهد. این تابع شاهدِ واقعی
+        (`jafj_status.json` و لاگ) را می‌خواند و اکانتِ لاگین‌شده را با
+        اکانتِ ثبت‌شده (`tg_id`) مقایسه می‌کند.
+        """
+        expected = 0
+        try:
+            c = self.db.get(uid) or {}
+            expected = int(c.get("tg_id") or c.get("uid") or 0)
+        except Exception:
+            expected = 0
+        try:
+            folder = self.folder(uid)
+        except Exception:
+            folder = os.path.join(CLIENTS_DIR, str(uid))
+        if proc_alive is None:
+            try:
+                proc_alive = self.is_running(uid)
+            except Exception:
+                proc_alive = None
+        return selfbot_readiness(folder, expected_uid=expected,
+                                 proc_alive=proc_alive)
 
     def write_defaults(self, uid, max_accounts=1):
         """تنظیمات اولیه سلف — فقط اگر از قبل نبود."""
