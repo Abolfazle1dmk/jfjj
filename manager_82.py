@@ -5670,9 +5670,33 @@ class Supervisor:
                 tail = ""
             kind, hint = classify_selfbot_log(tail, rc)
             if rc is None:
-                if not kind:                  # سالم و در حال کار
+                # «زنده» با «پنل بالا آمده» یکی نیست. تا وقتی نشانه‌ای از
+                # «آنلاین شد» یا اکانتِ درست در لاگ نباشد، گفتنِ «روشن شد»
+                # دروغ است و مشتری در Saved Messages هیچ پیامی نمی‌بیند.
+                rd = self.readiness(uid, proc_alive=True)
+                if rd.get("state") == "wrong_account":
+                    self.last_failure[uid] = "account"
+                    self.last_detail[uid] = (rd.get("why") or "")[:300]
                     try:
-                        self.db.log(uid, "alive", f"{int(delay)}s pid={p.pid}")
+                        self.db.log(uid, "start_wrong_account",
+                                    str(rd.get("why") or "")[:300])
+                    except Exception:
+                        pass
+                    self._notify_start_failure(uid, "account",
+                                               rd.get("why") or "", tail)
+                    return
+                if rd.get("ready") is True:
+                    try:
+                        self.last_ready[uid] = time.time()
+                        self.db.log(uid, "panel_ready", f"{int(delay)}s pid={p.pid}")
+                    except Exception:
+                        pass
+                    return
+                if not kind:                  # زنده و در حال اتصال
+                    try:
+                        self.db.log(uid, "alive",
+                                    f"{int(delay)}s pid={p.pid} — "
+                                    "هنوز «آنلاین شد» در لاگ نیست")
                     except Exception:
                         pass
                     return
@@ -5721,6 +5745,77 @@ class Supervisor:
         try:
             threading.Thread(target=_run, daemon=True,
                              name=f"jafj-watch-{uid}").start()
+        except Exception:
+            pass
+
+    def _confirm_ready(self, uid, p, budget=None, every=None):
+        """تا `budget` ثانیه صبر کن تا شاهدِ واقعیِ پنل دیده شود.
+
+        چرا لازم است: `start` فقط می‌گوید «پروسه ساخته شد». سلفی که سشنش
+        به اکانتِ دیگر تعلق دارد یا دیر وصل می‌شود، در نگاهِ اول «سالم»
+        به نظر می‌رسد و مشتری در Saved Messages هیچ پیامی نمی‌بیند —
+        همان گزارشِ «ربات می‌گوید بالا آمد ولی پنل نمی‌آید».
+        """
+        if budget is None:
+            try:
+                budget = float(os.environ.get("JAFJ_READY_BUDGET", "") or 120)
+            except Exception:
+                budget = 120.0
+        if every is None:
+            every = 10.0
+        end = time.time() + max(10.0, budget)
+        last = {}
+        while time.time() < end:
+            if self.procs.get(uid) is not p:
+                return last          # پروسه عوض/خاموش شد؛ کارِ دیگری ندارد
+            if p.poll() is not None:
+                return last          # مرگ را _watch_start گزارش می‌کند
+            rd = self.readiness(uid, proc_alive=True)
+            last = rd
+            if rd.get("state") == "wrong_account":
+                self.last_failure[uid] = "account"
+                self.last_detail[uid] = (rd.get("why") or "")[:300]
+                try:
+                    self.db.log(uid, "start_wrong_account",
+                                str(rd.get("why") or "")[:300])
+                except Exception:
+                    pass
+                try:
+                    self._notify_start_failure(uid, "account",
+                                               rd.get("why") or "",
+                                               self.tail(uid, 25))
+                except Exception:
+                    pass
+                return rd
+            if rd.get("ready") is True:
+                try:
+                    self.last_ready[uid] = time.time()
+                    self.db.log(uid, "panel_ready_confirmed",
+                                f"{int(budget)}s pid={getattr(p, 'pid', 0)}")
+                except Exception:
+                    pass
+                return rd
+            time.sleep(max(1.0, min(every, end - time.time())))
+        # تا آخرِ بودجه هم شاهدی نبود: «روشن» هست ولی پنل تأیید نشده.
+        try:
+            self.last_detail[uid] = (last.get("why") or
+                                     "شاهدِ پنل در لاگ نیامد")[:300]
+            self.db.log(uid, "panel_unconfirmed", self.last_detail[uid])
+        except Exception:
+            pass
+        try:
+            self._notify_start_failure(uid, "unconfirmed",
+                                       self.last_detail.get(uid) or "",
+                                       self.tail(uid, 25))
+        except Exception:
+            pass
+        return last
+
+    def _confirm_ready_async(self, uid, p):
+        try:
+            threading.Thread(target=self._confirm_ready, args=(uid, p),
+                             daemon=True,
+                             name=f"jafj-ready-{uid}").start()
         except Exception:
             pass
 
@@ -5891,6 +5986,23 @@ class Supervisor:
             return self._why(uid, "manager",
                              f"فایلِ سلف نیست یا خالی است: {SELFBOT}",
                              hint="۹۵.py سرِ جایش نیست")
+        # فایل هست ولی «فایل» به‌تنهایی یعنی هیچ: نصفه/خالی/نسخه‌ی دیگر.
+        # بدونِ این چک، پروسه بالا می‌آمد و فوراً می‌مرد و مشتری فقط
+        # «روشن شد» می‌دید (دقیقاً همان «اجرا نمی‌شود»).
+        _bad, _why_bad = selfbot_file_problem(SELFBOT)
+        if _bad:
+            try:
+                _restore_selfbot(os.path.abspath(SELFBOT))
+            except Exception:
+                pass
+            _bad2, _why_bad2 = selfbot_file_problem(SELFBOT)
+            if _bad2:
+                return self._why(
+                    uid, "selfbot",
+                    f"فایلِ سلف قابل اجرا نیست: {_why_bad2}. "
+                    "همین فایل باید ۹۵.pyِ سالم باشد (نسخه‌ی مرجع ایمیج: "
+                    f"{SELFBOT_REF}) — ایمیج را دوباره بساز/Redeploy بزن.",
+                    hint="فایلِ سلف خراب/ناقص است")
         if not self.python_deps_ok():
             # فقط هشدار، نه توقف: خودِ 95.py اول telethon را نصب می‌کند
             # (pip) و اگر نشد می‌میرد؛ آن مرگ را _watch_start با علتِ
@@ -6047,7 +6159,13 @@ class Supervisor:
         # ثانیه‌های اول را زیرِ نظر بگیر: مرگِ دیرتر یا «گیرکردن در اتصال»
         # همین‌جا معلوم می‌شود، نه با صبر کردنِ الکیِ مشتری.
         self._watch_start(uid, p)
-        return True, f"روشن شد (pid {p.pid})"
+        # یک نگاهِ کوتاه کافی نیست: سلفی که دیر وصل می‌شود یا با اکانتِ
+        # دیگری بالا می‌آید، در ۲۵ ثانیه‌ی اول «سالم» دیده می‌شد. این
+        # تأییدِ بلندمدت تا دو دقیقه ادامه می‌دهد و تا وقتی شاهدِ پنل
+        # نباشد، «روشن» را موفق اعلام نمی‌کند.
+        self._confirm_ready_async(uid, p)
+        return True, (f"روشن شد (pid {p.pid}) — پنل در چند ثانیه‌ی آینده "
+                      "تأیید می‌شود")
 
     def stop(self, uid, remember_off=False):
         """خاموش کردن پروسه.
