@@ -2452,7 +2452,7 @@ RETIRED_BOT_IDS = ("8832561144",)
 API_ID = 28039994
 API_HASH = "00877cdcd706564a4de6abf7f7d64349"
 ADMIN_IDS = [8287266200]
-BUILD_VERSION = "v1109-bot9216"
+BUILD_VERSION = "v1109-panelcheck"
 # کدام کامیتِ گیت دارد اجرا می‌شود؟ (اول JAFJ_COMMIT که هاست/اسکریپتِ بوت
 # می‌تواند بدهد، بعد تلاشِ محلی برای git — داخلِ ایمیج معمولاً .git نیست)
 GIT_COMMIT = ""
@@ -2518,7 +2518,7 @@ def uptime_text():
     parts.append(f"{mins} دقیقه")
     return " و ".join(parts)
 CODE_IS_STALE = (os.path.dirname(MANAGER_PATH) != os.path.abspath(image_dir()))
-BUILD_TAG = "JAFJ_MANAGER_82_v1109-bot9216_2026_11_09"
+BUILD_TAG = "JAFJ_MANAGER_82_v1109-panelcheck_2026_11_09"
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  شناسه‌ی نمونه (instance) + تشخیص «سرویس قدیمی هنوز روشنه»
@@ -11675,7 +11675,26 @@ class Manager:
                 ok, msg = self.sup.stop(uid, remember_off=True)
             elif act == "log":
                 await ans()
-                return await self.edit(ev, "📜 <b>گزارش</b>\n\n<pre>" +
+                # بالای لاگ، «آیا پنل واقعاً بالا آمده؟» را می‌گوییم؛ وگرنه
+                # کاربر فقط لاگِ خام می‌بیند و نمی‌داند مشکل کجاست.
+                head = ""
+                try:
+                    _rd = self.sup.readiness(uid)
+                    _st = {"ready": "✅ پنل تأیید شد",
+                           "starting": "⏳ در حال اتصال",
+                           "stale": "⚠️ ضربان کهنه",
+                           "wrong_account": "⛔ اکانتِ اشتباه",
+                           "crashed": "⛔ پروسه مرده"}.get(
+                               _rd.get("state"), "؟")
+                    head = f"وضعیت: {_st}"
+                    if _rd.get("uid"):
+                        head += f" · اکانتِ لاگین‌شده: <code>{_rd['uid']}</code>"
+                    if _rd.get("why"):
+                        head += f"\n{self._esc(_rd['why'])[:300]}"
+                    head += "\n" + self.LINE + "\n"
+                except Exception:
+                    head = ""
+                return await self.edit(ev, "📜 <b>گزارش</b>\n" + head + "<pre>" +
                     self.sup.tail(uid, 20).replace("<", "&lt;")[-2000:] + "</pre>",
                     [[B("🔄 بروزرسانی", "s:log")], back_btn("m:svc")])
             else:
@@ -17931,10 +17950,20 @@ class Manager:
                 # باشد و هیچ حلقه‌ای کار نکند. این‌جا ضربانِ وضعیت و
                 # ری‌استارت‌شدنِ حلقه‌ها را هم می‌گوییم.
                 notes = self._alive_notes(uid)
+                # «پروسه زنده» ≠ «پنل بالا آمده». اگر شاهدِ پنل نباشد،
+                # اینجا هم همان را می‌گوییم تا کسی دنبالِ پنلِ گم‌شده نگردد.
+                try:
+                    rd = self.sup.readiness(uid, proc_alive=True)
+                except Exception:
+                    rd = {}
+                if rd.get("ready") is not True and rd.get("why"):
+                    notes = [f"⚠️ پنل تأیید نشد: {self._esc(rd['why'])[:90]}"] \
+                        + list(notes or [])
                 if not detail and not notes:
                     continue
                 line = (f"  • {self._esc(nm)[:24]} <code>{uid}</code>: "
-                        "روشن ✅")
+                        + ("روشن ✅" if rd.get("ready") is True
+                           else "روشن (پنل تأیید نشد) ⚠️"))
                 if notes:
                     line += "\n    " + " · ".join(notes)
                 out.append(line)
