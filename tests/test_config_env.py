@@ -48,25 +48,26 @@ def run(extra_env, port):
                        capture_output=True, text=True, timeout=30)
     return p.stdout + p.stderr
 
-def scenario_file_wins_over_hardcode():
-    print("--- 1: file wins over hardcoded ---")
+def scenario_file_api_wins_and_hardcode_token_wins_over_stale_file():
+    print("--- 1: file api_id/hash win, hardcoded BOT_TOKEN beats stale file token ---")
     reset()
-    # write config file with custom api_id
     with open(os.path.join(DATA, "manager_config.json"), "w", encoding="utf-8") as f:
-        json.dump({"bot_token": "FILE_TOKEN_abc", "api_id": 11111, "api_hash": "FILE_HASH_xyz"}, f)
+        json.dump({"bot_token": "8832561144:OLD_STALE_TOKEN", "api_id": 11111, "api_hash": "FILE_HASH_xyz"}, f)
     out = run({}, 8131)
     print(out.strip().splitlines()[-3:])
-    good = "api_id=11111" in out and "FILE_TOKEN_abc" in out and "FILE_HASH_xyz" in out
-    # ensure hardcoded 28039994 NOT used
-    if "28039994" in out:
-        good = False
+    good = (
+        "api_id=11111" in out
+        and "FILE_HASH_xyz" in out
+        and "bot_token=<set:len=46,prefix='921'>" in out
+        and "28039994" not in out
+    )
     print("scenario1:", "PASS" if good else "FAIL")
     if not good:
         print(out[-2000:])
     return good
 
 def scenario_env_wins_over_file():
-    print("--- 2: env wins over file ---")
+    print("--- 2: env wins over file and hardcoded ---")
     reset()
     with open(os.path.join(DATA, "manager_config.json"), "w", encoding="utf-8") as f:
         json.dump({"bot_token": "FILE_TOKEN_abc", "api_id": 11111, "api_hash": "FILE_HASH_xyz"}, f)
@@ -81,7 +82,6 @@ def scenario_env_wins_over_file():
 def scenario_hardcode_fallback():
     print("--- 3: hardcoded fallback (no file, no env) ---")
     reset()
-    # no file
     out = run({}, 8133)
     print(out.strip().splitlines()[-3:])
     good = "api_id=28039994" in out and "bot_token=<set:len=46,prefix='921'>" in out
@@ -90,23 +90,21 @@ def scenario_hardcode_fallback():
         print(out[-2000:])
     return good
 
-def scenario_empty_file_token_uses_hardcode():
-    print("--- 4: empty bot_token in file falls back to hardcoded ---")
+def scenario_retired_env_token_ignored():
+    print("--- 4: retired BOT_TOKEN in env is ignored ---")
     reset()
-    with open(os.path.join(DATA, "manager_config.json"), "w", encoding="utf-8") as f:
-        json.dump({"bot_token": "", "api_id": 28039994, "api_hash": "FILE_HASH_xyz"}, f)
-    out = run({}, 8134)
+    out = run({"BOT_TOKEN": "8832561144:AAFSRpyaD4M9GWWsiltBMXs6acbbo6W0J-M"}, 8134)
     print(out.strip().splitlines()[-3:])
-    good = "bot_token=<set:len=46,prefix='921'>" in out and "FILE_HASH_xyz" in out
+    good = "bot_token=<set:len=46,prefix='921'>" in out
     print("scenario4:", "PASS" if good else "FAIL")
     if not good:
         print(out[-2000:])
     return good
 
 if __name__ == "__main__":
-    ok = (scenario_file_wins_over_hardcode()
+    ok = (scenario_file_api_wins_and_hardcode_token_wins_over_stale_file()
           and scenario_env_wins_over_file()
           and scenario_hardcode_fallback()
-          and scenario_empty_file_token_uses_hardcode())
+          and scenario_retired_env_token_ignored())
     print("ALL:", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)

@@ -2409,13 +2409,14 @@ def ensure_fresh_code():
 SELFBOT = find_selfbot()
 
 # ── تنظیمات مستقیم داخل همین فایل Python ──
-# توکن پیش‌فرض ربات داخل کد تنظیم شده؛ اگر متغیر محیطی BOT_TOKEN یا مقدارِ
-# غیرخالی در manager_config.json داده شود، روی این مقدار اولویت دارد.
+# توکن پیش‌فرض ربات داخل کد تنظیم شده؛ روی توکن‌های قدیمیِ ذخیره‌شده در
+# manager_config.json یا بک‌آپ اولویت دارد تا تعویض ربات بلافاصله اعمال شود.
 BOT_TOKEN = "9216878638:AAGVwb3pFJ_oONnMqSNLusAIpS9FfkMR5dY"
+RETIRED_BOT_IDS = ("8832561144",)
 API_ID = 28039994
 API_HASH = "00877cdcd706564a4de6abf7f7d64349"
 ADMIN_IDS = [8287266200]
-BUILD_VERSION = "v1028-nocode"
+BUILD_VERSION = "v1109-bot9216"
 # کدام کامیتِ گیت دارد اجرا می‌شود؟ (اول JAFJ_COMMIT که هاست/اسکریپتِ بوت
 # می‌تواند بدهد، بعد تلاشِ محلی برای git — داخلِ ایمیج معمولاً .git نیست)
 GIT_COMMIT = ""
@@ -2481,7 +2482,7 @@ def uptime_text():
     parts.append(f"{mins} دقیقه")
     return " و ".join(parts)
 CODE_IS_STALE = (os.path.dirname(MANAGER_PATH) != os.path.abspath(image_dir()))
-BUILD_TAG = "JAFJ_MANAGER_82_v1028-nocode_2026_10_28"
+BUILD_TAG = "JAFJ_MANAGER_82_v1109-bot9216_2026_11_09"
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  شناسه‌ی نمونه (instance) + تشخیص «سرویس قدیمی هنوز روشنه»
@@ -3173,14 +3174,27 @@ class Config:
                     self.d["restart_fee"] = 20
             except Exception as e:
                 print(f"⚠️ خواندن تنظیمات: {e}")
-        # اولویت اتصال: متغیر محیطی → manager_config.json (غیرخالی) → هاردکد.
-        # اگر در دیسکِ قبلی bot_token خالی ذخیره شده باشد، روی توکنِ داخل کد
-        # ننشیند و ربات بتواند با توکنِ ثبت‌شده بالا بیاید.
-        if not str(self.d.get("bot_token") or "").strip() and BOT_TOKEN:
-            self.d["bot_token"] = BOT_TOKEN
+        # اولویت توکن ربات:
+        # 1) متغیر محیطی BOT_TOKEN (مگر متعلق به رباتِ بازنشسته‌ی قدیمی باشد)
+        # 2) BOT_TOKENِ داخل کد (تا manager_config.jsonِ قدیمی یا بازیابی‌شده از
+        #    بک‌آپ هرگز رباتِ قبلی را به‌جای رباتِ جدید بالا نیاورد)
+        # 3) manager_config.json فقط وقتی که BOT_TOKEN در کد خالی باشد.
+        _hc_token = str(BOT_TOKEN or "").strip()
+        _file_token = str(self.d.get("bot_token") or "").strip()
+        if _hc_token:
+            if _file_token and _file_token != _hc_token:
+                print("  🔑 توکنِ قدیمی در manager_config.json نادیده گرفته شد "
+                      "— توکنِ جدیدِ داخل کد استفاده می‌شود", flush=True)
+            self.d["bot_token"] = _hc_token
         _env_token = (os.environ.get("BOT_TOKEN") or "").strip()
         if _env_token:
-            self.d["bot_token"] = _env_token
+            _env_bid = _env_token.split(":", 1)[0].strip()
+            if _env_bid in RETIRED_BOT_IDS and _hc_token:
+                print(f"  ⚠️ متغیر محیطی BOT_TOKEN متعلق به رباتِ قدیمی ({_env_bid}) "
+                      "است — نادیده گرفته شد و توکنِ داخل کد استفاده می‌شود",
+                      flush=True)
+            else:
+                self.d["bot_token"] = _env_token
         _env_api_id = (os.environ.get("API_ID") or "").strip()
         if _env_api_id:
             try:
@@ -15340,6 +15354,14 @@ class Manager:
                               "شدم و تنظیمات را به‌روز می‌کنم", flush=True)
                         try:
                             self.cfg["bot_token"] = cand
+                        except Exception:
+                            pass
+                    elif os.path.exists(CONFIG_FILE):
+                        try:
+                            with open(CONFIG_FILE, encoding="utf-8") as _cf:
+                                _disk_d = json.load(_cf)
+                            if _disk_d.get("bot_token") != cand:
+                                self.cfg.save()
                         except Exception:
                             pass
                     # نشست ذخیره شود
