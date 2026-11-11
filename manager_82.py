@@ -2452,7 +2452,7 @@ RETIRED_BOT_IDS = ("8832561144",)
 API_ID = 28039994
 API_HASH = "00877cdcd706564a4de6abf7f7d64349"
 ADMIN_IDS = [8287266200]
-BUILD_VERSION = "v1109-panelcheck"
+BUILD_VERSION = "v1109-selfcheck"
 # کدام کامیتِ گیت دارد اجرا می‌شود؟ (اول JAFJ_COMMIT که هاست/اسکریپتِ بوت
 # می‌تواند بدهد، بعد تلاشِ محلی برای git — داخلِ ایمیج معمولاً .git نیست)
 GIT_COMMIT = ""
@@ -2518,7 +2518,7 @@ def uptime_text():
     parts.append(f"{mins} دقیقه")
     return " و ".join(parts)
 CODE_IS_STALE = (os.path.dirname(MANAGER_PATH) != os.path.abspath(image_dir()))
-BUILD_TAG = "JAFJ_MANAGER_82_v1109-panelcheck_2026_11_09"
+BUILD_TAG = "JAFJ_MANAGER_82_v1109-selfcheck_2026_11_11"
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  شناسه‌ی نمونه (instance) + تشخیص «سرویس قدیمی هنوز روشنه»
@@ -4293,6 +4293,12 @@ def _h(text, limit=1600):
 
 # فقط نشانه‌های «نسخه‌ی محلیِ دوم». AUTH_KEY_DUPLICATED عمداً این‌جا نیست:
 # آن یعنی کلید را تلگرام سوزانده و درمانش لاگینِ دوباره است، نه «سشن سالم».
+# سلف اگر بفهمد سشنِ پوشه به اکانتِ دیگری تعلق دارد، عمداً با همین پیام
+# متوقف می‌شود. باید از «شبکه/سشن باطل» جدا شناخته شود، چون درمانش
+# لاگینِ همان اکانت است، نه ری‌استارت.
+WRONG_ACCOUNT_RE = re.compile(
+    r"این پوشه برای اکانتِ|account_mismatch|به اکانتِ \d+ وصل شد", re.I)
+
 DUP_FAIL_RE = re.compile(
     r"نسخه‌ی دیگری از همین اکانت|jafj\.run\.lock|"
     r"duplicate(d)? (key|session)|"
@@ -4395,6 +4401,12 @@ def selfbot_readiness(folder, expected_uid=None, proc_alive=None, now_ts=None):
         if PANEL_READY_RE.search(tail):
             out.update(ready=True, state="ready", why="")
             return out
+    # ۲.۵) خودِ سلف در وضعیتش نوشته که اکانت اشتباه است؟
+    if stt and stt.get("account_mismatch"):
+        out.update(ready=False, state="wrong_account",
+                   why=("خودِ سلف می‌گوید سشن به اکانتِ دیگری وصل شده "
+                        f"({stt.get('user_id')} ≠ {stt.get('expected_user_id')})."))
+        return out
     # ۳) هیچ نشانه‌ای نیست: یا تازه شروع کرده یا اصلاً بالا نیامده.
     if proc_alive is False:
         out.update(ready=False, state="crashed",
@@ -4420,6 +4432,9 @@ def classify_selfbot_log(tail, rc=None):
     if rc == 76 or DUP_FAIL_RE.search(t):
         return "dup", ("نسخه‌ی دیگری از همین اکانت هم‌زمان در حال اجرا بود "
                        "(یک سشن، چند پروسه → تلگرام هر دو را قطع می‌کند)")
+    if WRONG_ACCOUNT_RE.search(t):
+        return "account", ("سشنِ این پوشه به اکانتِ دیگری وصل شده — پنل به "
+                           "Saved Messages همان اکانتِ دیگر می‌رود")
     if rc == 79:
         return "network", ("شبکه/MTProto از این میزبان باز نمی‌شود "
                            "(هر تلاشِ اتصال شکست خورد)")
@@ -5298,6 +5313,14 @@ class Supervisor:
             expected = int(c.get("tg_id") or c.get("uid") or 0)
         except Exception:
             expected = 0
+        if not expected:
+            try:
+                with open(os.path.join(self.folder(uid),
+                                       ".jafj_expected_account"),
+                          encoding="utf-8") as f:
+                    expected = int((f.read() or "0").strip() or 0)
+            except Exception:
+                expected = 0
         try:
             folder = self.folder(uid)
         except Exception:
@@ -5333,8 +5356,26 @@ class Supervisor:
             print("write_defaults:", e)
             return False
 
+    def write_expected_account(self, uid):
+        """اکانتِ این پوشه را برای خودِ سلف مکتوب کن.
+
+        سلف با همین فایل می‌فهمد که سشنِ داخلِ پوشه باید به کدام اکانت وصل
+        شود؛ اگر به اکانتِ دیگری وصل شد، بالا می‌آید ولی همه‌ی پیام‌های پنل
+        به آن اکانتِ دیگر می‌رود (کاربر در Saved Messages خودش هیچ چیزی
+        نمی‌بیند). بدونِ این فایل، آن حالت از بیرون «سالم» دیده می‌شود.
+        """
+        try:
+            with open(os.path.join(self.folder(uid),
+                                   ".jafj_expected_account"), "w",
+                      encoding="utf-8") as f:
+                f.write(str(int(uid)))
+            return True
+        except Exception:
+            return False
+
     def prepare(self, uid, string_session, phone, max_accounts=1, plan=None):
         self.write_session(uid, string_session)
+        self.write_expected_account(uid)
         self.write_creds(uid, phone)
         self.write_ai(uid)
         self.write_defaults(uid, max_accounts)
@@ -6135,6 +6176,16 @@ class Supervisor:
                     "سلف روی اکانتم» دوباره لاگین کنی (کد می‌آید). قبلش "
                     "مطمئن شو نسخه/سرویسِ دیگری روی همین اکانت بالاست نیست.",
                     hint=hint or "کلیدِ سشن باطل شده", tail_n=14)
+            if kind == "account":
+                # سشنِ پوشه مالِ اکانتِ دیگری است؛ تلاشِ دوباره فقط همان
+                # نتیجه را تکرار می‌کند. درمان: لاگینِ دوباره با همین شماره.
+                return self._why(
+                    uid, "account",
+                    "سلف بالا آمد ولی سشن به اکانتِ دیگری وصل شد؛ پنل به "
+                    "Saved Messages همان اکانت می‌رود. یک‌بار «🚀 راه‌اندازی "
+                    "سلف روی اکانتم» را برای همین اکانت بزن تا سشنِ درست "
+                    "نوشته شود.",
+                    hint=hint or "سشن به اکانتِ دیگری تعلق دارد", tail_n=14)
             if rc == 78 or kind == "session" or _LOGIN_CODE_RE.search(tail or ""):
                 # سشن باطل (یا بدتر: یک جایی کد ورود رفته) → دیگر تلاش نکن
                 try:
@@ -8937,6 +8988,7 @@ class Manager:
 
         ok, msg = self.sup.start(uid)
         if not ok:
+            # «اکانتِ اشتباه» خطای خودِ سلف نیست؛ امتیاز کم نمی‌شود.
             if self.sup.last_failure.get(uid) == "selfbot":
                 msg += self.charge_selfbot_error(uid, msg)
             return False, msg, ""
