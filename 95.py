@@ -1016,7 +1016,7 @@ def format_capacity_cleanup_note(left_links, target, stopped=None,
 
 
 VERSION = "3.0"
-BUILD_TAG = "JAFJ_SELF_69_70_EN_2026_08_28"
+BUILD_TAG = "JAFJ_SELF_v1109_selfcheck_2026_11_11"
 FA = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 EN = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 
@@ -3682,6 +3682,12 @@ class Engine:
                 "ai": bool(self.ai.ready),
                 "plan": self.lim["plan"],
                 "last_error": self.last_error,
+                "expected_user_id": expected_account_id(),
+                "account_mismatch": bool(
+                    expected_account_id()
+                    and self.my_id
+                    and int(expected_account_id()) != int(self.my_id)),
+                "dup_suspect": bool(getattr(self, "_dup_suspect", False)),
                 # حافظه و سلامتِ حلقه‌ها: پنل با همین دو عدد جوابِ «چرا هیچ
                 # کاری نمی‌کند» را می‌دهد، بی‌آنکه کسی ترمینال داشته باشد.
                 "mem": mem_info(),
@@ -3705,6 +3711,11 @@ class Engine:
             tmp = STATUS_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(d, f, ensure_ascii=False)
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
             os.replace(tmp, STATUS_FILE)
         except Exception as e:
             print("write_status:", e)
@@ -6750,8 +6761,46 @@ def load_creds():
     return c
 
 
+def write_json_atomic(path, data, indent=2):
+    """JSON را اتمیک بنویس (tmp + replace).
+
+    چرا: اگر پروسه وسطِ نوشتن بمیرد (OOM/دیپلوی)، فایلِ نیمه‌کاره می‌مانَد
+    و دفعه‌ی بعد خواندنش استثنا می‌دهد و حالتِ قبلی از بین می‌رود —
+    مثلاً تنظیماتِ تبادل می‌پرد یا وضعیتِ حساب خالی می‌شود.
+    """
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=indent)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
 def save_creds(c):
     try:
+        if write_json_atomic(CREDS_FILE, c):
+            if hasattr(os, "chmod"):
+                try:
+                    os.chmod(CREDS_FILE, 0o600)
+                except Exception:
+                    pass
+            return
         with open(CREDS_FILE, "w", encoding="utf-8") as f:
             json.dump(c, f, ensure_ascii=False, indent=2)
         if hasattr(os, "chmod"):
@@ -7059,6 +7108,13 @@ def claim_instance(uid, now=None):
                 and os.path.abspath(cwd or "/") != mine):
             return False, pid, cwd, (
                 "نسخه‌ی دیگری از همین اکانت در پوشه‌ی دیگری در حال اجراست")
+        # اگر نه pidِ زنده دارد و نه از همین پوشه است، رکوردِ کهنه را
+        # نگه نمی‌داریم تا اکانتِ درست بتواند قفل را بگیرد.
+        if (now - ts) >= INSTANCE_STALE_SEC or not _pid_alive(pid):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"pid": os.getpid(), "cwd": mine, "ts": now,
@@ -7066,6 +7122,68 @@ def claim_instance(uid, now=None):
     except Exception:
         return True, 0, "", ""           # نشد بنویسیم → مانعِ اجرا نشو
     return True, 0, "", ""
+
+
+def _msgs_go_to_other_session(me, slack=90):
+    """آیا آپدیتِ پیام‌هایی که خودمان می‌فرستیم برنمی‌گردد؟ (تخمینِ محافظه‌کار)
+
+    تلگرام آپدیت‌ها را بینِ همه‌ی اتصال‌های یک سشن پخش می‌کند. اگر نسخه‌ی
+    دیگری از همین اکانت هم وصل باشد، این پروسه «زنده» است ولی پیام‌ها
+    یکی‌درمیان به آن یکی می‌رسد؛ نتیجه: کاربر «پنل» می‌نویسد و هیچ جوابی
+    نمی‌گیرد. تنها نشانه‌ی قابلِ‌اتکا در دسترس، این است که آخرین پیامِ
+    خودِ اکانت خیلی قدیمی باشد در حالی که ربات ادعا می‌کند پیام فرستاده.
+    عمداً فقط «هشدار» می‌دهد و هیچ‌وقت ربات را نمی‌بندد.
+    """
+    try:
+        import datetime
+        last = getattr(me, "last_message_date", None)
+        if last is None:
+            return False
+        now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        return (now_ts - last.timestamp()) > max(90.0, float(slack))
+    except Exception:
+        return False
+
+
+def expected_account_id():
+    """شناسه‌ی اکانتی که مدیر برای این پوشه ثبت کرده (0 = نمی‌دانیم).
+
+    مدیر موقعِ ساخت/به‌روزرسانیِ پوشه، `.jafj_expected_account` را
+    می‌نویسد. اگر سشنِ داخلِ پوشه به اکانتِ دیگری تعلق داشته باشد، سلف
+    با موفقیت وصل می‌شود ولی همه‌ی پیام‌های پنل به اکانتِ **دیگر** می‌رود
+    و مشتری در Saved Messages خودش هیچ چیزی نمی‌بیند. این تابع اجازه‌ی
+    تشخیصِ همان حالت را می‌دهد.
+    """
+    for env_key in ("JAFJ_EXPECTED_ACCOUNT", "JAFJ_TG_ID"):
+        v = (os.environ.get(env_key) or "").strip()
+        if v.isdigit() and int(v) > 0:
+            return int(v)
+    try:
+        with open(".jafj_expected_account", encoding="utf-8") as f:
+            v = f.read().strip()
+        return int(v) if v.isdigit() else 0
+    except Exception:
+        return 0
+
+
+def account_guard(uid):
+    """(اکانت درست است؟, پیامِ خطا) — قبل از هر کاری بعد از get_me."""
+    want = expected_account_id()
+    if not want or not uid:
+        return True, ""
+    if int(uid) == int(want):
+        return True, ""
+    return False, (
+        f"⛔ این پوشه برای اکانتِ {want} ساخته شده، ولی سشن به اکانتِ "
+        f"{uid} وصل شد.\n"
+        "   یعنی فایلِ jafj.session داخلِ این پوشه مالِ اکانتِ دیگری است.\n"
+        "   در این حالت ربات بالا می‌آید و «روشن» نشان داده می‌شود، ولی "
+        "پنل به Saved Messages اکانتِ {w} می‌رود و کاربرِ {w} هیچ پیامی "
+        "نمی‌بیند.\n"
+        "   👉 از پنلِ مدیر: «🚀 راه‌اندازی سلف روی اکانتم» را برای همین "
+        "اکانت بزن تا سشنِ درست نوشته شود.\n"
+        "   (خاموش‌کردنِ این نگهبان در صورتِ نیاز: JAFJ_ACCOUNT_GUARD=0)"
+    ).format(w=want)
 
 
 def release_instance(uid=None):
@@ -7511,6 +7629,24 @@ async def connect_and_run(eng, creds):
     eng.write_status()
     eng.log("ok", "login", f"{eng.me} | id={me.id}")
     _boot_step("ورود انجام شد", f"{eng.me} | id={me.id}")
+
+    # ── ۰) اکانتِ درست است؟ ─────────────────────────────────────────────
+    # اگر سشنِ این پوشه به اکانتِ دیگری وصل شود، ربات سالم بالا می‌آید ولی
+    # همه‌ی پیام‌های پنل به همان اکانتِ دیگر می‌رود؛ کاربر در Saved
+    # Messages خودش هیچ چیزی نمی‌بیند. اینجا صریح متوقف می‌شویم تا مدیر
+    # «اکانتِ اشتباه» را ببیند و لاگینِ درست را بزند.
+    if (os.environ.get("JAFJ_ACCOUNT_GUARD") or "").strip() not in (
+            "0", "false", "no", "خاموش"):
+        _acc_ok, _acc_msg = account_guard(me.id)
+        if not _acc_ok:
+            print("\n" + _acc_msg, flush=True)
+            record_boot_crash(None, tb=_acc_msg)
+            _boot_step("بوت متوقف شد", "سشن به اکانتِ دیگری تعلق دارد")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            return "wrong_account"
 
     _ok_inst, _other_pid, _other_cwd, _why_inst = claim_instance(me.id)
     if not _ok_inst:
@@ -11478,11 +11614,27 @@ async def connect_and_run(eng, creds):
     st_task = _supervise("status", status_loop)
     mem_task = _supervise("memory", memory_loop)
 
+    # قبل از پیامِ شروع، یک‌بار وضعیت را با شاهدِ اکانت می‌نویسیم تا مدیر
+    # حتی وقتی ارسال به Saved Messages شکست بخورد، «اکانتِ درست» و
+    # «ضربانِ تازه» را در پنل خودش ببیند.
+    try:
+        eng.write_status()
+    except Exception:
+        pass
     sent = await note(_startup_text())
     # این خط، مرزِ «کار می‌کند / نمی‌کند» است: اگر در jafj_boot.log نبود،
     # یعنی ربات هرگز به پنل نرسیده و باید بالاتر را نگاه کرد.
     _boot_step(BOOT_OK_STEP, "پیامِ شروع رفت" if sent else
                "⚠️ پیامِ شروع نرفت (ارسال به Saved Messages خطا داد)")
+    if not sent:
+        print("\n⚠️ نتوانستم پیامِ شروع را در Saved Messages بفرستم.\n"
+              "   یعنی همان چیزی که کاربر می‌بیند: «روشن شد ولی پنل نیامد».\n"
+              "   علت‌های رایج: ۱) اکانتِ این سشن با اکانتِ پوشه فرق دارد، "
+              "۲) نسخه‌ی دیگری از همین اکانت هم وصل است و آپدیت‌ها را "
+              "می‌دزدد، ۳) تلگرام محدودیتِ ارسال داده.\n"
+              "   جزئیات در jafj.log با کلیدِ say/note.", flush=True)
+        eng.log("error", "startup_msg_failed",
+                f"uid={eng.my_id} expected={expected_account_id()}")
 
     # خطای اولیه‌ای که باعث ورود به پاک‌سازی شد را نگه می‌داریم؛ اگر لغوِ
     # بیرونی (CancelledError) بود، در پایان دوباره پرتاب می‌شود تا خاموشی
@@ -11592,6 +11744,14 @@ async def run_bot():
                 print("\n⛔ تا لاگینِ دوباره، این سشن اجرا نمی‌شود (کلید باطل "
                       "شده).", flush=True)
                 return EXIT_KEY_BURNED
+            if r == "wrong_account":
+                # سشنِ این پوشه مالِ اکانتِ دیگری است. تلاشِ دوباره فقط همان
+                # نتیجه را تکرار می‌کند (و پیام‌های پنل همچنان به آن اکانت
+                # می‌رود)، پس صریح با کدِ «نیاز به لاگین» تمام می‌شویم تا
+                # مدیر علت را ببیند و لاگینِ درست را بزند.
+                print("\n⛔ تا لاگینِ دوباره با همین اکانت، اجرا نمی‌شود "
+                      "(سشن به اکانتِ دیگری تعلق دارد).", flush=True)
+                return EXIT_NEEDS_RELOGIN
             if r == "dup_instance":
                 # دو نسخه روی یک اکانت: پنل بی‌جواب می‌شود. مثلِ قفلِ
                 # هم‌پوشه رفتار می‌کنیم تا مدیر «نسخه‌ی تکراری» ببیند.
