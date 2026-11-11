@@ -3805,6 +3805,32 @@ class ForkDaemon:
     رابطش عمداً همان چیزی است که Supervisor از یک پروسه می‌خواهد: pid و poll.
     """
 
+    @staticmethod
+    def _daemon_cwd():
+        """cwdِ صریح برای دیمنِ fork/shard.
+
+        چرا صریح: این دیمن‌ها قبلاً بدونِ `cwd=` اسپاون می‌شدند و cwdِ خودِ
+        مدیر را **به ارث** می‌بردند. در حالتِ fork مشکلی نبود (فرزند
+        `os.chdir` می‌کند)، ولی شارد چند اکانت را در **یک** پروسه و بدونِ
+        chdir اجرا می‌کند؛ پس هر مسیرِ نسبیِ باقی‌مانده در ۹۵.py دقیقاً
+        همان‌جا می‌نشست که مدیر ایستاده بود — و اگر آن‌جا پوشه‌ی ایمیج
+        (`/opt/jafj`) بود، نوشتن اصلاً ممکن نبود. حالا مقصد عمدی و نوشتنی
+        است: پوشه‌ی داده.
+
+        عمداً staticmethod است و به `BASE_DIR` دست نمی‌زند: `ShardDaemon` از
+        همین کلاس ارث می‌برد و بعضی آزمون‌ها (مثلِ
+        `test_shard_ipc_responsiveness.py`) فقط گره‌های کلاس را با AST
+        بیرون می‌کشند، پس تابعِ سطحِ ماژول آن‌جا `NameError` می‌داد.
+        """
+        for cand in ((os.environ.get("DATA_DIR") or "").strip(), os.getcwd()):
+            try:
+                p = os.path.abspath(os.path.expanduser(cand)) if cand else ""
+                if p and os.path.isdir(p) and os.access(p, os.W_OK):
+                    return p
+            except Exception:
+                continue
+        return os.getcwd()
+
     def __init__(self, selfbot=None, python=None):
         self.python = python or sys.executable
         self.selfbot = selfbot or SELFBOT
@@ -3838,6 +3864,7 @@ class ForkDaemon:
             _env.setdefault("JAFJ_NO_AUTO_LOGIN", "1")
             self.proc = subprocess.Popen(
                 [self.python, path, "--selfbot", os.path.abspath(self.selfbot)],
+                cwd=self._daemon_cwd(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, bufsize=0, env=_env,
                 start_new_session=True)
@@ -4031,6 +4058,7 @@ class ShardDaemon(ForkDaemon):
             self.proc = subprocess.Popen(
                 [self.python, path, "--selfbot", os.path.abspath(self.selfbot),
                  "--max-accounts", str(self.size)],
+                cwd=self._daemon_cwd(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, bufsize=0, env=_env,
                 start_new_session=True)

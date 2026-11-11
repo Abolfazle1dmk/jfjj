@@ -43,7 +43,25 @@ import time
 # روی یک فایل می‌نویسند (سشنِ مشترک = سوزاندنِ کلید).
 PATH_CONSTS = ("SESSION", "CREDS_FILE", "AI_FILE", "LIMITS_FILE",
                "STATUS_FILE", "SETTINGS_FILE", "DB_FILE", "LOG_FILE",
-               "RUN_LOCK")
+               "RUN_LOCK",
+               # این چهارتا قبلاً جا افتاده بودند. شارد chdir نمی‌کند (چون
+               # چند اکانت در یک پروسه‌اند و chdir سراسریِ پروسه است)، پس هر
+               # مسیرِ نسبیِ ۹۵.py به cwdِ خودِ دیمن (یعنی DATA_DIR مدیر)
+               # می‌رفت و بینِ **همه‌ی اکانت‌های شارد** مشترک می‌شد:
+               #   BOOT_LOG / BOOT_CRASH → jafj_boot.log و jafj_boot_error.txt
+               #     هرگز داخلِ پوشه‌ی اکانت ساخته نمی‌شدند؛ مدیر، دکتر و
+               #     صفحه‌ی وضعیت همان‌جا را می‌خوانند، پس «ردیِ بوت» و
+               #     «علتِ بالا نیامدن» برای هر اکانت خالی می‌ماند و خطوطِ
+               #     اکانت‌های مختلف هم در یک فایل قاطی می‌شد.
+               #   IP_FILE → همه‌ی اکانت‌ها یک jafj_ip.txt داشتند، پس
+               #     «IPِ خروجی عوض شده» به‌دروغ برای اکانتِ بعدی چاپ می‌شد.
+               #   EXPECTED_ACCOUNT_FILE → مدیر این فایل را داخلِ پوشه‌ی
+               #     اکانت می‌نویسد ولی سلف با مسیرِ نسبی می‌خواندش؛ در شارد
+               #     پیدایش نمی‌کرد و `expected_account_id()` صفر
+               #     برمی‌گرداند، یعنی **نگهبانِ اکانت در حالتِ شارد عملاً
+               #     خاموش بود** — دقیقاً همان حالتی که پنل به Saved
+               #     Messages اکانتِ دیگری می‌رود و بی‌صدا می‌ماند.
+               "BOOT_LOG", "BOOT_CRASH", "IP_FILE", "EXPECTED_ACCOUNT_FILE")
 
 # در حالتِ شارد، «قفلِ زنده» را باید بتوانیم از پروسه‌ی شارد تشخیص دهیم؛
 # وگرنه `_is_our_selfbot` می‌گوید «قفل مرده است»، قفل را پاک می‌کند و
@@ -57,6 +75,22 @@ def _is_our_selfbot(pid):          # ← تزریق‌شده توسطِ jafj_sha
     except Exception:
         return True
     return ("95.py" in cmd) or ("jafj_shardd" in cmd) or ("jafj_forkd" in cmd)
+'''
+
+# در شارد، `os.environ` بینِ **همه‌ی اکانت‌های پروسه** مشترک است، پس
+# `JAFJ_EXPECTED_ACCOUNT` هرگز نمی‌تواند per-account باشد. تابعِ اصلیِ ۹۵.py
+# اول env را می‌خواند؛ اگر روزی آن متغیر در محیطِ مدیر ست شود، هر اکانت همان
+# یک شناسه را انتظار می‌کشد و بقیه با «سشن به اکانتِ دیگری تعلق دارد» عمداً
+# متوقف می‌شوند — یعنی یک شوردِ کامل خاموش. پس در شارد فقط فایلِ خودِ
+# اکانت خوانده می‌شود (که مسیرش توسطِ _patch_paths مطلق شده است).
+EXPECTED_ACCOUNT_SHIM = '''
+def expected_account_id():         # ← تزریق‌شده توسطِ jafj_shardd
+    try:
+        with open(EXPECTED_ACCOUNT_FILE, encoding="utf-8") as f:
+            v = f.read().strip()
+        return int(v) if v.isdigit() else 0
+    except Exception:
+        return 0
 '''
 
 
@@ -80,6 +114,10 @@ REL_PATHS = {
     "DB_FILE": "jafj.db",
     "LOG_FILE": "jafj.log",
     "RUN_LOCK": "jafj.run.lock",
+    "BOOT_LOG": "jafj_boot.log",
+    "BOOT_CRASH": "jafj_boot_error.txt",
+    "IP_FILE": "jafj_ip.txt",
+    "EXPECTED_ACCOUNT_FILE": ".jafj_expected_account",
 }
 
 
@@ -123,10 +161,22 @@ def _patch_paths(ns, folder):
 
 
 def _rewrite(src, folder):
-    """مسیرهای نسبیِ 95.py را برای همین اکانت مطلق کن."""
+    """مسیرهای نسبیِ 95.py را برای همین اکانت مطلق کن.
+
+    ⚠️ این نسخه‌ی «پشتیبان» است (وقتی `_patch_paths` جواب ندهد)، ولی تنها
+    جایی است که مقدارِ **متنِ سورس** عوض می‌شود؛ پس اگر الگو خطی را نگیرد،
+    آن مسیر بی‌صدا نسبی می‌ماند و در شارد به پوشه‌ی اکانت نمی‌رسد.
+
+    باگِ قبلی: الگو با `$` تمام می‌شد، یعنی فقط خطِ بدونِ کامنت را می‌گرفت.
+    ولی در ۹۵.py دو خط دقیقاً کامنتِ دنبالِ مقدار دارند:
+        LIMITS_FILE = "jafj_limits.json"     # سقف‌های پلن — …
+        STATUS_FILE = "jafj_status.json"     # گزارش زنده — …
+    پس همین دو تا هرگز بازنویسی نمی‌شدند. حالا با lookahead، کامنتِ آخرِ خط
+    دست‌نخورده می‌ماند و خودِ مقدار بازنویسی می‌شود.
+    """
     out = src
     for name in PATH_CONSTS:
-        out = re.sub(r'(?m)^(%s = )"([^"]*)"$' % name,
+        out = re.sub(r'(?m)^(%s = )"([^"]*)"(?=\s*(?:#.*)?$)' % re.escape(name),
                      lambda m: '%s"%s/%s"' % (m.group(1), folder, m.group(2)),
                      out, count=1)
     return out
@@ -198,6 +248,7 @@ class Account:
                 # اصلاح‌های مخصوصِ شارد، بعد از اجرای بدنه و قبل از main():
                 ns["print"] = self._mk_print()
                 exec(LOCK_OWNER_SHIM, ns)
+                exec(EXPECTED_ACCOUNT_SHIM, ns)
                 r = ns["main"]()
                 if hasattr(r, "__await__"):
                     import asyncio

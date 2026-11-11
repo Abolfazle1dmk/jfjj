@@ -342,6 +342,12 @@ STATUS_FILE = "jafj_status.json"     # گزارش زنده — پنل می‌خ�
 SETTINGS_FILE = "jafj_settings.json"
 DB_FILE = "jafj.db"
 LOG_FILE = "jafj.log"
+# دو فایلی که قبلاً **لیترالِ نسبیِ درونِ تابع** بودند و نه ثابت: در حالتِ
+# شارد (چند اکانت در یک پروسه، بدونِ chdir) به پوشه‌ی خودِ اکانت مربوط
+# نمی‌شدند و همه‌ی اکانت‌ها روی یک فایلِ مشترک در cwdِ دیمن می‌نوشتند.
+# حالا ثابت‌اند تا jafj_shardd بتواند مثلِ بقیه مطلقشان کند.
+IP_FILE = "jafj_ip.txt"
+EXPECTED_ACCOUNT_FILE = ".jafj_expected_account"
 
 
 # ═══════════════════════════════════════════════════════
@@ -7182,7 +7188,7 @@ def expected_account_id():
         if v.isdigit() and int(v) > 0:
             return int(v)
     try:
-        with open(".jafj_expected_account", encoding="utf-8") as f:
+        with open(EXPECTED_ACCOUNT_FILE, encoding="utf-8") as f:
             v = f.read().strip()
         return int(v) if v.isdigit() else 0
     except Exception:
@@ -7437,10 +7443,10 @@ def log_egress_ip():
         return None
     prev = ""
     try:
-        if os.path.isfile("jafj_ip.txt"):
-            with open("jafj_ip.txt", encoding="utf-8") as f:
+        if os.path.isfile(IP_FILE):
+            with open(IP_FILE, encoding="utf-8") as f:
                 prev = ((f.read() or "").strip().split() or [""])[0]
-        with open("jafj_ip.txt", "w", encoding="utf-8") as f:
+        with open(IP_FILE, "w", encoding="utf-8") as f:
             f.write(f"{ip} {int(time.time())}\n")
     except Exception:
         pass
