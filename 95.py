@@ -6983,6 +6983,29 @@ def _boot_step(name, extra=""):
     return key
 
 
+def _boot_note(name, extra=""):
+    """مثلِ `_boot_step` ولی **بدونِ حذفِ تکراری** — برای رویدادهایی که
+    چند بار اتفاق می‌افتند (تلاشِ اتصال، شکست، retry).
+
+    چرا جدا از `_boot_step`: آن تابع هر نام را در هر پروسه فقط یک‌بار
+    می‌نویسد (تا ردیِ بوت شلوغ نشود). دقیقاً همین باعث می‌شد حلقه‌ی
+    «اتصال قطع شد → تلاشِ دوباره» هیچ اثری در `jafj_boot.log` نگذارد:
+    آخرین خط تا ابد «شروعِ اتصال به تلگرام» می‌ماند و از بیرون فقط
+    «اجرا شد ولی پنل نیامد» دیده می‌شد — بدونِ هیچ علتی.
+    """
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} {name}"
+    if extra:
+        line += f" | {extra}"
+    try:
+        with open(BOOT_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    _BOOT_LAST["step"] = str(name)
+    print(f"  ◦ بوت: {name}" + (f" | {extra}" if extra else ""), flush=True)
+    return line
+
+
 def boot_last_step():
     """آخرین مرحله‌ای که این پروسه (یا پروسه‌ی قبلی) رد کرده است."""
     if _BOOT_LAST["step"]:
@@ -7440,6 +7463,164 @@ def log_egress_ip():
     return ip
 
 
+# ─────────────────────────────────────────────
+#  «میزبان راهِ تلگرام را بسته یا کد خراب است؟»
+# ─────────────────────────────────────────────
+#  گزارشِ همیشگی: «۹۵.py اجرا شد، ولی نه پیامی در Saved Messages می‌آید نه
+#  پنل جواب می‌دهد.» از بیرون هیچ فرقی بینِ این سه حالت دیده نمی‌شود:
+#     الف) میزبان/کانتینر راهِ MTProto را بسته است (رایج‌ترین)
+#     ب) سشن/اکانت مشکل دارد
+#     ج) خودِ کد خراب است
+#  قبلاً هر سه یک خروجی داشتند: «🔄 اتصال قطع شد» و یک حلقه‌ی بی‌پایان که
+#  هیچ اثری هم در jafj_boot.log نمی‌گذاشت. حالا همان لحظه یک پروبِ شبکه
+#  زده می‌شود و خطای واقعیِ اتصال طبقه‌بندی می‌شود، پس یک خط در لاگ می‌گوید
+#  مقصر کیست.
+TELEGRAM_DCS = (
+    ("DC2 آمستردام", "149.154.167.51"),
+    ("DC4 آمستردام", "149.154.167.91"),
+    ("DC1", "149.154.175.50"),
+    ("DC3", "149.154.175.100"),
+    ("DC5", "91.108.56.130"),
+)
+
+# وضعیتِ آخرین شکستِ اتصال — همان چیزی که در ردیِ بوت و فایلِ خطا می‌نشیند.
+CONN_STATE = {"count": 0, "err": "", "kind": "", "probe": None}
+
+
+def probe_telegram_net(timeout=5.0):
+    """DNS + TCP:443 به DCهای تلگرام. فقط کتابخانه‌ی استاندارد، بی‌خطر.
+
+    برمی‌گرداند: {"dns": ..., "open": n, "closed": n, "detail": [...]}
+    هیچ‌وقت استثنا پرتاب نمی‌کند — این یک ابزارِ تشخیص است، نباید خودش
+    بوت را بخواباند.
+    """
+    import socket
+    out = {"dns": "", "open": 0, "closed": 0, "detail": [], "timeout": timeout}
+    try:
+        socket.getaddrinfo("api.telegram.org", 443, proto=socket.IPPROTO_TCP)
+        out["dns"] = "ok"
+    except Exception as e:
+        out["dns"] = f"{type(e).__name__}: {e}"
+        out["detail"].append(f"DNS برای api.telegram.org جواب نداد — {type(e).__name__}")
+    for label, ip in TELEGRAM_DCS:
+        t0 = time.time()
+        try:
+            s = socket.create_connection((ip, 443), timeout=timeout)
+            try:
+                s.close()
+            except Exception:
+                pass
+            out["open"] += 1
+            out["detail"].append(f"{label} {ip}:443 باز ({int((time.time() - t0) * 1000)}ms)")
+        except Exception as e:
+            out["closed"] += 1
+            out["detail"].append(f"{label} {ip}:443 بسته — {type(e).__name__}")
+    return out
+
+
+# الگوهایی که می‌گویند «اتصال در سطحِ شبکه/میزبان قطع شد»، نه در سطحِ اکانت.
+_NET_ERR_RE = re.compile(
+    r"IncompleteRead|Server closed the connection|0 bytes read|"
+    r"ConnectionReset|ConnectionRefused|ConnectionAborted|ConnectionError|"
+    r"TimeoutError|timed out|timeout|NetworkManager|NoRouteToHost|"
+    r"gaierror|getaddrinfo|SSL|SSLEOFError|EOFError|BrokenPipe|"
+    r"Network is unreachable|OSError", re.I)
+_FLOOD_RE = re.compile(r"FloodWait|FLOOD_WAIT|TooManyRequests", re.I)
+_CREDS_RE = re.compile(r"API_ID_INVALID|API_ID_PUBLISHED_FLOOD|"
+                       r"AUTH_KEY_UNREGISTERED|API_ID_|PHONE_NUMBER_INVALID", re.I)
+
+
+def classify_conn_error(name="", text=""):
+    """خطای واقعیِ `client.connect()` → («net»/«flood»/«creds»/«auth»/«?», توضیح).
+
+    «net» یعنی مقصر میزبان/شبکه است، نه کد و نه اکانت. این همان تفکیکی است
+    که بدونِ آن کاربر مجبور بود حدس بزند.
+    """
+    blob = f"{name or ''} {text or ''}"
+    if is_burned_key_error(name, text):
+        return "auth", "کلید/سشن توسط تلگرام باطل شده — لاگینِ تازه لازم است"
+    if _FLOOD_RE.search(blob):
+        return "flood", "تلگرام برای ورود/اتصال محدودیتِ زمانی گذاشته (FloodWait)"
+    if _CREDS_RE.search(blob):
+        return "creds", "api_id/api_hash یا شماره پذیرفته نشد"
+    if _NET_ERR_RE.search(blob):
+        return "net", "اتصال در سطحِ شبکه قطع شد — TCP/MTProto تا تلگرام نمی‌رسد"
+    return "?", "علت ناشناخته — متنِ خطا را همان‌طور که هست ببین"
+
+
+def conn_verdict(probe=None, err="", kind=""):
+    """یک بلوکِ متنیِ «مقصر کیست» — برای ردیِ بوت و jafj_boot_error.txt."""
+    probe = probe or {}
+    op, cl = int(probe.get("open", 0) or 0), int(probe.get("closed", 0) or 0)
+    lines = []
+    if kind == "net" and op == 0 and cl > 0:
+        lines.append("⛔ میزبان راهِ تلگرام را بسته است (کد سالم است).")
+        lines.append("   هیچ‌کدام از IPهای DC تلگرام روی پورتِ 443 باز نشد؛ "
+                     "پس ۹۵.py هرگز نمی‌تواند وصل شود و به همین دلیل نه "
+                     "پیامی در Saved Messages می‌آید نه پنل جواب می‌دهد.")
+        lines.append("   👉 فایروال/egress همین کانتینر باید 443 به این "
+                     "IPها را باز کند: " + ", ".join(ip for _, ip in TELEGRAM_DCS))
+    elif kind == "net" and op > 0:
+        lines.append("⛔ پورتِ TCP باز است ولی دست‌دادنِ MTProto کامل نمی‌شود "
+                     "(کد سالم است).")
+        lines.append("   یعنی چیزی وسطِ راه اتصال را می‌بندد: پروکسیِ شفاف، "
+                     "DPI/فیلتر، یا میزبانی که فقط HTTP(S) را عبور می‌دهد. "
+                     "TCP «باز» دیده شدن دلیلِ سالم‌بودنِ مسیر نیست.")
+        lines.append("   👉 همین سرویس را از یک میزبان/شبکه‌ی دیگر امتحان کن؛ "
+                     "اگر آن‌جا پنل بالا آمد، مقصر صددرصد شبکه‌ی این میزبان است.")
+    elif kind == "auth":
+        lines.append("⛔ سشن/کلیدِ اکانت مشکل دارد — شبکه باز است، مقصر "
+                     "میزبان نیست.")
+        lines.append("   👉 باید یک‌بار **لاگینِ دوباره** کنی: از پنلِ مدیر "
+                     "«🚀 راه‌اندازی سلف روی اکانتم» را بزن تا سشنِ تازه "
+                     "ساخته شود. ری‌استارتِ خالی این را درست نمی‌کند.")
+    elif kind == "flood":
+        lines.append("⏳ تلگرام محدودیتِ زمانی گذاشته — صبر لازم است، "
+                     "ری‌استارت وضعیت را بدتر می‌کند.")
+    elif kind == "creds":
+        lines.append("⛔ api_id/api_hash پذیرفته نشد — همان‌ها که بالای "
+                     "۹۵.py هستند با اکانت نمی‌خوانند.")
+    else:
+        lines.append("⚠️ علتِ شکستِ اتصال روشن نیست — متنِ خطا را مقایسه کن.")
+    if probe.get("dns") and probe["dns"] != "ok":
+        lines.append(f"   DNS: {probe['dns']}")
+    for d in (probe.get("detail") or [])[:6]:
+        lines.append(f"   • {d}")
+    if err:
+        lines.append(f"   آخرین خطای اتصال: {err[:220]}")
+    return "\n".join(lines)
+
+
+def note_conn_fail(e, where=""):
+    """یک شکستِ اتصال را در ردیِ بوت ثبت و طبقه‌بندی کن.
+
+    اولین شکستِ «شبکه‌ای» علاوه بر ردیِ بوت در `jafj_boot_error.txt` هم
+    می‌نشیند — چون صفحه‌ی وضعیت و `tools/doctor_fa.py` همان فایل را
+    می‌خوانند و بدونِ ترمینال، تنها راهِ دیدنِ علت است.
+    """
+    CONN_STATE["count"] = int(CONN_STATE.get("count", 0)) + 1
+    n = CONN_STATE["count"]
+    txt = f"{type(e).__name__}: {e}"
+    kind, why = classify_conn_error(type(e).__name__, e)
+    CONN_STATE["err"] = txt
+    CONN_STATE["kind"] = kind
+    _boot_note(f"شکستِ اتصال #{n}" + (f" ({where})" if where else ""),
+               f"{kind}: {txt[:160]}")
+    probe = CONN_STATE.get("probe")
+    if kind == "net" and not probe:
+        # یک‌بار پروب بزن و نتیجه را نگه دار؛ هر تلاشِ دوباره پروبِ تازه
+        # نمی‌خواهد (و لاگ را بی‌جهت پر نمی‌کند).
+        try:
+            probe = probe_telegram_net()
+        except Exception as pe:                      # pragma: no cover
+            probe = {"detail": [f"پروب ممکن نشد: {type(pe).__name__}: {pe}"]}
+        CONN_STATE["probe"] = probe
+        verdict = conn_verdict(probe, txt, kind)
+        print("\n" + "═" * 56 + "\n" + verdict + "\n" + "═" * 56, flush=True)
+        record_boot_crash(None, tb=verdict)
+    return kind
+
+
 def ensure_creds():
     """تا وقتی api_id و api_hash درست نگرفته، می‌پرسد. خاموش نمی‌شود."""
     c = load_creds()
@@ -7571,6 +7752,7 @@ async def connect_and_run(eng, creds):
                 burned_key_help(f"{type(e).__name__}: {e}")
                 return "key_burned"
             print(f"\n⚠️ بررسیِ سشن: {type(e).__name__}: {e}", flush=True)
+            note_conn_fail(e, "is_user_authorized")
             authorized = False
     except Exception as e:
         if is_burned_key_error(type(e).__name__, e):
@@ -7579,6 +7761,7 @@ async def connect_and_run(eng, creds):
             burned_key_help(f"{type(e).__name__}: {e}")
             return "key_burned"
         print(f"\n⚠️ اتصال برای بررسیِ سشن: {type(e).__name__}: {e}", flush=True)
+        note_conn_fail(e, "بررسیِ سشن")
         await asyncio.sleep(5)
         return "retry"
 
@@ -7608,6 +7791,7 @@ async def connect_and_run(eng, creds):
             return "retry"
         except Exception as e:
             print(f"\n⚠️ ورود ناموفق: {type(e).__name__}: {e}")
+            note_conn_fail(e, "ورود")
             print("   ۳۰ ثانیه دیگر دوباره تلاش می‌کنم… (Ctrl+C برای خروج)")
             await asyncio.sleep(30)
             return "retry"
@@ -7618,6 +7802,7 @@ async def connect_and_run(eng, creds):
             await client.connect()
     except Exception as e:
         print(f"\n⚠️ اتصال دوباره: {type(e).__name__}: {e}", flush=True)
+        note_conn_fail(e, "اتصالِ دوباره")
         await asyncio.sleep(5)
         return "retry"
 
@@ -7629,6 +7814,9 @@ async def connect_and_run(eng, creds):
     eng.write_status()
     eng.log("ok", "login", f"{eng.me} | id={me.id}")
     _boot_step("ورود انجام شد", f"{eng.me} | id={me.id}")
+    # اتصال موفق = وضعیتِ شکست‌های قبلی کهنه است؛ پاکش کن تا اگر بعداً قطع شد
+    # پروبِ شبکه از نو زده شود (و «علتِ قدیمی» به‌جای علتِ تازه ننشیند).
+    CONN_STATE.update({"count": 0, "err": "", "kind": "", "probe": None})
 
     # ── ۰) اکانتِ درست است؟ ─────────────────────────────────────────────
     # اگر سشنِ این پوشه به اکانتِ دیگری وصل شود، ربات سالم بالا می‌آید ولی
@@ -11769,6 +11957,10 @@ async def run_bot():
                 backoff = 10
             else:
                 fails += 1
+                _boot_note(f"تلاشِ اتصال ناموفق — {fails}/{max_fails}",
+                           f"{CONN_STATE.get('kind') or '?'}: "
+                           f"{CONN_STATE.get('err') or ''}"[:170]
+                           + f" • تلاشِ بعدی {backoff}s دیگر")
                 if fails >= max_fails:
                     print(f"\n⛔ {fails} بارِ پشتِ‌سرهم نتوانستم به تلگرام وصل "
                           f"شوم.", flush=True)
@@ -11776,6 +11968,17 @@ async def run_bot():
                           "تلاشِ دوباره در همین پروسه فایده ندارد.", flush=True)
                     print("   IPِ خروجی همین بالا در لاگ هست — با اجرای قبل "
                           "مقایسه‌اش کن.", flush=True)
+                    # بدونِ این، پروسه با کدِ ۷۹ می‌مرد و در jafj_boot_error.txt
+                    # هیچ علتی نمی‌ماند؛ مدیر/صفحه‌ی وضعیت فقط «خاموش» می‌دید.
+                    _verdict = conn_verdict(CONN_STATE.get("probe"),
+                                            CONN_STATE.get("err"),
+                                            CONN_STATE.get("kind") or "net")
+                    _verdict = (f"⛔ {fails} تلاشِ پشتِ‌سرهم برای اتصال شکست خورد "
+                                f"(کدِ خروج {EXIT_NET_DEAD}).\n{_verdict}")
+                    print("\n" + _verdict, flush=True)
+                    record_boot_crash(None, tb=_verdict)
+                    _boot_note("بوت متوقف شد",
+                               "شبکه‌ی میزبان به تلگرام نمی‌رسد (EXIT_NET_DEAD)")
                     return EXIT_NET_DEAD
         except KeyboardInterrupt:
             raise

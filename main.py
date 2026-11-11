@@ -270,6 +270,41 @@ def self_folder(data_dir):
     return None
 
 
+TELEGRAM_DCS = (("DC2 آمستردام", "149.154.167.51"),
+                ("DC4 آمستردام", "149.154.167.91"),
+                ("DC1", "149.154.175.50"))
+
+
+def net_probe(timeout=2.5):
+    """DNS + TCP:443 به DCهای تلگرام → «میزبان راهِ تلگرام را دارد یا نه».
+
+    چرا در چک‌لیستِ بوت: رایج‌ترین علتِ «۹۵.py اجرا شد ولی نه پیامی در
+    Saved Messages آمد نه پنل جواب داد» کد نیست، بسته بودنِ مسیرِ MTProto از
+    سمتِ میزبان است. بدونِ این چک، بوت همه‌چیز را ✅ گزارش می‌کرد و کاربر
+    می‌ماند و یک سؤالِ بی‌جواب: «کد یا میزبان؟»
+    """
+    import socket
+    res = {"dns": True, "open": 0, "closed": 0, "detail": []}
+    try:
+        socket.getaddrinfo("api.telegram.org", 443, proto=socket.IPPROTO_TCP)
+    except Exception as e:
+        res["dns"] = False
+        res["detail"].append(f"DNS: {type(e).__name__}")
+    for label, ip in TELEGRAM_DCS:
+        try:
+            s = socket.create_connection((ip, 443), timeout=timeout)
+            try:
+                s.close()
+            except Exception:
+                pass
+            res["open"] += 1
+            res["detail"].append(f"{ip}:443 باز")
+        except Exception as e:
+            res["closed"] += 1
+            res["detail"].append(f"{ip}:443 بسته ({type(e).__name__})")
+    return res
+
+
 def boot_report(py, env):
     """هر چیزی که «چرا بالا نیامد» را می‌تواند بسازد، همان اول چک می‌شود."""
     log(f"host={env.get('JAFJ_HOST_LABEL', 'wispbyte')} "
@@ -307,6 +342,15 @@ def boot_report(py, env):
     except Exception:
         ok_dep = False
     check("telethon در مفسرِ اجرا نصب است", ok_dep, str(py))
+    # شبکه: اگر این ❌ باشد، بقیه‌ی بوت سالم هم فایده ندارد — سلف هرگز به
+    # تلگرام نمی‌رسد و پنل بی‌جواب می‌ماند.
+    _net = net_probe()
+    check("مسیرِ شبکه به تلگرام باز است", _net["open"] > 0 and _net["dns"],
+          f"{_net['open']}/{len(TELEGRAM_DCS)} DC باز • " + " • ".join(_net["detail"]))
+    if _net["open"] == 0:
+        log("   ⛔ هیچ DC تلگرامی روی 443 باز نشد — این میزبان راهِ تلگرام را "
+            "بسته است. تا بازش نکنی، ۹۵.py سالم هم «اجرا شد» می‌گوید ولی "
+            "هرگز آنلاین نمی‌شود (نه پیامِ Saved Messages، نه پنل).")
     if os.environ.get("PORT"):
         check("PORT از میزبان رسیده", True, os.environ["PORT"])
     # نمونه‌ی دوم: دو مدیر روی یک پوشه‌ی داده = پیام‌های تکراری و سشن خراب

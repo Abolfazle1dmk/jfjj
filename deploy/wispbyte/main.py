@@ -28,6 +28,12 @@
 #   ۶) اختلافِ `95.py`ِ ریشه با `code/95.py` (کدی که واقعاً اجرا می‌شود)
 #      حالا گفته می‌شود — همان چیزی که «آپدیت کردم، عینِ قبل است» را
 #      می‌سازد.
+#   ۷) رایج‌ترین علتِ «۹۵.py اجرا شد ولی پنل نیامد» اصلاً در صفحه نبود:
+#      بسته بودنِ راهِ تلگرام از سمتِ میزبان. حالا یک پروبِ DNS+TCP به
+#      DCهای تلگرام در صفحه هست و نتیجه‌اش با ردیِ بوتِ خودِ سلف مقایسه
+#      می‌شود، پس بدونِ ترمینال معلوم است مقصر کانتینر است یا کد.
+#      (باز بودنِ TCP به‌تنهایی «سالم» نیست — پروکسی/DPI اتصال را قبول و
+#      بعد می‌بندد؛ برای همین مقایسه با شکست‌های واقعیِ سلف لازم است.)
 # ═══════════════════════════════════════════════════════════════════════
 import glob
 import hashlib
@@ -263,6 +269,66 @@ def _db_summary():
     return None
 
 
+TELEGRAM_DCS = (("DC2 آمستردام", "149.154.167.51"),
+                ("DC4 آمستردام", "149.154.167.91"),
+                ("DC1", "149.154.175.50"))
+
+# نتیجه‌ی پروبِ شبکه کش می‌شود: صفحه هر ۱۰ ثانیه تازه می‌شود و ۳ تلاشِ
+# TCP با مهلتِ چند ثانیه نباید هر بار صفحه را معطل کند.
+_NET_CACHE = {"at": 0.0, "res": None}
+_NET_TTL = 90.0
+
+
+def net_probe(force=False, timeout=2.5):
+    """DNS + TCP:443 به DCهای تلگرام، با کش. هرگز استثنا پرتاب نمی‌کند.
+
+    چرا در صفحه‌ی وضعیت: رایج‌ترین علتِ «۹۵.py اجرا شد ولی پنل نیامد»
+    شبکه‌ی میزبان است، نه کد. بدونِ این ردیف، صفحه همه‌چیز را سبز نشان
+    می‌داد و کاربر نمی‌فهمید مقصر کانتینر است یا کد — دقیقاً همان سؤالی
+    که بدونِ ترمینال جوابی ندارد.
+
+    ⚠️ باز بودنِ TCP به‌تنهایی «سالم» نیست: پروکسی/DPI اتصال را قبول و بعد
+    می‌بندد. پس نتیجه با ردیِ بوتِ خودِ سلف مقایسه می‌شود.
+    """
+    import socket
+    now = time.time()
+    if not force and _NET_CACHE["res"] is not None and \
+            now - _NET_CACHE["at"] < _NET_TTL:
+        return _NET_CACHE["res"]
+    res = {"dns": "ok", "open": 0, "closed": 0, "detail": [], "conn_fails": 0}
+    try:
+        socket.getaddrinfo("api.telegram.org", 443, proto=socket.IPPROTO_TCP)
+    except Exception as e:
+        res["dns"] = f"{type(e).__name__}: {e}"
+    for label, ip in TELEGRAM_DCS:
+        t0 = time.time()
+        try:
+            s = socket.create_connection((ip, 443), timeout=timeout)
+            try:
+                s.close()
+            except Exception:
+                pass
+            res["open"] += 1
+            res["detail"].append(
+                f"{label} {ip}:443 باز ({int((time.time() - t0) * 1000)}ms)")
+        except Exception as e:
+            res["closed"] += 1
+            res["detail"].append(f"{label} {ip}:443 بسته — {type(e).__name__}")
+    # سلف خودش روی اتصال شکست خورده؟ (ردیِ بوتِ ۹۵.py — نسخه‌ی جدید می‌نویسدش)
+    for folder in selfbot_folders():
+        try:
+            with open(Path(folder) / "jafj_boot.log", encoding="utf-8",
+                      errors="ignore") as f:
+                for ln in f.readlines()[-80:]:
+                    if "شکستِ اتصال" in ln:
+                        res["conn_fails"] += 1
+        except Exception:
+            pass
+    _NET_CACHE["at"] = now
+    _NET_CACHE["res"] = res
+    return res
+
+
 def diagnose():
     """همه‌ی چیزهایی که «بالا نمی‌آید» را می‌سازند → [(سطح, عنوان, جزئیات)].
 
@@ -321,6 +387,28 @@ def diagnose():
                 f'"{py}" -m pip install -r {CODE_DIR / "requirements.txt"}')
     else:
         add("yellow", "venv", "هنوز ساخته نشده (اولین بوت)")
+
+    # شبکه — «میزبان مقصر است یا کد؟»
+    net = net_probe()
+    if net["open"] == 0:
+        add("red", "شبکه: راهی به تلگرام نیست — مقصر میزبان است، نه کد",
+            *net["detail"],
+            "" if net["dns"] == "ok" else f"DNS: {net['dns']}",
+            "فایروال/egress این کانتینر باید TCP 443 به DCهای تلگرام را باز "
+            "کند. تا بسته است، ۹۵.py سالم هم آنلاین نمی‌شود (نه پیامِ "
+            "Saved Messages، نه پنل).")
+    elif net["conn_fails"]:
+        add("red", "شبکه: پورت باز است ولی MTProto کامل نمی‌شود — مقصر میزبان",
+            *net["detail"],
+            f"سلف {net['conn_fails']} بار روی اتصال شکست خورده "
+            "(ردیِ بوتِ jafj_boot.log).",
+            "یعنی پروکسیِ شفاف/DPI/فیلتر وسطِ راه اتصال را می‌بندد. آزمونِ "
+            "قطعی: همین سرویس روی یک میزبانِ دیگر — آن‌جا پنل آمد یعنی کد "
+            "سالم است.")
+    else:
+        add("green", "شبکه",
+            f"{net['open']} DC از {len(TELEGRAM_DCS)} باز است",
+            *net["detail"])
 
     # داده
     add("red" if not DATA_STATE.get("writable") else
@@ -430,6 +518,7 @@ def status_payload():
         "python": DEPS_STATE.get("python", ""),
         "data": DATA_STATE.get("dir") or str(data_dir()),
         "data_tmp": bool(DATA_STATE.get("tmp")),
+        "net": net_probe(),
         "checks": rows,
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
