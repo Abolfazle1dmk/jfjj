@@ -387,6 +387,35 @@ _REF_NOT_A_VALUE = {
     "channel", "group", "panel", "close", "cancel", "none", "off",
 }
 
+# جای‌نگهدارهای نمونه در راهنما و «📋 دستورات آماده» (`کانال @channel`،
+# `افزودن گروه @group`). این‌ها آیدیِ واقعی نیستند، ولی چون شکلِ یوزرنیم
+# دارند از اعتبارسنجی رد می‌شدند و کاربر با کپیِ همان دستورِ نمونه،
+# «@channel» را به‌عنوان کانالِ خودش ثبت می‌کرد. نتیجه: تبادل سریع از همان
+# اول می‌گفت «از قبل آماده است»، در حالی که کاربر هیچ چیزِ واقعی‌ای تعیین
+# نکرده بود — و بعدش هم راهی برای اصلاحش نداشت.
+# فقط جای‌نگهدارهای «واقعاً نمونه‌ای» این‌جا هستند. عمداً `@mychannel` و
+# `@mygroup` نیستند؛ خودِ ربات در پنل و wizard همان‌ها را نمونه نشان می‌دهد
+# و کاربر واقعاً همان را تایپ می‌کند. `channel`/`group` هم نمونه‌اند چون
+# `@username` واقعیِ تلگرام نمی‌تواند دقیقاً «channel» یا «group» باشد.
+_REF_PLACEHOLDERS = {
+    "channel", "channelname", "channel_name", "yourchannel",
+    "your_channel", "yourchannelname",
+    "group", "groupname", "group_name", "yourgroup", "your_group",
+    "yourgroupname", "exchange_group", "exchangegroup",
+}
+
+
+def is_placeholder_ref(value):
+    """آیا این مقدار یکی از نمونه‌های راهنماست (نه آیدیِ واقعی)؟
+
+    فقط برای یوزرنیم‌ها و آیدی‌های متنی سنجیده می‌شود؛ هشِ دعوت و آیدیِ
+    عددی هرگز جای‌نگهدار حساب نمی‌شوند.
+    """
+    v = (value or "").strip().strip("«»\"'").lstrip("@").strip().lower()
+    if not v:
+        return True
+    return v in _REF_PLACEHOLDERS
+
 
 def normalize_peer_ref(value):
     """«@name / name / t.me/name / +hash / t.me/+hash» → مقدارِ قابل‌ذخیره.
@@ -416,7 +445,9 @@ def normalize_peer_ref(value):
         if path.lower().startswith("c/"):
             return None          # لینکِ پیامِ خصوصی، آیدیِ کانال نیست
         name = path.split("/")[0]
-        return f"@{name}" if _REF_USERNAME_RE.match(name) else None
+        if _REF_USERNAME_RE.match(name) and not is_placeholder_ref(name):
+            return f"@{name}"
+        return None
     # هشِ دعوتِ خالی: «+abc123»
     if v.startswith("+"):
         h = v[1:]
@@ -425,7 +456,7 @@ def normalize_peer_ref(value):
     if re.fullmatch(r"-?\d{5,20}", v):
         return v
     name = v.lstrip("@")
-    if _REF_USERNAME_RE.match(name):
+    if _REF_USERNAME_RE.match(name) and not is_placeholder_ref(name):
         return f"@{name}"
     return None
 
@@ -3424,6 +3455,12 @@ class Engine:
                         + ("`کانال ویژه @mychannel`" if tier == "vip"
                            else "`کانال @mychannel`"))
             v = arg.strip().split()[0]
+            # جای‌نگهدارِ راهنما (`@channel`) کانال حساب نمی‌شود؛ وگرنه کاربر
+            # دستورِ نمونه را کپی می‌کرد، «@channel» ثبت می‌شد و تبادل به
+            # اشتباه «آماده» به نظر می‌رسید.
+            if is_placeholder_ref(v) and not normalize_peer_ref(v):
+                return ("❌ `" + v + "` فقط یک نمونهٔ راهنماست، نه کانالِ تو.\n"
+                        "آیدیِ واقعیِ کانالت را بفرست؛ مثلاً `کانال @my_channel_id`")
             old_channel = (self.st.prof(tier)["channel"] or "").strip()
             mc = self.lim["max_channels"]
             if mc:
@@ -4877,10 +4914,31 @@ class Engine:
                 x["group_failover_on"] = False
             else:
                 current = list(x.get("groups") or [])
+                rejected = []
                 for group in (w.strip() for w in rest.split() if w.strip()):
-                    if group.lower() not in {g.lower() for g in current}:
-                        current.append(group)
+                    # مثل `کانال`، دستورِ نمونه (`@group`) هم گروه حساب
+                    # نمی‌شود؛ هر ورودیِ نامعتبر با پیامِ روشن رد می‌شود.
+                    parsed = normalize_peer_ref(group)
+                    if not parsed:
+                        rejected.append(group)
+                        continue
+                    if parsed.lower() not in {g.lower() for g in current}:
+                        current.append(parsed)
                 x["groups"] = current
+                if rejected:
+                    x["_group_failover_active_index"] = 0
+                    x["_group_failover_last_activity"] = int(time.time())
+                    if len(x.get("groups") or []) < 2:
+                        x["group_failover_on"] = False
+                    self.st.save()
+                    bad = "، ".join(f"`{g}`" for g in rejected[:4])
+                    kept = ("، ".join(f"`{i}`" for i in x["groups"])
+                            if x["groups"] else "هیچ")
+                    return (f"❌ {bad} آیدیِ معتبرِ گروه نیست"
+                            + (" (نمونهٔ راهنماست)" if any(
+                                is_placeholder_ref(g) for g in rejected) else "") +
+                            f".\n📡 گروه‌های ثبت‌شده: {kept}\n"
+                            "آیدیِ واقعی بفرست؛ مثلاً `افزودن گروه @my_real_group`")
             x["_group_failover_active_index"] = 0
             x["_group_failover_last_activity"] = int(time.time())
             if len(x.get("groups") or []) < 2:
@@ -8187,26 +8245,34 @@ async def connect_and_run(eng, creds):
         if channel and group:
             if _ensure_quick_exchange_defaults(x):
                 eng.st.save()
+            # ── «آماده» یعنی «آماده برای اجرا»، نه «قفل‌شده» ──
+            # قبلاً اگر کانال و گروه ثبت بودند، همین‌جا برمی‌گشتیم و
+            # «تبادل سریع» فقط می‌گفت «از قبل آماده است». نتیجه: کاربر
+            # هیچ راهی نداشت کانال/گروهِ اشتباه (مثلاً @channel و @group
+            # از روی نمونه‌های راهنما) را عوض کند. حالا اول می‌پرسیم
+            # ویرایش می‌خواهد یا نه؛ هیچ تنظیمی بی‌اجازه عوض نمی‌شود.
             quick_exchange_state.pop(user_id, None)
             backup_line = (f"🔁 گروه پشتیبان: {backup_group}\n"
                            f"حالت جایگزین: {'روشن' if x.get('group_failover_on') else 'خاموش'}\n"
                            if backup_group else
                            "🔁 گروه پشتیبان: تنظیم نشده (اختیاری)\n")
-            if x.get("enabled"):
-                await _say("⚡ تبادل سریع از قبل آماده و روشن است.\n\n"
-                           f"📡 کانال: {channel}\n"
-                           f"👥 گروه اصلی: {group}\n"
-                           f"{backup_line}\n"
-                           + ("برای روشن‌کردن جایگزینی: `تبادل گروه جایگزین روشن`\n"
-                              if backup_group and not x.get("group_failover_on") else
-                              "برای ثبت گروه پشتیبان: `تبادل گروه جایگزین @backup`\n"
-                              if not backup_group else "")
-                           + "برای دیدن وضعیت: `تبادل`")
-            else:
-                await _say("⚡ تبادل سریع از قبل آماده است؛ فقط روشنش کن:\n"
-                           "`تبادل روشن`\n"
-                           + ("جایگزینی گروه اختیاری است؛ تنظیم: `تبادل گروه جایگزین`"
-                              if backup_group else ""))
+            on_off = "🟢 روشن" if x.get("enabled") else "🔴 خاموش"
+            state = {"step": "edit_choice",
+                     "edit_from": {"channel": channel, "group": group,
+                                   "backup_group": backup_group}}
+            quick_exchange_state[user_id] = state
+            await _say(
+                "⚡ تبادل سریع از قبل آماده است.\n\n"
+                f"📡 کانال: {channel}\n"
+                f"👥 گروه اصلی: {group}\n"
+                f"{backup_line}"
+                f"🔁 وضعیت: {on_off}\n\n"
+                + ("فقط روشنش کن: `تبادل روشن`\n\n"
+                   if not x.get("enabled") else "")
+                + "می‌خواهی چیزی را عوض کنی؟\n"
+                "`ویرایش` — تغییر کانال/گروه (بدون روشن‌شدن خودکار)\n"
+                "`لغو` — همین‌طور بماند\n"
+                "`تبادل` — دیدن وضعیت")
             return
 
         state = {"step": "channel" if not channel else "group"}
@@ -8227,6 +8293,19 @@ async def connect_and_run(eng, creds):
                        + _qe_prompt("channel", extra))
 
     async def _finish_quick_exchange(user_id, state):
+        # در حالتِ ویرایش فقط فیلدِ انتخاب‌شده در state است؛ بقیه از
+        # تنظیمِ فعلی خوانده می‌شوند تا «ویرایش گروه» کانال را پاک نکند.
+        if state.get("_mode") == "edit":
+            live = eng.ex_cfg()
+            live_groups = [normalize_peer_ref(str(g or ""))
+                           for g in (live.get("groups") or [])]
+            live_groups = [g for g in live_groups if g]
+            if "channel" not in state:
+                state["channel"] = (eng.ex_my_channel() or "").strip()
+            if "group" not in state:
+                state["group"] = live_groups[0] if live_groups else ""
+            if "backup_group" not in state and len(live_groups) > 1:
+                state["backup_group"] = live_groups[1]
         channel = normalize_peer_ref(state.get("channel"))
         group = normalize_peer_ref(state.get("group"))
         backup_group = normalize_peer_ref(state.get("backup_group"))
@@ -8260,25 +8339,68 @@ async def connect_and_run(eng, creds):
             return
 
         st = eng.st
-        st.prof("standard")["channel"] = channel
         ex_cfg = eng.ex_cfg()
-        ex_cfg["groups"] = [group] + ([backup_group] if backup_group else [])
-        ex_cfg["group_failover_on"] = bool(backup_group)
-        ex_cfg["_group_failover_active_index"] = 0
-        ex_cfg["_group_failover_last_activity"] = int(time.time())
+        # ── «ویرایش» یعنی تغییرِ همان فیلد، نه راه‌اندازیِ دوباره ──
+        # قبلاً هر بار که wizard تمام می‌شد گروه‌ها از نو ست می‌شدند و
+        # تبادل بی‌اجازه روشن می‌شد. حالا اگر کاربر فقط یک فیلد را عوض
+        # کرده باشد، فقط همان فیلد نوشته می‌شود و وضعیتِ روشن/خاموش
+        # دست‌نخورده می‌ماند.
+        editing = (state.get("_mode") == "edit")
+        if editing:
+            edited = set(state.get("_edited") or [])
+            if "channel" in edited:
+                st.prof("standard")["channel"] = channel
+            if "group" in edited or "backup_group" in edited:
+                current_groups = [g for g in (ex_cfg.get("groups") or [])
+                                  if normalize_peer_ref(str(g or ""))]
+                main = group if "group" in edited else (
+                    current_groups[0] if current_groups else group)
+                if "backup_group" in edited:
+                    backup = backup_group
+                else:
+                    backup = (current_groups[1] if len(current_groups) > 1
+                              else "")
+                ex_cfg["groups"] = [main] + ([backup] if backup else [])
+                ex_cfg["group_failover_on"] = bool(backup)
+                ex_cfg["_group_failover_active_index"] = 0
+                ex_cfg["_group_failover_last_activity"] = int(time.time())
+        else:
+            st.prof("standard")["channel"] = channel
+            ex_cfg["groups"] = [group] + ([backup_group] if backup_group else [])
+            ex_cfg["group_failover_on"] = bool(backup_group)
+            ex_cfg["_group_failover_active_index"] = 0
+            ex_cfg["_group_failover_last_activity"] = int(time.time())
         _ensure_quick_exchange_defaults(ex_cfg)
         # ── قاعده‌ی ایمنی: بدون کانالِ معتبر هیچ‌وقت روشن نکن ──
         if not eng.ex_channel_ready():
             ex_cfg["enabled"] = False
             st.save()
+            quick_exchange_state.pop(user_id, None)
             await _say("❌ کانال ذخیره نشد؛ تبادل روشن نشد.\n"
                        "`کانال @mychannel` رو دستی بفرست.")
             return
-        ex_cfg["enabled"] = True
-        # مثل روشن‌کردن دستی، توقف قبلیِ خودکار را از نظر محافظ باطل کن.
-        st["risk"]["_auto_off"] = False
+        if not editing:
+            ex_cfg["enabled"] = True
+            # مثل روشن‌کردن دستی، توقف قبلیِ خودکار را از نظر محافظ باطل کن.
+            st["risk"]["_auto_off"] = False
         st.save()
         quick_exchange_state.pop(user_id, None)
+
+        if editing:
+            on_off = "🟢 روشن" if ex_cfg.get("enabled") else "🔴 خاموش"
+            groups_now = ex_cfg.get("groups") or []
+            await _say(
+                "✅ تغییر ذخیره شد.\n\n"
+                f"📡 کانال: {channel}\n"
+                f"👥 گروه اصلی: {groups_now[0] if groups_now else group}\n"
+                + (f"🔁 گروه پشتیبان: {groups_now[1]}\n"
+                   if len(groups_now) > 1 else
+                   "🔁 گروه پشتیبان: تنظیم نشده (اختیاری)\n")
+                + f"🔁 وضعیت تبادل: {on_off}\n\n"
+                + ("برای شروع: `تبادل روشن`\n" if not ex_cfg.get("enabled") else "")
+                + "برای دیدن وضعیت: `تبادل`"
+            )
+            return
 
         await _say(
             "✅ تبادل آماده‌ست!\n\n"
@@ -8318,12 +8440,115 @@ async def connect_and_run(eng, creds):
         value = text if step in ("group", "backup_group") else (text.split()[0] if text.split() else "")
         return (step or "channel"), value
 
-    async def _handle_quick_exchange_input(user_id, raw, low):
+    async def _handle_quick_exchange_input(user_id, raw, low, event=None):
         state = quick_exchange_state.get(user_id) or {}
+        if low in ("تبادل سریع", ".quickexchange", "/quickexchange"):
+            # از هر جای wizard، «تبادل سریع» دوباره از اول شروع می‌کند.
+            quick_exchange_state.pop(user_id, None)
+            await _start_quick_exchange(user_id)
+            return
         if low in ("لغو", "cancel", ".cancel", "/cancel", "انصراف"):
             quick_exchange_state.pop(user_id, None)
             await _say("❌ تبادل سریع لغو شد. هیچ تنظیمی تغییر نکرد.")
             return
+
+        # ── انتخابِ فیلدِ ویرایش ──
+        if state.get("step") == "edit_pick":
+            prev = state.pop("edit_from", {}) or {}
+            keys = {"کانال": ["channel"], "چنل": ["channel"],
+                    "channel": ["channel"], "گروه": ["group"],
+                    "گروه اصلی": ["group"], "group": ["group"],
+                    "پشتیبان": ["backup_group"], "گروه پشتیبان": ["backup_group"],
+                    "backup": ["backup_group"],
+                    "همه": ["channel", "group", "backup_group"],
+                    "همه‌چیز": ["channel", "group", "backup_group"],
+                    "all": ["channel", "group", "backup_group"]}
+            text = _soft_clean(raw).lower()
+            for pref in ("ویرایش ", "تغییر ", "عوض "):
+                if text.startswith(pref):
+                    text = text[len(pref):].strip()
+            picked = keys.get(text)
+            if picked is None and text:
+                # آیدیِ مستقیم هم قبول است: «ویرایش @newchannel»
+                direct = normalize_peer_ref(text)
+                if direct:
+                    picked = ["channel"]
+            if not picked:
+                # فرمانِ عادی (پنل/تبادل/گروه/…) نباید وسطِ ویرایش بلعیده
+                # شود؛ wizard بسته می‌شود و همان فرمان اجرا می‌شود.
+                quick_exchange_state.pop(user_id, None)
+                if event is not None:
+                    await on_saved(event)
+                    return
+                state["edit_from"] = prev
+                state["step"] = "edit_pick"
+                quick_exchange_state[user_id] = state
+                await _say("کدام؟ `ویرایش کانال` / `ویرایش گروه` / "
+                           "`ویرایش پشتیبان` / `ویرایش همه` — یا `لغو`")
+                return
+            state = {"step": "channel" if "channel" in picked else
+                     ("group" if "group" in picked else "backup_group"),
+                     "_mode": "edit", "_edited": list(picked)}
+            quick_exchange_state[user_id] = state
+            if state["step"] == "channel":
+                await _say("📡 کانالِ جدیدت را بفرست (مثلاً @my_channel_id)\n"
+                           "برای انصراف: `لغو`")
+            elif state["step"] == "group":
+                await _say("👥 گروهِ اصلیِ جدید را بفرست (مثلاً @my_real_group)\n"
+                           "برای انصراف: `لغو`")
+            else:
+                await _say("➕ گروه پشتیبانِ جدید را بفرست، یا `رد` تا پشتیبان "
+                           "داشته نباشی.\nبرای انصراف: `لغو`")
+            return
+        # ── پرسشِ «ویرایش می‌خواهی؟» روی تنظیمِ آماده ──
+        # تبادلِ آماده قفل نمی‌شود: کاربر انتخاب می‌کند چه چیزی را عوض
+        # کند. تا وقتی خودش انتخاب نکند هیچ تنظیمی تغییر نمی‌کند و
+        # وضعیتِ روشن/خاموش هم دست‌نخورده می‌ماند.
+        if state.get("step") == "edit_choice":
+            prev = state.get("edit_from") or {}
+            edit_words = {"ویرایش", "اصلاح", "تغییر", "عوض", "edit",
+                          ".edit", "/edit"}
+            # «ویرایش» تنها = نمایش فهرست؛ «ویرایش گروه» = انتخابِ همان فیلد
+            # که در قدمِ بعدی (edit_pick) پردازش می‌شود.
+            picked_now = None
+            if low in edit_words:
+                picked_now = ""
+            elif low.startswith(("ویرایش ", "تغییر ", "عوض ")):
+                picked_now = low
+            if low in ("کانال", "گروه", "پشتیبان", "کانال جدید", "گروه جدید"):
+                picked_now = low
+            if picked_now is not None:
+                state["edit_from"] = prev
+                state["step"] = "edit_pick"
+                quick_exchange_state[user_id] = state
+                if picked_now:
+                    # انتخابِ صریح در همان پیام؛ دوباره از همین تابع رد شود.
+                    await _handle_quick_exchange_input(user_id, raw, low, event)
+                    return
+                await _say(
+                    "✏️ کدام را عوض کنم؟\n\n"
+                    f"۱) کانال — الان: {prev.get('channel') or '—'} → `ویرایش کانال`\n"
+                    f"۲) گروه اصلی — الان: {prev.get('group') or '—'} → `ویرایش گروه`\n"
+                    f"۳) گروه پشتیبان — الان: {prev.get('backup_group') or 'تنظیم نشده'} "
+                    "→ `ویرایش پشتیبان`\n"
+                    "۴) هر سه، از اول → `ویرایش همه`\n\n"
+                    "`لغو` — هیچ تغییری نده")
+                return
+            quick_exchange_state.pop(user_id, None)
+            # «تبادل روشن» همین‌جا هم باید کار کند؛ وگرنه کاربری که تبادلش
+            # آماده ولی خاموش است، وسطِ این پرسش گیر می‌کرد.
+            if low in ("تبادل روشن", "روشن", ".ex on", "/ex on"):
+                reply = eng.cmd("ex", "on")
+                await _say(reply)
+                return
+            if event is not None:
+                await on_saved(event)
+                return
+            await _say("باشه، هیچ تنظیمی عوض نشد.\n"
+                       "برای عوض‌کردن: `تبادل سریع` → `ویرایش`\n"
+                       "برای دیدن وضعیت: `تبادل`")
+            return
+
         if state.get("step") == "backup_group" and low in (
                 "رد", "نه", "ندارم", "بدون پشتیبان", "ادامه", "ادامه بدون پشتیبان",
                 "skip", "no", "none"):
@@ -8366,6 +8591,10 @@ async def connect_and_run(eng, creds):
                 return
             state["group"] = parsed
             state.pop("backup_group", None)
+            if state.get("_mode") == "edit" and target == "group":
+                quick_exchange_state[user_id] = state
+                await _finish_quick_exchange(user_id, state)
+                return
         else:
             parsed = normalize_peer_ref(value)
             if not parsed:
@@ -8379,6 +8608,12 @@ async def connect_and_run(eng, creds):
                                + _qe_prompt(target))
                     return
             state[target] = parsed
+            if state.get("_mode") == "edit":
+                # ویرایشِ تک‌فیلدی: فیلدهای دیگر دست‌نخورده می‌مانند، پس
+                # از پر کردنشان رد می‌شویم و مستقیم ذخیره می‌کنیم.
+                quick_exchange_state[user_id] = state
+                await _finish_quick_exchange(user_id, state)
+                return
         quick_exchange_state[user_id] = state
 
         # ── قاعده‌ی «اول کانال» ──
@@ -8431,7 +8666,7 @@ async def connect_and_run(eng, creds):
 
         # ورودیِ فعالِ wizard همیشه داده است، نه فرمان؛ فقط «لغو» از آن خارج می‌شود.
         if user_id in quick_exchange_state:
-            await _handle_quick_exchange_input(user_id, raw, low)
+            await _handle_quick_exchange_input(user_id, raw, low, event)
             return
         if low in {"تبادل سریع", ".quickexchange", "/quickexchange"}:
             await _start_quick_exchange(user_id)
