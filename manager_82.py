@@ -2444,6 +2444,36 @@ def ensure_fresh_code():
 
 SELFBOT = find_selfbot()
 
+
+def selfbot_python():
+    """مفسری که سلف را اجرا کند: venv را ترجیح بده، وگرنه sys.executable.
+
+    اگر خود_manager_82.py با پایتونِ venv اجرا شده باشد، sys.executable
+    همان venv است (sys.prefix != sys.base_prefix). وگرنه سعی می‌کنیم
+    ./venv/bin/python را پیدا کنیم تا 95.py با telethon اجرا شود؛
+    وگرنه به sys.executable بازمی‌گردیم و چکِ وابستگی خطای صریح می‌دهد.
+    """
+    # حالا در venv هستیم → sys.executable همان venv است
+    if sys.prefix != sys.base_prefix:
+        return sys.executable
+    # وگرنه venv کنار کد (یک سطح بالاتر از فایل manager_82.py) یا در cwd
+    here = os.path.dirname(os.path.abspath(__file__))
+    cwd = os.getcwd()
+    candidates = []
+    # venv یا .venv کنار کد (یک سطح بالاتر از فایل manager_82.py)
+    for name in ("venv", ".venv"):
+        candidates.append(os.path.normpath(os.path.join(here, "..", name, "bin", "python")))
+        candidates.append(os.path.join(cwd, name, "bin", "python"))
+    ref_dir = os.path.dirname(os.path.abspath(SELFBOT_REF)) if SELFBOT_REF else ""
+    if ref_dir:
+        for name in ("venv", ".venv"):
+            candidates.append(os.path.normpath(os.path.join(ref_dir, "..", name, "bin", "python")))
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return sys.executable
+
+
 # ── تنظیمات مستقیم داخل همین فایل Python ──
 # توکن پیش‌فرض ربات داخل کد تنظیم شده؛ روی توکن‌های قدیمیِ ذخیره‌شده در
 # manager_config.json یا بک‌آپ اولویت دارد تا تعویض ربات بلافاصله اعمال شود.
@@ -5157,7 +5187,8 @@ class Supervisor:
         self._fail_notified = {} # uid -> زمانِ آخرین اطلاع‌رسانیِ شکست
         # uid -> زمانی که سلف واقعاً «آنلاین شد» را دیدیم (نه فقط Popen).
         self.last_ready = {}
-        self._deps_ok = None     # آیا sys.executable می‌تواند telethon را import کند؟
+        self._deps_ok = None     # آیا مفسرِ سلف می‌تواند telethon را import کند؟
+        self._deps_py = None     # مفسری که برای چکِ وابستگی استفاده شد
         self.mgr = None          # به Manager وصل می‌شود
         # uid -> {"n": تعداد تلاش‌های ناموفق، "next": زمانِ تلاشِ بعدی}
         # تا پروسه‌ای که فوراً می‌میرد (سشنِ خراب/FloodWait) هر ۳۰ ثانیه
@@ -5701,10 +5732,13 @@ class Supervisor:
         if self._deps_ok is not None:
             return self._deps_ok
         try:
-            r = subprocess.run([sys.executable, "-c", "import telethon"],
+            _py = selfbot_python()
+            r = subprocess.run([_py, "-c", "import telethon"],
                                stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, timeout=30)
             self._deps_ok = (r.returncode == 0)
+            if not self._deps_ok:
+                self._deps_py = _py
         except Exception:
             self._deps_ok = False
         return self._deps_ok
@@ -6146,8 +6180,9 @@ class Supervisor:
                     except Exception:
                         pass
             if p is None:
+                _py = selfbot_python()
                 p = subprocess.Popen(
-                    [sys.executable, SELFBOT],
+                    [_py, SELFBOT],
                     cwd=folder, stdout=logf, stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL, env=_env,
                     start_new_session=True)

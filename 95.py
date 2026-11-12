@@ -11881,6 +11881,19 @@ async def run_bot():
             pip_out = ((_pr.stdout or "") + (_pr.stderr or "")).strip()
             if pip_out:
                 print(pip_out[-900:], flush=True)
+            # در محیط externally-managed (PEP 668) نصب مستقیم échec می‌خورد.
+            # دوباره با --break-system-packages تلاش می‌کنیم.
+            pip_out2 = ""
+            if _pr.returncode != 0 and need_telethon():
+                _pr2 = subprocess.run(
+                    [sys.executable, "-m", "pip", "install",
+                     "--break-system-packages", "telethon"],
+                    capture_output=True, text=True, timeout=300)
+                pip_out2 = ((_pr2.stdout or "") + (_pr2.stderr or "")).strip()
+                if pip_out2:
+                    print(pip_out2[-900:], flush=True)
+            if not pip_out:
+                pip_out = pip_out2
         except Exception as _e:
             pip_out = f"{type(_e).__name__}: {_e}"
             print(f"   اجرای pip ممکن نشد: {pip_out}", flush=True)

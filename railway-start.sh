@@ -39,10 +39,22 @@ _code_shadow() {
 }
 
 pick_python() {
+    # ۱) env 변수 PYTHON
     if [ -n "${PYTHON:-}" ] && command -v "$PYTHON" >/dev/null 2>&1; then
         echo "$PYTHON"
         return
     fi
+    # ۲) venv یا .venv کنار کد (تصمیم‌گیری‌ی مهم: telethon در venv نصب است)
+    for base in "$IMAGE_DIR" "$APP_DIR" "." "$HOME"; do
+        for name in venv .venv; do
+            v="$base/$name/bin/python"
+            if [ -x "$v" ]; then
+                echo "$v"
+                return
+            fi
+        done
+    done
+    # ۳) پایتون سیستمی
     for c in python3 python; do
         if command -v "$c" >/dev/null 2>&1; then
             echo "$c"
