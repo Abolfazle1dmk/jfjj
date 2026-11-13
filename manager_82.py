@@ -3357,7 +3357,8 @@ CREATE TABLE IF NOT EXISTS clients (
     trial_warning_sent INTEGER NOT NULL DEFAULT 0,
     rules_accepted INTEGER NOT NULL DEFAULT 1,
     want_on INTEGER NOT NULL DEFAULT 1,
-    need_login INTEGER NOT NULL DEFAULT 0
+    need_login INTEGER NOT NULL DEFAULT 0,
+    sub_paused_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3399,11 +3400,25 @@ class DB:
                               # ۱ = سشن باطل است و باید از پنل دوباره لاگین شود؛
                               # تا آن موقع هیچ پروسه‌ای بالا نمی‌آید (وگرنه هر
                               # بار تلگرام برای مشتری کدِ ورود می‌فرستد).
-                              ("need_login", "INTEGER NOT NULL DEFAULT 0")):
+                              ("need_login", "INTEGER NOT NULL DEFAULT 0"),
+                              ("sub_paused_at", "INTEGER NOT NULL DEFAULT 0")):
                 if col not in cols:
                     self.c.execute(f"ALTER TABLE clients ADD COLUMN {col} {decl}")
                     if col == "trial_used":
                         pass
+            # کاربرهای قدیمی که سرویس ماهانه را خاموش کرده بودند هم مهاجرت
+            # شوند؛ اگر اشتراک در زمانِ خاموش‌کردن هنوز اعتبار داشته، زمانش
+            # از همان نقطه فریز می‌شود حتی اگر نسخه‌ی قبلی آن را منقضی کرده باشد.
+            _legacy_pause = ("(SELECT MAX(l.ts) FROM log l WHERE l.uid=clients.uid "
+                             "AND l.kind='want_off' AND l.ts<clients.expires_at)")
+            self.c.execute(
+                "UPDATE clients SET sub_paused_at=COALESCE(" + _legacy_pause + ", ?), "
+                "status=CASE WHEN status='expired' THEN 'active' ELSE status END "
+                "WHERE sub_paused_at=0 AND status IN ('active','expired') "
+                "AND COALESCE(want_on,1)=0 AND expires_at>0 "
+                "AND COALESCE(trial_expires_at,0)<=? "
+                "AND expires_at>COALESCE(" + _legacy_pause + ", ?)",
+                (now(), now(), now()))
             # اصلاح خودکار کاربرانی که به اشتباه تست‌سوخته ثبت شده بودند ولی تستی نزده‌اند:
             self.c.execute("UPDATE clients SET trial_used=0 WHERE trial_started_at=0")
             self.c.commit()
@@ -3452,7 +3467,7 @@ class DB:
     CRITICAL_COLS = ("session", "phone", "tg_id", "status", "expires_at",
                      "trial_expires_at", "trial_started_at", "trial_used",
                      "current_plan_id", "max_accounts", "want_on",
-                     "phone_verified", "rules_accepted")
+                     "phone_verified", "rules_accepted", "sub_paused_at")
 
     def set(self, uid, **kw):
         if not kw:
@@ -3565,6 +3580,7 @@ class DB:
 
     def expired(self):
         return self.x("SELECT * FROM clients WHERE status='active'"
+                      " AND COALESCE(sub_paused_at,0)=0"
                       " AND expires_at>0 AND expires_at<=?", (now(),), "all")
 
     def counts(self):
@@ -5865,6 +5881,7 @@ class Supervisor:
                         self.db.log(uid, "panel_ready", f"{int(delay)}s pid={p.pid}")
                     except Exception:
                         pass
+                    self._resume_paid_subscription(uid)
                     return
                 if not kind:                  # زنده و در حال اتصال
                     try:
@@ -5968,6 +5985,7 @@ class Supervisor:
                                 f"{int(budget)}s pid={getattr(p, 'pid', 0)}")
                 except Exception:
                     pass
+                self._resume_paid_subscription(uid)
                 return rd
             time.sleep(max(1.0, min(every, end - time.time())))
         # تا آخرِ بودجه هم شاهدی نبود: «روشن» هست ولی پنل تأیید نشده.
@@ -6368,6 +6386,31 @@ class Supervisor:
         return True, ("درخواست روشن‌کردن ثبت شد؛ منتظر تأیید پنل هستیم. "
                       "اگر پنل نیامد، «گزارش» را بررسی کن.")
 
+    def _pause_paid_subscription(self, uid):
+        """توقفِ دستی: مهلتِ اشتراک ماهانه را از همین لحظه فریز کن."""
+        try:
+            c = self.db.get(uid) or {}
+            if (c.get("status") == "active" and int(c.get("expires_at") or 0) > now()
+                    and int(c.get("trial_expires_at") or 0) <= now()
+                    and int(c.get("sub_paused_at") or 0) <= 0):
+                self.db.set(uid, sub_paused_at=now())
+                self.db.log(uid, "subscription_paused", "سرویس دستی خاموش شد")
+        except Exception:
+            pass
+
+    def _resume_paid_subscription(self, uid):
+        """با آماده‌شدنِ واقعیِ پنل، زمانِ توقف را به انقضای اشتراک اضافه کن."""
+        try:
+            c = self.db.get(uid) or {}
+            paused = int(c.get("sub_paused_at") or 0)
+            expiry = int(c.get("expires_at") or 0)
+            if paused > 0 and expiry > 0:
+                elapsed = max(0, now() - paused)
+                self.db.set(uid, expires_at=expiry + elapsed, sub_paused_at=0)
+                self.db.log(uid, "subscription_resumed", f"{elapsed}s paused")
+        except Exception:
+            pass
+
     def stop(self, uid, remember_off=False):
         """خاموش کردن پروسه.
 
@@ -6386,6 +6429,8 @@ class Supervisor:
         if not p or p.poll() is not None:
             self.procs.pop(uid, None)
             self._clear_pid(uid)
+            if remember_off:
+                self._pause_paid_subscription(uid)
             return True, "خاموش بود"
         if hasattr(p, "remote_stop"):
             # اکانتِ داخلِ shard: کشتنِ گروهِ پروسه یعنی کشتنِ همه‌ی اکانت‌های
@@ -6400,6 +6445,8 @@ class Supervisor:
             self.procs.pop(uid, None)
             self._clear_pid(uid)
             self.db.log(uid, "stop")
+            if remember_off:
+                self._pause_paid_subscription(uid)
             return True, "خاموش شد"
         try:
             os.killpg(os.getpgid(p.pid), signal.SIGTERM)
@@ -6420,6 +6467,8 @@ class Supervisor:
         self.procs.pop(uid, None)
         self._clear_pid(uid)
         self.db.log(uid, "stop")
+        if remember_off:
+            self._pause_paid_subscription(uid)
         return True, "خاموش شد"
 
     def jafj_summary(self, uid):
@@ -8068,7 +8117,9 @@ class Manager:
             live = self.service_run_label(c["uid"])
             if int(c.get("trial_expires_at") or 0) > now():
                 return f"🎁 تست رایگان — {human_left(c['trial_expires_at'])}"
-            return f"{live} — {human_left(c['expires_at'])}"
+            if int(c.get("sub_paused_at") or 0) > 0:
+                return f"⏸ اشتراک ماهانه متوقف — {human_left(self.subscription_expiry(c))}"
+            return f"{live} — {human_left(self.subscription_expiry(c))}"
         return {"new": "🆕 ثبت‌نام نشده",
                 "pending": "⏳ منتظر تأیید",
                 "expired": "🔴 منقضی",
@@ -8334,13 +8385,13 @@ class Manager:
         if self.trial_active(uid):
             credit = f"تست رایگان: {human_left(c['trial_expires_at'])}"
         elif self.has_sub(uid):
-            credit = f"اعتبار: {human_left(c['expires_at'])}"
+            credit = f"اعتبار: {human_left(self.subscription_expiry(c))}"
         elif self.shop and self.cfg["points_on"]:
             b = self.shop.p_balance(uid)
             per = max(1, self.cfg["cost_per_hour"])
             credit = f"امتیاز: {_fa_digits(b)}  ·  ≈{_fa_digits(b // per)} ساعت"
         else:
-            credit = f"اعتبار: {human_left(c['expires_at'])}"
+            credit = f"اعتبار: {human_left(self.subscription_expiry(c))}"
 
         txt = self.cfg["sold_text"] or (
             ("🎁 <b>تست رایگان " + self.trial_label() + " فعال شد</b>" if trial
@@ -8919,17 +8970,25 @@ class Manager:
         ])
         return txt, [back_btn("a:cm")]
 
+    def subscription_expiry(self, c):
+        """تاریخِ انقضای مؤثر؛ هنگام خاموشیِ دستی مهلت فریز می‌ماند."""
+        if not c:
+            return 0
+        expiry = int(c.get("expires_at") or 0)
+        paused = int(c.get("sub_paused_at") or 0)
+        if paused > 0 and expiry > 0:
+            expiry += max(0, now() - paused)
+        return expiry
+
     def has_sub(self, uid):
-        """اشتراک پولی فعال دارد؟
+        """اشتراک پولی فعال دارد (زمانِ خاموشیِ دستی مصرف نمی‌شود)؟
 
         مُهرِ «کهنه»ی تست رایگان (trial_expires_at در گذشته) نباید اشتراکِ
-        فعال را پنهان کند؛ وگرنه مشترکِ ماهانه‌ای که یک بار تست گرفته بود
-        به‌اشتباه «امتیازی» حساب می‌شود، امتیازش ساعتی می‌سوزد و بعد از
-        چند ساعت خاموش می‌شود. فقط تستِ «در حال اجرا» (در آینده) جلوی
-        has_sub را می‌گیرد.
+        فعال را پنهان کند؛ فقط تستِ «در حال اجرا» جلوی has_sub را می‌گیرد.
         """
         c = self.db.get(uid)
-        return bool(c and c["status"] == "active" and c["expires_at"] > now()
+        return bool(c and c["status"] == "active"
+                    and self.subscription_expiry(c) > now()
                     and int(c.get("trial_expires_at") or 0) <= now())
 
     def trial_active(self, uid):
@@ -9039,7 +9098,8 @@ class Manager:
         if not c or c["status"] == "banned":
             return False, "دسترسی بسته است"
         # انقضا را همان لحظه اعمال کن، نه فقط در چرخه watchdog.
-        if c["status"] == "active" and c["expires_at"] and c["expires_at"] <= now():
+        if (c["status"] == "active" and c["expires_at"]
+                and self.subscription_expiry(c) <= now()):
             if self.sup.is_running(uid):
                 self.sup.stop(uid)
             self.db.set(uid, status="expired", current_plan_id=0)
@@ -9194,7 +9254,7 @@ class Manager:
         if self.trial_active(uid):
             t.append(f"🎁 <b>تست رایگان</b>   {human_left(c['trial_expires_at'])}")
         elif c and c["expires_at"]:
-            t.append(f"⏳ <b>اعتبار</b>   {human_left(c['expires_at'])}")
+            t.append(f"⏳ <b>اعتبار</b>   {human_left(self.subscription_expiry(c))}")
         if self.shop and self.cfg["points_on"]:
             pb = self.shop.p_balance(uid)
             note = "  ·  اشتراک فعال، بدون مصرف" if self.has_sub(uid) else ""
