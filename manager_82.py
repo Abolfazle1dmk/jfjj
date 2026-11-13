@@ -5760,10 +5760,14 @@ class Supervisor:
 
         def _run():
             rc = None
-            try:
-                rc = p.wait(timeout=delay)
-            except Exception:
-                rc = None                     # هنوز زنده است
+            # Fork and shard handles provide poll(), not Popen.wait().  Poll
+            # all handle types so delayed exits are monitored in every mode.
+            deadline = time.monotonic() + max(0.0, delay)
+            while self.procs.get(uid) is p:
+                rc = p.poll()
+                if rc is not None or time.monotonic() >= deadline:
+                    break
+                time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
             if self.procs.get(uid) is not p:
                 return                        # پروسه‌ی دیگری جایگزین شده
             tail = ""
@@ -6016,7 +6020,7 @@ class Supervisor:
             proc = self.procs.get(uid)
             if isinstance(proc, _ShardProc) and proc.daemon.start_is_unconfirmed(uid):
                 return self._why(uid, "manager", "وضعیت اجرای سلف هنوز تأیید نشده است.")
-            return True, "از قبل روشن بود"
+            return True, "پروسه از قبل در حال اجراست؛ وضعیت پنل را در گزارش ببین."
         if self.mgr and self.running_count() >= int(self.cfg["max_clients"]):
             return self._why(uid, "manager",
                              "ظرفیت اجرای همزمان تکمیل است "
@@ -6278,8 +6282,8 @@ class Supervisor:
         # تأییدِ بلندمدت تا دو دقیقه ادامه می‌دهد و تا وقتی شاهدِ پنل
         # نباشد، «روشن» را موفق اعلام نمی‌کند.
         self._confirm_ready_async(uid, p)
-        return True, (f"روشن شد (pid {p.pid}) — پنل در چند ثانیه‌ی آینده "
-                      "تأیید می‌شود")
+        return True, ("درخواست روشن‌کردن ثبت شد؛ منتظر تأیید پنل هستیم. "
+                      "اگر پنل نیامد، «گزارش» را بررسی کن.")
 
     def stop(self, uid, remember_off=False):
         """خاموش کردن پروسه.
@@ -7956,11 +7960,22 @@ class Manager:
         except Exception as e:
             print("hide_keyboard:", type(e).__name__, e)
 
+    def service_run_label(self, uid):
+        """A live process alone is not evidence that its panel is ready."""
+        if not self.sup.is_running(uid):
+            return "⚪ خاموش"
+        try:
+            if self.sup.readiness(uid, proc_alive=True).get("ready") is True:
+                return "🟢 پنل تأیید شد"
+        except Exception:
+            pass
+        return "⏳ پنل هنوز تأیید نشده"
+
     def client_state(self, c):
         if not c:
             return "❓ ناشناخته"
         if c["status"] == "active":
-            live = "🟢 در حال کار" if self.sup.is_running(c["uid"]) else "🟡 متوقف"
+            live = self.service_run_label(c["uid"])
             if int(c.get("trial_expires_at") or 0) > now():
                 return f"🎁 تست رایگان — {human_left(c['trial_expires_at'])}"
             return f"{live} — {human_left(c['expires_at'])}"
@@ -8239,10 +8254,10 @@ class Manager:
 
         txt = self.cfg["sold_text"] or (
             ("🎁 <b>تست رایگان " + self.trial_label() + " فعال شد</b>" if trial
-             else "✅ <b>راه‌اندازی شد")
+             else "✅ <b>ورود انجام شد</b>")
             + "\n" + self.LINE + "\n"
             f"👤 اکانت: {name}\n"
-            f"📡 وضعیت: {'🟢 در حال کار' if ok else '🟡 ' + msg}\n"
+            f"📡 وضعیت: {self.service_run_label(uid) if ok else '🟡 ' + msg}\n"
             f"🎯 {credit}\n" + self.LINE + "\n\n"
             "حالا برو به <b>Saved Messages</b> اکانتت و بفرست:\n"
             "<code>.panel</code>\n\n"
@@ -9047,7 +9062,7 @@ class Manager:
             proc = self.sup.procs.get(uid)
             if isinstance(proc, _ShardProc) and proc.daemon.start_is_unconfirmed(uid):
                 return False, "وضعیت اجرای سلف هنوز تأیید نشده است.", ""
-            return True, "از قبل روشن بود", ""
+            return True, "پروسه از قبل در حال اجراست؛ وضعیت پنل را در گزارش ببین.", ""
 
         ok, msg = self.sup.start(uid)
         if not ok:
@@ -11837,7 +11852,7 @@ class Manager:
                 body += ("\n💤 تا وقتی خاموش است امتیازی مصرف نمی‌شود.\n"
                          f"<i>روشن کردن دوباره {_fa_digits(self.cfg['start_fee'])} "
                          f"امتیاز هزینه دارد.</i>\n")
-            body += f"\nوضعیت: {'🟢 در حال کار' if live else '⚪ خاموش'}"
+            body += f"\nوضعیت: {self.service_run_label(uid) if live else '⚪ خاموش'}"
             return await self.edit(ev, body,
                 svc_menu(live, bool(c["session"]),
                          self.cfg["start_fee"], self.has_sub(uid)))
@@ -14727,7 +14742,7 @@ class Manager:
                     f"🎯 <b>+{_fa_digits(o['points'])} امتیاز</b>\n"
                     f"موجودی: <b>{_fa_digits(nb)}</b>  ·  ≈{_fa_digits(nb // per)} ساعت\n"
                     f"{self.LINE}\n\n" +
-                    ("🟢 سرویست روشن شد." if started else
+                    ("⏳ درخواست روشن‌کردن ثبت شد؛ وضعیت پنل را در «سرویس من» ببین." if started else
                      ("💡 حالا می‌توانی سرویس را روشن کنی."
                       if c and c["session"] else
                       "🚀 حالا سلف را روی اکانتت راه بینداز.")),
@@ -14740,7 +14755,8 @@ class Manager:
                     f"🎯 {_fa_digits(o['points'])} امتیاز به {o['uid']} اضافه شد "
                     f"(موجودی {_fa_digits(nb)})")
 
-            # فعال‌سازی سرویس
+            # فعال‌سازی اشتراک با آماده‌شدن پنل دو وضعیت جداست.
+            start_ok, start_msg = False, ""
             c = self.db.get(o["uid"])
             if c:
                 base = max(c["expires_at"], now()) if c["expires_at"] else now()
@@ -14755,8 +14771,9 @@ class Manager:
                     ua = int((self.db.get(o["uid"]) or {}).get("max_accounts") or 0)
                     self.sup.write_limits(o["uid"], pl, override_max_accounts=ua)
                 if c["session"]:
-                    self.sup.restart(o["uid"]) if self.sup.is_running(o["uid"]) \
-                        else self.sup.start(o["uid"])
+                    start_ok, start_msg = (self.sup.restart(o["uid"])
+                                           if self.sup.is_running(o["uid"])
+                                           else self.sup.start(o["uid"]))
             # پاداش معرف
             ref, rew = sh.pay_referral(oid, self.cfg["referral_percent"])
             if ref:
@@ -14768,8 +14785,9 @@ class Manager:
                 f"✅ <b>پرداختت تأیید شد</b>\n\n"
                 f"پلن: {o['plan_name']}\n"
                 f"اعتبار: {human_left(nc['expires_at'])}\n\n" +
-                ("سرویست روشن شد 🟢" if c and c["session"]
-                 else "حالا سلف را روی اکانتت راه بینداز."),
+                (("⏳ درخواست روشن‌کردن ثبت شد؛ وضعیت پنل را در «سرویس من» ببین."
+                  if start_ok else "⚠️ سلف روشن نشد: " + self._esc(start_msg))
+                 if c and c["session"] else "حالا سلف را روی اکانتت راه بینداز."),
                 [[B("⚙️ سرویس من", "m:svc", "primary")]] if c and c["session"]
                 else [[B("🚀 راه‌اندازی سلف", "s:setup", "primary")]])
             # آموزش‌های «بعد از خرید اشتراک ماهانه»
