@@ -1345,6 +1345,10 @@ CREATE TABLE IF NOT EXISTS events (
     ts INTEGER NOT NULL, level TEXT NOT NULL,
     kind TEXT NOT NULL, detail TEXT
 );
+-- Preserve the existing substring matching, including old or unknown kinds.
+CREATE INDEX IF NOT EXISTS idx_events_flood_ts ON events(ts)
+    WHERE lower(kind) LIKE '%flood%';
+CREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events(kind, ts);
 """
 
 
@@ -1423,6 +1427,16 @@ class DB:
                 # (اندازه‌گیری روی ۵۰ هزار رکورد: ۱.۲ تا ۲.۳ms → ۰.۰۱ms).
                 "CREATE INDEX IF NOT EXISTS idx_ex_peer "
                 "ON exchange(peer_id)",
+                # شمارش‌های «ارسال در ۲۴ ساعت» (sent_since / risk_current)
+                # با (status='sent' AND sent_at>=?) خوانده می‌شوند؛ بدونِ
+                # این ایندکس کلِ صف اسکن می‌شد (~۶ms روی ۵۰ هزار رکورد).
+                "CREATE INDEX IF NOT EXISTS idx_queue_sent "
+                "ON queue(status, sent_at)",
+                # شمارش‌های «جوین در ۲۴ ساعت / امروز» (ex_joins_today /
+                # risk_current / hour_cap_wait) با (joined_at>=?) خوانده
+                # می‌شوند؛ بدونِ این ایندکس کلِ جدول تبادل اسکن می‌شد.
+                "CREATE INDEX IF NOT EXISTS idx_ex_joined "
+                "ON exchange(joined_at)",
                 # ایندکسِ قدیمیِ صف دیگر به کاری نمی‌آید و فقط حجم و
                 # زمانِ نوشتن را زیاد می‌کند (اندازه‌گیری‌شده).
                 "DROP INDEX IF EXISTS idx_q",
@@ -3693,6 +3707,7 @@ class Engine:
         try:
             c = self.db.counts()
             ec = self.db.ex_counts()
+            held = self.db.held_count()
             now_t = int(time.time())
             d = {
                 "ts": now_t,
@@ -3704,9 +3719,8 @@ class Engine:
                 "paused": bool(self.st["paused"]),
                 "channels": {t: self.st.prof(t)["channel"] for t in
                              ("standard", "vip")},
-                "queue": {"pending": self.db.pending_count()
-                                     - self.db.held_count(),
-                          "held": self.db.held_count(),
+                "queue": {"pending": self.db.pending_count() - held,
+                          "held": held,
                           "sent": c.get("sent", 0),
                           "failed": c.get("failed", 0)},
                 "sent_24h": self.db.sent_since(now_t - 86400),
