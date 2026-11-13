@@ -199,8 +199,8 @@ def _deploy_id():
         return ""
 
 
-def build_bundle():
-    """zip بایتی بسته + manifest (فایل‌های جمع‌شده)."""
+def build_bundle(skip_fingerprint=None):
+    """Snapshot and fingerprint first; omit compression if already remote."""
     staging = tempfile.mkdtemp(prefix=".gh_sync_stage_", dir=data_dir())
     try:
         files = collect(staging)
@@ -212,6 +212,8 @@ def build_bundle():
             "files": files,
             "fingerprint": fingerprint(files),
         }
+        if files and skip_fingerprint and manifest["fingerprint"] == skip_fingerprint:
+            return None, manifest
         with open(os.path.join(staging, MANIFEST_NAME), "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, ensure_ascii=False, indent=1)
         out = os.path.join(data_dir(), ".gh_sync_bundle.zip")
@@ -415,20 +417,19 @@ def _manifest_of(blob):
 
 def cmd_push(quiet=False):
     c = cfg()
-    blob, manifest = build_bundle()
+    remote = get_remote(c)
+    rmanifest = _manifest_of(remote[0]) if remote else None
+    blob, manifest = build_bundle(
+        skip_fingerprint=rmanifest.get("fingerprint") if rmanifest else None)
     if not manifest["files"]:
-        remote = get_remote(c)
         if remote:
             log("داده‌ی محلی خالی است — پشتیبان گیت‌هاب دست نخورد")
             return 1
         log("چیزی برای ذخیره نیست")
         return 0
-    remote = get_remote(c)
-    if remote:
-        rmanifest = _manifest_of(remote[0])
-        if rmanifest and rmanifest.get("fingerprint") == manifest["fingerprint"]:
-            log("بدون تغییر — ذخیره‌ی جدید لازم نیست")
-            return 0
+    if blob is None:
+        log("بدون تغییر — ذخیره‌ی جدید لازم نیست")
+        return 0
     if len(blob) > 90 * 1024 * 1024:
         log("بسته خیلی بزرگ است (%d MB) — از سقف Contents API می‌گذرد" % (len(blob) // (1024 * 1024)))
         return 1
