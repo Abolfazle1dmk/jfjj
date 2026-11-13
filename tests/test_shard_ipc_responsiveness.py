@@ -262,6 +262,10 @@ class ShardIpcTest(unittest.TestCase):
         d._status_verified_at['1'] = time.monotonic()
         asyncio.run(run_once())
         self.assertEqual(calls, [('charge', 1)])
+        calls.clear()
+        manager.sup.is_running = lambda uid: False
+        asyncio.run(run_once())
+        self.assertEqual(calls, [('reset', 1)])
 
     def test_shard_protocol_real_process_and_account_lifecycle(self):
         # Two synthetic accounts share one real shard; stopping one must not

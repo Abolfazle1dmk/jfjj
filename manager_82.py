@@ -4410,6 +4410,7 @@ def selfbot_readiness(folder, expected_uid=None, proc_alive=None, now_ts=None):
     folder = str(folder or "")
     # ۱) آخرین وضعیتِ خودِ سلف (jafj_status.json) — عددِ اکانت را هم دارد.
     stt = _read_json_soft(os.path.join(folder, "jafj_status.json"))
+    stale_status_why = ""
     if stt:
         try:
             out["uid"] = int(stt.get("user_id") or 0) or None
@@ -4420,7 +4421,9 @@ def selfbot_readiness(folder, expected_uid=None, proc_alive=None, now_ts=None):
         except Exception:
             age = None
         mm = account_mismatch(expected_uid, out["uid"])
-        if mm:
+        # mismatch در statusِ کهنه هم ممکن است از اجرای قبلی مانده باشد؛
+        # mismatch تازه را قطعی بگیر و کهنه را با لاگِ اجرای فعلی بسنج.
+        if mm and (age is None or age <= STALE_READY_SEC):
             out.update(ready=False, state="wrong_account",
                        why=(f"سلف با اکانتِ {out['uid']} وصل شده، نه اکانتِ "
                             f"ثبت‌شده ({expected_uid}) — سشنِ این پوشه به "
@@ -4431,10 +4434,11 @@ def selfbot_readiness(folder, expected_uid=None, proc_alive=None, now_ts=None):
             out.update(ready=True, state="ready", why="")
             return out
         if age is not None:
-            out.update(ready=False, state="stale",
-                       why=f"ضربانِ سلف {int(age // 60)} دقیقه است تازه نشده "
-                           "(پروسه هست ولی حلقه‌ی اصلی گیر کرده).")
-            return out
+            stale_status_why = (f"ضربانِ سلف {int(age // 60)} دقیقه است تازه نشده "
+                                "(پروسه هست ولی حلقه‌ی اصلی گیر کرده).")
+            # status می‌تواند از اجرای قبلی مانده باشد؛ پایین‌تر لاگِ همین
+            # اجرا را هم بررسی می‌کنیم تا «پنل تأییدنشده» اشتباه گزارش نشود.
+            out.update(ready=False, state="stale", why=stale_status_why)
     # ۲) آخرین خطوطِ لاگ: «آنلاین شد» یعنی پنل بالا آمده.
     tail = ""
     try:
@@ -4444,6 +4448,11 @@ def selfbot_readiness(folder, expected_uid=None, proc_alive=None, now_ts=None):
     except Exception:
         tail = ""
     if tail:
+        # لاگِ آماده‌بودن از اجرای قبلی شاهدِ زنده‌بودنِ اجرای فعلی نیست.
+        # اگر هدرِ شروع هست، فقط بخشِ بعد از آخرین شروع را بررسی کن.
+        starts = list(re.finditer(r"(?m)^===== start .*?=====\s*$", tail))
+        if starts:
+            tail = tail[starts[-1].start():]
         try:
             ids = LOGIN_ID_RE.findall(tail)
             if ids:
@@ -4464,6 +4473,8 @@ def selfbot_readiness(folder, expected_uid=None, proc_alive=None, now_ts=None):
         out.update(ready=False, state="wrong_account",
                    why=("خودِ سلف می‌گوید سشن به اکانتِ دیگری وصل شده "
                         f"({stt.get('user_id')} ≠ {stt.get('expected_user_id')})."))
+        return out
+    if stale_status_why:
         return out
     # ۳) هیچ نشانه‌ای نیست: یا تازه شروع کرده یا اصلاً بالا نیامده.
     if proc_alive is False:
@@ -15401,6 +15412,9 @@ class Manager:
                     for c in self.db.all("active"):
                         uid = c["uid"]
                         if not self.sup.is_running(uid):
+                            # زمانِ خاموشی نباید برای اجرای بعدی عقب‌افتاده
+                            # جمع شود و مثل کارکرد واقعی امتیاز کم کند.
+                            self.shop.p_reset_charge(uid)
                             continue
                         proc = self.sup.procs.get(uid)
                         if (isinstance(proc, _ShardProc)
