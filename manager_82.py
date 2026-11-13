@@ -5368,8 +5368,7 @@ class Supervisor:
         """
         expected = 0
         try:
-            c = self.db.get(uid) or {}
-            expected = int(c.get("tg_id") or c.get("uid") or 0)
+            expected = self.expected_telegram_id(uid)
         except Exception:
             expected = 0
         if not expected:
@@ -5415,30 +5414,79 @@ class Supervisor:
             print("write_defaults:", e)
             return False
 
+    def expected_telegram_id(self, uid):
+        """شناسه‌ی تلگرام را برای حساب‌های قدیمی هم از داده‌ی قابل‌اعتماد بازیابی کن."""
+        try:
+            row = self.db.get(uid) or {}
+            expected = int(row.get("tg_id") or 0)
+        except Exception:
+            row, expected = {}, 0
+        if expected > 0:
+            return expected
+
+        # در نسخه‌های قدیمی ممکن است tg_id در جدول خالی مانده باشد، ولی
+        # رویدادِ ورود، شناسه‌ای را که Telethon واقعاً گرفته ثبت کرده است.
+        try:
+            event = self.db.x(
+                "SELECT detail FROM log WHERE uid=? AND kind='login' "
+                "ORDER BY id DESC LIMIT 1", (uid,), "one") or {}
+            match = re.search(r"\btg_id=(\d+)\b", str(event.get("detail") or ""))
+            if match:
+                expected = int(match.group(1))
+        except Exception:
+            expected = 0
+
+        # بعضی دیتابیس‌های قدیمی log ندارند؛ گزارش سلف فقط نوشته می‌شود
+        # بعد از get_me، بنابراین user_id آن هم شاهدِ مستقیمِ همان سشن است.
+        if expected <= 0:
+            try:
+                with open(os.path.join(self.folder(uid), "jafj_status.json"),
+                          encoding="utf-8") as f:
+                    expected = int((json.load(f) or {}).get("user_id") or 0)
+            except Exception:
+                expected = 0
+        if expected > 0:
+            try:
+                self.db.set(uid, tg_id=expected)
+            except Exception:
+                pass
+        return expected
+
     def write_expected_account(self, uid):
         """اکانتِ تلگرامِ این پوشه را برای خودِ سلف مکتوب کن.
 
         `uid` شناسه‌ی کاربر در رباتِ مدیر است و لزوماً با شناسه‌ی اکانتِ
-        تلگرامِ لاگین‌شده یکی نیست. نگهبانِ سلف باید با `tg_id` مقایسه کند؛
-        نوشتنِ `uid` باعث می‌شد ورود در مدیر موفق دیده شود، اما 95.py با
-        «اکانتِ دیگری» متوقف شود و پنل هرگز بالا نیاید.
+        تلگرامِ لاگین‌شده یکی نیست. برای رکوردهای قدیمی هم `tg_id` را از
+        رویدادِ لاگین یا گزارشِ موفقِ سلف backfill می‌کنیم.
         """
-        path = os.path.join(self.folder(uid), ".jafj_expected_account")
         try:
-            row = self.db.get(uid) or {}
-            expected = int(row.get("tg_id") or 0)
+            expected = self.expected_telegram_id(uid)
             if expected <= 0:
-                # فایل کهنه هم نباید به‌اشتباه اکانت را به uid مدیر ببندد.
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
                 return False
-            with open(path, "w", encoding="utf-8") as f:
+            with open(os.path.join(self.folder(uid),
+                                   ".jafj_expected_account"), "w",
+                      encoding="utf-8") as f:
                 f.write(str(expected))
             return True
         except Exception:
             return False
+
+    def refresh_expected_account(self, uid):
+        """نگهبان را برای اکانتِ قدیمی ترمیم کن → (موفق؟, فایل عوض شد؟, پیام)."""
+        expected = self.expected_telegram_id(uid)
+        if expected <= 0:
+            return True, False, ""
+        path = os.path.join(self.folder(uid), ".jafj_expected_account")
+        try:
+            with open(path, encoding="utf-8") as f:
+                current = f.read().strip()
+        except Exception:
+            current = ""
+        if current == str(expected):
+            return True, False, ""
+        if not self.write_expected_account(uid):
+            return False, False, "فایلِ شناسه‌ی اکانت را اصلاح نتوانستم؛ دسترسی نوشتنِ پوشه را بررسی کن."
+        return True, True, ""
 
     def prepare(self, uid, string_session, phone, max_accounts=1, plan=None):
         self.write_session(uid, string_session)
@@ -6024,11 +6072,27 @@ class Supervisor:
 
     def _start_one(self, uid):
         self.last_failure.pop(uid, None)
+        # قبل از بررسیِ «از قبل روشن است»، نگهبانِ حساب‌های قدیمی را هم
+        # اصلاح کن. اگر فایل عوض شد، پروسه‌ی زنده باید با مقدارِ تازه بوت شود.
+        expected_ok, expected_changed, expected_error = self.refresh_expected_account(uid)
+        if not expected_ok:
+            return self._why(uid, "manager", expected_error,
+                             hint="expected-account قابل نوشتن نیست")
+
         if self.is_running(uid):
-            proc = self.procs.get(uid)
-            if isinstance(proc, _ShardProc) and proc.daemon.start_is_unconfirmed(uid):
-                return self._why(uid, "manager", "وضعیت اجرای سلف هنوز تأیید نشده است.")
-            return True, "پروسه از قبل در حال اجراست؛ وضعیت پنل را در گزارش ببین."
+            if expected_changed:
+                stopped, stop_why = self.stop(uid)
+                if not stopped:
+                    return self._why(uid, "manager",
+                                     "نسخه‌ی قبلی با شناسه‌ی اشتباه هنوز متوقف نشده؛ "
+                                     + stop_why,
+                                     hint="ری‌استارتِ اصلاحی تأیید نشد")
+                time.sleep(0.4)
+            else:
+                proc = self.procs.get(uid)
+                if isinstance(proc, _ShardProc) and proc.daemon.start_is_unconfirmed(uid):
+                    return self._why(uid, "manager", "وضعیت اجرای سلف هنوز تأیید نشده است.")
+                return True, "پروسه از قبل در حال اجراست؛ وضعیت پنل را در گزارش ببین."
         if self.mgr and self.running_count() >= int(self.cfg["max_clients"]):
             return self._why(uid, "manager",
                              "ظرفیت اجرای همزمان تکمیل است "
@@ -6076,9 +6140,6 @@ class Supervisor:
         ready, why_not = self._session_ok_or_mark(uid)
         if not ready:
             return self._why(uid, "session", why_not, hint="سشن باطل/خارج‌شده")
-        # مقدارِ قدیمیِ uid-محور را هم برای اکانت‌های موجود ترمیم کن؛ وگرنه
-        # باگِ قبلی پس از deploy باقی می‌مانْد تا کاربر دوباره لاگین کند.
-        self.write_expected_account(uid)
         # قبل از هر اجرا/ری‌استارت، هم امتیاز و هم محدودیت جدید پلن را Sync کن.
         if self.mgr:
             try:
@@ -6731,6 +6792,12 @@ class Supervisor:
                 skip_why.append((uid, "نیاز به لاگین"))
                 self.db.log(uid, "boot_skip", "نیاز به لاگین")
                 continue
+            expected_ok, expected_changed, expected_error = self.refresh_expected_account(uid)
+            if not expected_ok:
+                skipped += 1
+                skip_why.append((uid, expected_error))
+                self.db.log(uid, "boot_skip", expected_error)
+                continue
             # اگر از قبل روشن بود: فقط وقتی ری‌استارت کن که کدِ روی دیسک
             # (95.py) بعد از شروعِ آن پروسه عوض شده باشد — یعنی نسخه‌ی
             # درونِ حافظه کهنه است. ری‌استارتِ بی‌دلیل، سرویسِ سالمِ
@@ -6738,8 +6805,9 @@ class Supervisor:
             if self.is_running(uid):
                 # بعد از بازیابی، سشن/تنظیماتِ روی دیسک عوض شده و پروسه‌ی
                 # در حال اجرا نسخه‌ی قدیمی را در حافظه دارد → ری‌استارتِ اجباری.
-                if not force_restart and not self._code_changed_since_start(uid):
-                    n += 1          # با همین کد اجرا می‌شود؛ دست نزن
+                if (not force_restart and not expected_changed
+                        and not self._code_changed_since_start(uid)):
+                    n += 1          # با همین کد و نگهبانِ درست اجرا می‌شود
                     continue
                 stopped, stop_why = self.stop(uid)
                 if not stopped:

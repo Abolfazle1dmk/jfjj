@@ -158,10 +158,41 @@ def main():
           Path(sup.folder(manager_uid), ".jafj_expected_account").read_text().strip()
           == str(telegram_uid))
 
-    # بدون tg_id نباید uid مدیر را به‌عنوان اکانتِ مورد انتظار جعل کند.
+    # رکوردهای قدیمی که tg_id ندارند، از رخدادِ معتبرِ لاگین backfill شوند.
+    legacy_uid, legacy_tg_id = 123458, 876543210
+    sup.db.add(legacy_uid, "legacy", "Legacy", 0)
+    sup.db.log(legacy_uid, "login", f"tg_id={legacy_tg_id}")
+    legacy_file = Path(sup.folder(legacy_uid), ".jafj_expected_account")
+    check("حسابِ قدیمی: tg_id از لاگین backfill می‌شود",
+          sup.write_expected_account(legacy_uid) and
+          legacy_file.read_text().strip() == str(legacy_tg_id) and
+          int(sup.db.get(legacy_uid).get("tg_id") or 0) == legacy_tg_id)
+
+    # اگر سلف قدیمی هنوز زنده است ولی guard فایلش اشتباه است، start نباید
+    # به «از قبل روشن است» برگردد؛ باید آن را یک‌بار برای اعمال اصلاح متوقف کند.
+    repair_uid, repair_tg_id = 123459, 765432109
+    sup.db.add(repair_uid, "legacy-running", "Legacy Running", 0)
+    sup.db.set(repair_uid, tg_id=repair_tg_id)
+    repair_path = Path(sup.folder(repair_uid), ".jafj_expected_account")
+    repair_path.write_text(str(repair_uid), encoding="utf-8")
+    stopped_ids = []
+    real_running, real_stop, real_ram_gate = sup.is_running, sup.stop, sup._ram_gate_failure
+    sup.is_running = lambda _uid: True
+    sup.stop = lambda _uid: (stopped_ids.append(_uid) is None, "stopped")
+    sup._ram_gate_failure = lambda _uid: (False, "test-stop-after-repair")
+    try:
+        repair_result = sup._start_one(repair_uid)
+    finally:
+        sup.is_running, sup.stop, sup._ram_gate_failure = real_running, real_stop, real_ram_gate
+    check("سلفِ قدیمیِ زنده با guard کهنه برای اصلاح ری‌استارت می‌شود",
+          stopped_ids == [repair_uid] and
+          repair_path.read_text().strip() == str(repair_tg_id) and
+          repair_result == (False, "test-stop-after-repair"))
+
+    # بدون tg_id و بدون سابقه‌ی ورود نباید uid مدیر را جعل کند.
     manager_uid_missing = 123457
     sup.db.add(manager_uid_missing, "tester", "Tester", 0)
-    check("بدون tg_id فایلِ expected-account ساخته نمی‌شود",
+    check("بدون tg_id یا سابقه‌ی ورود، فایل ساخته نمی‌شود",
           not sup.write_expected_account(manager_uid_missing) and
           not Path(sup.folder(manager_uid_missing), ".jafj_expected_account").exists())
 
