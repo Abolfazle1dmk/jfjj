@@ -146,6 +146,25 @@ def main():
 
     # ── ۵) Supervisor.readiness روی DB واقعی ────────────────────────────
     sup = M.Supervisor(M.Config(), M.DB())
+
+    # `uid` در دیتابیس شناسه‌ی چت با ربات مدیر است؛ `tg_id` شناسه‌ی
+    # اکانتی است که Telethon لاگین کرده. این‌ها باید متفاوت باشند تا
+    # رگرسیونِ نوشتن uid به‌جای tg_id را بگیریم.
+    manager_uid, telegram_uid = 123456, 987654321
+    sup.db.add(manager_uid, "tester", "Tester", 0)
+    sup.db.set(manager_uid, tg_id=telegram_uid)
+    check("expected-account از tg_id اکانت تلگرام نوشته می‌شود",
+          sup.write_expected_account(manager_uid) and
+          Path(sup.folder(manager_uid), ".jafj_expected_account").read_text().strip()
+          == str(telegram_uid))
+
+    # بدون tg_id نباید uid مدیر را به‌عنوان اکانتِ مورد انتظار جعل کند.
+    manager_uid_missing = 123457
+    sup.db.add(manager_uid_missing, "tester", "Tester", 0)
+    check("بدون tg_id فایلِ expected-account ساخته نمی‌شود",
+          not sup.write_expected_account(manager_uid_missing) and
+          not Path(sup.folder(manager_uid_missing), ".jafj_expected_account").exists())
+
     uid = 555
     f2 = Path(sup.folder(uid))
     f2.mkdir(parents=True, exist_ok=True)

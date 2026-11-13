@@ -5416,18 +5416,26 @@ class Supervisor:
             return False
 
     def write_expected_account(self, uid):
-        """اکانتِ این پوشه را برای خودِ سلف مکتوب کن.
+        """اکانتِ تلگرامِ این پوشه را برای خودِ سلف مکتوب کن.
 
-        سلف با همین فایل می‌فهمد که سشنِ داخلِ پوشه باید به کدام اکانت وصل
-        شود؛ اگر به اکانتِ دیگری وصل شد، بالا می‌آید ولی همه‌ی پیام‌های پنل
-        به آن اکانتِ دیگر می‌رود (کاربر در Saved Messages خودش هیچ چیزی
-        نمی‌بیند). بدونِ این فایل، آن حالت از بیرون «سالم» دیده می‌شود.
+        `uid` شناسه‌ی کاربر در رباتِ مدیر است و لزوماً با شناسه‌ی اکانتِ
+        تلگرامِ لاگین‌شده یکی نیست. نگهبانِ سلف باید با `tg_id` مقایسه کند؛
+        نوشتنِ `uid` باعث می‌شد ورود در مدیر موفق دیده شود، اما 95.py با
+        «اکانتِ دیگری» متوقف شود و پنل هرگز بالا نیاید.
         """
+        path = os.path.join(self.folder(uid), ".jafj_expected_account")
         try:
-            with open(os.path.join(self.folder(uid),
-                                   ".jafj_expected_account"), "w",
-                      encoding="utf-8") as f:
-                f.write(str(int(uid)))
+            row = self.db.get(uid) or {}
+            expected = int(row.get("tg_id") or 0)
+            if expected <= 0:
+                # فایل کهنه هم نباید به‌اشتباه اکانت را به uid مدیر ببندد.
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                return False
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(str(expected))
             return True
         except Exception:
             return False
@@ -6068,6 +6076,9 @@ class Supervisor:
         ready, why_not = self._session_ok_or_mark(uid)
         if not ready:
             return self._why(uid, "session", why_not, hint="سشن باطل/خارج‌شده")
+        # مقدارِ قدیمیِ uid-محور را هم برای اکانت‌های موجود ترمیم کن؛ وگرنه
+        # باگِ قبلی پس از deploy باقی می‌مانْد تا کاربر دوباره لاگین کند.
+        self.write_expected_account(uid)
         # قبل از هر اجرا/ری‌استارت، هم امتیاز و هم محدودیت جدید پلن را Sync کن.
         if self.mgr:
             try:
