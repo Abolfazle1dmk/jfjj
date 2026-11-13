@@ -7763,8 +7763,29 @@ def need_telethon():
 
 
 async def connect_and_run(eng, creds):
+    """Run one session and release it before every retry or exit."""
+    from telethon import TelegramClient
+    client = TelegramClient(SESSION, creds["api_id"], creds["api_hash"],
+                            flood_sleep_threshold=0)
+    try:
+        return await _connect_and_run_client(eng, creds, client)
+    finally:
+        try:
+            await client.disconnect()
+        except Exception as e:
+            print(f"⚠️ بستن اتصال تلگرام: {type(e).__name__}: {e}", flush=True)
+            # Telethon may fail saving state before it closes the session.
+            try:
+                session = getattr(client, "session", None)
+                if session is not None:
+                    session.close()
+            except Exception as close_error:
+                print(f"⚠️ بستن سشن: {type(close_error).__name__}: {close_error}", flush=True)
+
+
+async def _connect_and_run_client(eng, creds, client):
     """یک بار وصل می‌شود و کار می‌کند. برمی‌گرداند: 'retry' یا 'stop'"""
-    from telethon import TelegramClient, events
+    from telethon import events
     from telethon.errors import (FloodWaitError, SlowModeWaitError,
                                  ChatWriteForbiddenError, ChannelPrivateError,
                                  UsernameNotOccupiedError, RPCError,
@@ -7785,9 +7806,6 @@ async def connect_and_run(eng, creds):
                                                 GetParticipantRequest)
     from telethon.tl.functions.messages import ImportChatInviteRequest
     _boot_step("telethon بارگذاری شد")
-
-    client = TelegramClient(SESSION, creds["api_id"], creds["api_hash"],
-                            flood_sleep_threshold=0)
 
     _boot_step("کلاینتِ تلگرام ساخته شد", f"session={SESSION}")
 
@@ -7851,10 +7869,6 @@ async def connect_and_run(eng, creds):
                   flush=True)
             print("   👉 از پنلِ مدیر: «🚀 راه‌اندازی سلف روی اکانتم» را برای این "
                   "اکانت بزن.", flush=True)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
             return "needs_relogin"
         # اجرای دستی: همان رفتارِ قبلی (کد می‌رود، چون خودِ کاربر نشسته)
         try:
@@ -7908,10 +7922,6 @@ async def connect_and_run(eng, creds):
             print("\n" + _acc_msg, flush=True)
             record_boot_crash(None, tb=_acc_msg)
             _boot_step("بوت متوقف شد", "سشن به اکانتِ دیگری تعلق دارد")
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
             return "wrong_account"
 
     _ok_inst, _other_pid, _other_cwd, _why_inst = claim_instance(me.id)
@@ -7927,10 +7937,6 @@ async def connect_and_run(eng, creds):
         print("\n" + _msg, flush=True)
         record_boot_crash(None, tb=_msg)
         _boot_step("بوت متوقف شد", "اکانت از پوشه‌ی دیگر در حال اجراست")
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
         return "dup_instance"
     atexit.register(release_instance, me.id)
     start_instance_heartbeat(me.id)
