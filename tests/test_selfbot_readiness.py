@@ -102,11 +102,28 @@ def main():
     check("پیامِ wrong_account عددِ هر دو اکانت را دارد",
           "999" in rd["why"] and "555" in rd["why"], rd["why"])
 
-    status(ts=int(now - 3600))
+    status(ts=int(now - 3600), user_id=888)
     rd = M.selfbot_readiness(str(folder), expected_uid=555, proc_alive=True,
                              now_ts=now)
     check("گزارشِ کهنه (بیش از ۵ دقیقه) → stale",
           rd["ready"] is False and rd["state"] == "stale", rd)
+
+    # وضعیتِ JSON ممکن است از اجرای قبلی مانده باشد: لاگِ اجرای قبلی نباید
+    # آن را ready کند، اما پیامِ شروعِ اجرای فعلی باید stale را خنثی کند.
+    (folder / "run.log").write_text(
+        "===== start old =====\nورود انجام شد | id=555\nآنلاین شد — پنل فعال\n"
+        "===== start current =====\nورود انجام شد | id=555\n",
+        encoding="utf-8")
+    rd = M.selfbot_readiness(str(folder), expected_uid=555, proc_alive=True,
+                             now_ts=now)
+    check("ready قدیمی در لاگِ اجرای قبل stale را پنهان نمی‌کند",
+          rd["ready"] is False and rd["state"] == "stale", rd)
+    with open(folder / "run.log", "a", encoding="utf-8") as f:
+        f.write("آنلاین شد — پنل فعال\n")
+    rd = M.selfbot_readiness(str(folder), expected_uid=555, proc_alive=True,
+                             now_ts=now)
+    check("لاگِ اجرای فعلی ready را بر stale-status اولویت می‌دهد",
+          rd["ready"] is True and rd["state"] == "ready", rd)
 
     (folder / "jafj_status.json").unlink()
     (folder / "run.log").write_text(
