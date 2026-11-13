@@ -213,6 +213,52 @@ def main():
           not sup.write_expected_account(manager_uid_missing) and
           not Path(sup.folder(manager_uid_missing), ".jafj_expected_account").exists())
 
+    # اشتراک ماهانه با خاموشیِ دستی متوقف می‌شود و هنگام آماده‌شدن دوباره
+    # همان مدت به انقضا برمی‌گردد.
+    sub_uid = 123460
+    sup.db.add(sub_uid, "monthly", "Monthly", 0)
+    sub_expiry = int(time.time()) + 3600
+    sup.db.set(sub_uid, status="active", expires_at=sub_expiry,
+               trial_expires_at=0)
+    sup._pause_paid_subscription(sub_uid)
+    paused_row = sup.db.get(sub_uid)
+    paused_at = int(paused_row.get("sub_paused_at") or 0)
+    mgr = M.Manager.__new__(M.Manager)
+    mgr.db = sup.db
+    still_valid = mgr.has_sub(sub_uid)
+    # شبیه‌سازیِ ۱۰ دقیقه خاموشی برای آزمودنِ محاسبه بدونِ انتظار واقعی.
+    sup.db.set(sub_uid, sub_paused_at=int(time.time()) - 600)
+    expected_expiry = mgr.subscription_expiry(sup.db.get(sub_uid))
+    sup._resume_paid_subscription(sub_uid)
+    resumed_row = sup.db.get(sub_uid)
+    check("خاموشیِ ماهانه اعتبار را pause می‌کند و روزهای باقیمانده را نگه می‌دارد",
+          paused_at > 0 and still_valid and
+          int(resumed_row.get("sub_paused_at") or 0) == 0 and
+          int(resumed_row.get("expires_at") or 0) >= expected_expiry - 2)
+
+    # مهاجرتِ کاربر قدیمی: اگر نسخه‌ی قبلی زمانِ توقف را مصرف کرده و حتی
+    # status را expired کرده باشد، زمانِ خاموشیِ ثبت‌شده باید برگردد.
+    legacy_db_path = root / "legacy-subscription.sqlite"
+    legacy_db = M.DB(str(legacy_db_path))
+    old_uid = 123461
+    legacy_db.add(old_uid, "old-sub", "Old Sub", 0)
+    old_pause = int(time.time()) - 3600
+    legacy_db.set(old_uid, status="expired", want_on=0,
+                  expires_at=old_pause + 1800, trial_expires_at=0)
+    legacy_db.x("INSERT INTO log(ts,uid,kind,detail) VALUES(?,?,?,?)",
+                (old_pause, old_uid, "want_off", "manual stop"))
+    legacy_db.close()
+    migrated_db = M.DB(str(legacy_db_path))
+    migrated_mgr = M.Manager.__new__(M.Manager)
+    migrated_mgr.db = migrated_db
+    old_row = migrated_db.get(old_uid)
+    check("مهاجرتِ اشتراکِ قدیمیِ خاموش حتی پس از انقضای قبلی",
+          old_row["status"] == "active" and
+          int(old_row.get("sub_paused_at") or 0) == old_pause and
+          migrated_mgr.has_sub(old_uid) and
+          old_uid not in {r["uid"] for r in migrated_db.expired()})
+    migrated_db.close()
+
     uid = 555
     f2 = Path(sup.folder(uid))
     f2.mkdir(parents=True, exist_ok=True)
